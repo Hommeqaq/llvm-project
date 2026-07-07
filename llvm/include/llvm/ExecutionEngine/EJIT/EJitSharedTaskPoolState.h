@@ -268,10 +268,6 @@ struct EJitSharedCounters {
   EJitAtomicU64 compileFailed;
   EJitAtomicU64 publishFailed;
   EJitAtomicU64 instanceDisabled;
-  EJitAtomicU64 instanceDisabledPreActivate; ///< Subset of instanceDisabled that
-                                             ///< occurred before the first
-                                             ///< setInstanceEnabled(true) — i.e.
-                                             ///< the init→activate window.
   EJitAtomicU64 executePrepareFailed;
 };
 
@@ -343,10 +339,6 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
       EJitAtomicU8 enabled[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 version[kEJitSharedDimTypes][kEJitSharedInstances];
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
-  EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
-                                      ///< setInstanceEnabled(true); gates the
-                                      ///< instanceDisabledPreActivate counter.
-                                      ///< Reset on each (re)initialization.
 
   //--- flat dedup slots (own cache line). Each slot stores the OWNER GENERATION
   //    that claimed it (0 = free), not a 1-bit flag: a dedupMark CASes 0->gen

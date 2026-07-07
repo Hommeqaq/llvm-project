@@ -130,12 +130,6 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   uint8_t desired = enabled ? 1 : 0;
   if (state_->enabled[dimType][instanceId].compareExchange(expected, desired)) {
     state_->version[dimType][instanceId].fetchAdd(1);
-    // Latch on the first successful enable of ANY instance: this brackets the
-    // init→activate window during which instanceDisabled hits are tallied
-    // separately (instanceDisabledPreActivate) for diagnosing the pre-activate
-    // fallback storm. Once latched it stays 1 until the next (re)initialization.
-    if (enabled)
-      state_->anyInstanceActivated.storeRelease(1);
     return true;
   }
   return false;
@@ -682,7 +676,6 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       st->version[d][i].storeRelaxed(0);
     }
   st->mode.storeRelaxed(mode);
-  st->anyInstanceActivated.storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedMaxFuncIndex; ++i)
     st->inFlight[i].storeRelaxed(0);
   for (uint32_t i = 0; i < kEJitSharedQueueSlots; ++i) {
@@ -698,7 +691,6 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
   st->counters.compileFailed.storeRelaxed(0);
   st->counters.publishFailed.storeRelaxed(0);
   st->counters.instanceDisabled.storeRelaxed(0);
-  st->counters.instanceDisabledPreActivate.storeRelaxed(0);
   st->counters.executePrepareFailed.storeRelaxed(0);
   // Code-pool stats mirror: zero until the owner publishes the first snapshot
   // after a successful compile (the pools are owner-private and empty at init).
@@ -927,10 +919,6 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   for (uint32_t i = 0; i < numDims; ++i)
     if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
       state_->counters.instanceDisabled.fetchAdd(1);
-      // If no instance has been activated yet, this hit is in the init→activate
-      // window — tally it separately to localize the pre-activate fallback storm.
-      if (state_->anyInstanceActivated.loadAcquire() == 0)
-        state_->counters.instanceDisabledPreActivate.fetchAdd(1);
       EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex,
                 i, dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
@@ -1302,8 +1290,6 @@ void EJitSharedTaskPool::getDiagnostics(EJitSharedDiagnostics &out) const {
   out.compileFailed = state_->counters.compileFailed.loadRelaxed();
   out.publishFailed = state_->counters.publishFailed.loadRelaxed();
   out.instanceDisabled = state_->counters.instanceDisabled.loadRelaxed();
-  out.instanceDisabledPreActivate =
-      state_->counters.instanceDisabledPreActivate.loadRelaxed();
   out.executePrepareFailed =
       state_->counters.executePrepareFailed.loadRelaxed();
 }

@@ -574,7 +574,6 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
   out->compileFailed = d.compileFailed;
   out->publishFailed = d.publishFailed;
   out->instanceDisabled = d.instanceDisabled;
-  out->instanceDisabledPreActivate = d.instanceDisabledPreActivate;
   out->readyEntries = d.cacheReadyCount;
   out->pendingEntries = d.pendingCount;
   out->queueApproxSize = d.queueDepth;
@@ -597,7 +596,6 @@ ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
   out->compileFailed = s.compileFailed;
   out->publishFailed = s.publishFailed;
   out->instanceDisabled = s.instanceDisabled;
-  out->instanceDisabledPreActivate = 0;
   out->readyEntries = s.readyEntries;
   out->pendingEntries = s.pendingEntries;
   out->queueApproxSize = s.queueApproxSize;
@@ -626,13 +624,6 @@ void ejit_taskpool_print_stats() {
             static_cast<unsigned long long>(s.publishFailed));
   EJIT_DIAG("  instanceDisabled = %llu",
             static_cast<unsigned long long>(s.instanceDisabled));
-  EJIT_DIAG("  instanceDisabledPreActivate  = %llu   (init->activate window)",
-            static_cast<unsigned long long>(s.instanceDisabledPreActivate));
-  EJIT_DIAG("  instanceDisabledPostActivate = %llu   (after first activate)",
-            static_cast<unsigned long long>(
-                s.instanceDisabled > s.instanceDisabledPreActivate
-                    ? s.instanceDisabled - s.instanceDisabledPreActivate
-                    : 0));
   EJIT_DIAG("  readyEntries     = %u", s.readyEntries);
   EJIT_DIAG("  pendingEntries   = %u", s.pendingEntries);
   EJIT_DIAG("  queueApproxSize  = %u", s.queueApproxSize);

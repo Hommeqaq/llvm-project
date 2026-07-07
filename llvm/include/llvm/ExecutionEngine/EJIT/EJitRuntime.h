@@ -199,9 +199,6 @@ typedef struct {
   uint64_t compileFailed;   ///< Compiles that failed, were cancelled or dropped.
   uint64_t publishFailed;   ///< Results that could not enter the cache.
   uint64_t instanceDisabled; ///< Per-instance disable fast-path hits.
-  uint64_t instanceDisabledPreActivate; ///< Subset of instanceDisabled that hit
-                                        ///< before the first activate (init→
-                                        ///< activate window). 0 in non-shared.
   uint32_t readyEntries;     ///< Live ready cache entries.
   uint32_t pendingEntries;   ///< Live in-flight dedup slots.
   uint32_t queueApproxSize;  ///< Approximate async queue depth.
