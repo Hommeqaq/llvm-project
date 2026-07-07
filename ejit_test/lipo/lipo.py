@@ -365,7 +365,6 @@ def doit_gc_merge(args):
         # EJIT_SRE_TASKPOOL ifdef in EJitRuntime.cpp).
         "ejit_set_log_level", "ejit_get_log_level",
         "ejit_print_registry", "ejit_print_func_meta",
-        "ejit_dump_all",
         "ejit_get_code_pool_stats", "ejit_print_code_pool_stats",
         "ejit_print_active",
     ]

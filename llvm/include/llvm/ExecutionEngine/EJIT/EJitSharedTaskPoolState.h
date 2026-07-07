@@ -73,17 +73,11 @@
 #ifndef EJIT_SRE_SHARED_DUMP_NAME_BYTES
 #define EJIT_SRE_SHARED_DUMP_NAME_BYTES 128u
 #endif
-// Per-slot IR/ASM text capacity in the cross-core dump table (each slot holds
-// one captured function's name + IR + ASM, truncated to this size per text).
-#ifndef EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES
-#define EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES 8192u
-#endif
 // Number of per-name result slots in the cross-core dump table. Each captured
 // specialization occupies one slot keyed by entry name; when full, the oldest
 // slot is round-robin evicted. Covers this many distinct functions for
-// cross-core ejit_print_dumped(name) retrieval. NOTE: the table lives in the
-// fixed shared section, so sizeof(EJitSharedTaskPoolState) scales with
-// SLOT_COUNT * (2 * SLOT_TEXT_BYTES); resize the linker section accordingly.
+// cross-core ejit_print_dumped(name) retrieval. The table stores pointers to
+// dynamically allocated IR/ASM payloads, not fixed text buffers.
 #ifndef EJIT_SRE_SHARED_DUMP_SLOT_COUNT
 #define EJIT_SRE_SHARED_DUMP_SLOT_COUNT 50u
 #endif
@@ -103,8 +97,6 @@ constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
 constexpr uint32_t kEJitSharedDumpNameBytes =
     EJIT_SRE_SHARED_DUMP_NAME_BYTES;
-constexpr uint32_t kEJitSharedDumpSlotTextBytes =
-    EJIT_SRE_SHARED_DUMP_SLOT_TEXT_BYTES;
 constexpr uint32_t kEJitSharedDumpSlotCount =
     EJIT_SRE_SHARED_DUMP_SLOT_COUNT;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
@@ -219,31 +211,28 @@ struct EJitSharedPoolSplit {
 };
 
 //===----------------------------------------------------------------------===//
-// EJitSharedDumpState: fixed-size cross-core diagnostic exchange.
+// EJitSharedDumpState: cross-core diagnostic exchange.
 //
 // The owner worker captures IR/ASM in its private ORC path, but shell/debug
 // requests can arrive on a different core. std::map/std::string cannot live in
 // shared memory, so the shared path uses one bounded filter plus a bounded
 // per-name result TABLE: each captured specialization occupies one slot keyed
 // by entry name; when the table is full the oldest slot is round-robin
-// evicted. This lets a non-owner core retrieve any recently-captured function
-// by name (not just the latest). It is diagnostic-only: long IR/ASM is
-// truncated (per-slot) instead of blocking normal JIT progress; the full,
-// untruncated IR/ASM remains available on the owner core via the per-core
-// gDumpStore + ejit_print_dumped(NULL).
+// evicted. IR/ASM payloads are allocated dynamically to their actual text size,
+// and the slot stores shared-visible pointers plus sizes.
 //===----------------------------------------------------------------------===//
 struct alignas(kEJitSharedCacheLine) EJitSharedDumpSlot {
   EJitAtomicU32 valid;       ///< 1 => name/ir/asm hold a capture
-  EJitAtomicU32 truncated;   ///< bit0 IR, bit1 ASM, bit2 name truncated
+  EJitAtomicU32 truncated;   ///< bit2 name truncated
   uint32_t nameLen;
   uint32_t irSize;
   uint32_t asmSize;
   uint32_t keyHi;
   uint32_t keyLo;
   uint32_t reserved0;
+  uintptr_t irPtr;
+  uintptr_t asmPtr;
   char name[kEJitSharedDumpNameBytes];
-  char ir[kEJitSharedDumpSlotTextBytes];
-  char asmText[kEJitSharedDumpSlotTextBytes];
 };
 
 struct alignas(kEJitSharedCacheLine) EJitSharedDumpState {

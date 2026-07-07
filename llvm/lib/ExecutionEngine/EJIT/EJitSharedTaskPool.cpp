@@ -19,6 +19,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
+#include <cstdlib>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -926,6 +927,10 @@ namespace {
 // the non-shared EJitRuntimeState::isActive default (no entry => inactive).
 // setInstanceEnabled(true) flips 0->1 and bumps version on first activate.
 void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
+  bool canFreeDumpPayload =
+      st->magic == kEJitSharedAbiMagic &&
+      st->abiVersion == kEJitSharedAbiVersion &&
+      st->structSize == sizeof(EJitSharedTaskPoolState);
   for (uint32_t d = 0; d < kEJitSharedDimTypes; ++d)
     for (uint32_t i = 0; i < kEJitSharedInstances; ++i) {
       st->enabled[d][i].storeRelaxed(0);
@@ -988,12 +993,14 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
     Slot.keyHi = 0;
     Slot.keyLo = 0;
     Slot.reserved0 = 0;
+    if (canFreeDumpPayload && Slot.irPtr)
+      std::free(reinterpret_cast<void *>(Slot.irPtr));
+    if (canFreeDumpPayload && Slot.asmPtr)
+      std::free(reinterpret_cast<void *>(Slot.asmPtr));
+    Slot.irPtr = 0;
+    Slot.asmPtr = 0;
     for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i)
       Slot.name[i] = 0;
-    for (uint32_t i = 0; i < kEJitSharedDumpSlotTextBytes; ++i) {
-      Slot.ir[i] = 0;
-      Slot.asmText[i] = 0;
-    }
   }
   for (uint32_t b = 0; b < kEJitSharedCacheBuckets; ++b) {
     st->buckets[b].writeFlag.storeRelaxed(0);

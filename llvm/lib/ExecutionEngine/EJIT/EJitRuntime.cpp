@@ -905,7 +905,7 @@ void ejit_dump_func(const char *name) {
 
 void ejit_print_dumped(const char *name) {
   // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
-  EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(all)");
+  EJIT_DIAG("print_dumped name=%s", (name && name[0]) ? name : "(list)");
   printDumped(name);
 }
 
@@ -929,19 +929,6 @@ uint32_t ejit_taskpool_get_worker_core() {
   // a private per-instance taskpool has no cross-core owner to report.
   return kEJitInvalidOwnerCore;
 #endif
-}
-
-//===----------------------------------------------------------------------===//
-// General diagnostics (available in every build, not only taskpool).
-//===----------------------------------------------------------------------===//
-
-void ejit_dump_all(bool enable) {
-  // gDumpSharedState is bound once in ejit_init; no per-call rebind needed.
-  // The "*" filter is a wildcard matched by every specialization in the IR
-  // transform layer (see getActiveDumpFilter / the capture condition). Capture
-  // is bounded by distinct function names; print with ejit_print_dumped(NULL).
-  EJIT_DIAG("dump_all enable=%u", enable ? 1u : 0u);
-  setDumpFuncFilter(enable ? std::string("*") : std::string());
 }
 
 void ejit_set_log_level(ejit_log_level_t level) {

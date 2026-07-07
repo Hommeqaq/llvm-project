@@ -16,6 +16,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "gtest/gtest.h"
+#include <cstdlib>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -1571,11 +1572,12 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
   EXPECT_TRUE(r.readyButNotShareable);
 }
 
-// 16/17 ABI v5 layout: the slot carries the executable range as fixed-width,
+// 16/17 ABI v6 layout: the slot carries the executable range as fixed-width,
 // naturally-aligned scalars (read back by value — endian-safe), and the
-// pool-split table is POD.
+// pool-split table is POD. v6 also changes dump slots from fixed text buffers
+// to dynamic payload pointers.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 5u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 6u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -1601,6 +1603,43 @@ TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
   EXPECT_EQ(slot->poolSize, 0x200000ull);
   EXPECT_EQ(slot->poolId, 7u);
   EXPECT_EQ(slot->rangeReserved, 0u);
+}
+
+TEST_F(SharedTaskPoolTest, DumpDynamicPayloadsClearedOnInit) {
+  state_->magic = kEJitSharedAbiMagic;
+  state_->abiVersion = kEJitSharedAbiVersion;
+  state_->structSize = sizeof(EJitSharedTaskPoolState);
+
+  char *IR = static_cast<char *>(std::malloc(8));
+  char *ASM = static_cast<char *>(std::malloc(8));
+  ASSERT_NE(IR, nullptr);
+  ASSERT_NE(ASM, nullptr);
+  state_->dump.slots[0].valid.storeRelaxed(1);
+  state_->dump.slots[0].truncated.storeRelaxed(7);
+  state_->dump.slots[0].nameLen = 4;
+  state_->dump.slots[0].irPtr = reinterpret_cast<uintptr_t>(IR);
+  state_->dump.slots[0].asmPtr = reinterpret_cast<uintptr_t>(ASM);
+  state_->dump.slots[0].irSize = 7;
+  state_->dump.slots[0].asmSize = 7;
+  state_->dump.slots[0].keyHi = 0x12;
+  state_->dump.slots[0].keyLo = 0x34;
+  state_->dump.slots[0].name[0] = 'f';
+  state_->dump.nextSlot = 1;
+
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+
+  EXPECT_EQ(state_->dump.slots[0].valid.loadRelaxed(), 0u);
+  EXPECT_EQ(state_->dump.slots[0].truncated.loadRelaxed(), 0u);
+  EXPECT_EQ(state_->dump.slots[0].nameLen, 0u);
+  EXPECT_EQ(state_->dump.slots[0].irPtr, 0u);
+  EXPECT_EQ(state_->dump.slots[0].asmPtr, 0u);
+  EXPECT_EQ(state_->dump.slots[0].irSize, 0u);
+  EXPECT_EQ(state_->dump.slots[0].asmSize, 0u);
+  EXPECT_EQ(state_->dump.slots[0].keyHi, 0u);
+  EXPECT_EQ(state_->dump.slots[0].keyLo, 0u);
+  EXPECT_EQ(state_->dump.slots[0].name[0], 0);
+  EXPECT_EQ(state_->dump.nextSlot, 0u);
 }
 
 // 18/ Code-sharing OFF in 4K mode: a non-owner cleanly rejects and triggers NO
