@@ -434,13 +434,18 @@ static void generateSymbolRegisters(
             }
           }
         }
-        // External global variable references. Skip constants (compiler-
-        // generated strings etc.) — they're embedded in the bitcode. Resolve
-        // through bitcasts/GEPs via rootGlobal so every global the collector
-        // kept in the extracted bitcode is actually registered here.
+        // External global variable references. A const global *with a local
+        // definition* (initializer) is embedded in the extracted bitcode by
+        // extractAndSerialize, so it needs no registration. A const global that
+        // is only a *declaration* (extern const, no initializer in this TU)
+        // cannot be embedded and must be resolved from the host process at JIT
+        // link time, so it MUST be registered — dropping it leaves an
+        // unresolved external that fails JITLink. Resolve through bitcasts/GEPs
+        // via rootGlobal so every global the collector kept in the extracted
+        // bitcode is actually registered here.
         for (Use &U : I.operands()) {
           auto *GV = rootGlobal(U.get(), DL);
-          if (!GV || GV->isConstant())
+          if (!GV || (GV->isConstant() && !GV->isDeclaration()))
             continue;
           if (GV->isDeclaration() || !isPeriodVar(*GV)) {
             std::string Name = GV->getName().str();
@@ -581,7 +586,11 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
         for (const Value *Op : I.operands()) {
           const GlobalVariable *GV =
               rootGlobal(const_cast<Value *>(Op), DL);
-          if (!GV || GV->isConstant() || GV->getName().starts_with("llvm."))
+          // Skip const globals that have a local definition (they're embedded
+          // in the bitcode), but keep const *declarations* (extern const) so
+          // they get registered and resolved from the host at JIT link time.
+          if (!GV || (GV->isConstant() && !GV->isDeclaration()) ||
+              GV->getName().starts_with("llvm."))
             continue;
           if (!GVsDone.insert(GV).second)
             continue;
