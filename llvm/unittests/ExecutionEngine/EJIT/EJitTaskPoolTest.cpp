@@ -953,6 +953,189 @@ TEST(EJitTaskPoolTest, DisabledInstanceWithExistingCacheFallsBack) {
   EXPECT_EQ(r.fnPtr, fb);
 }
 
+//===----------------------------------------------------------------------===//
+// tryCacheHit(): the flattened fast cache-hit path the C API drives before the
+// compileOrGet slow path. On the private pool it performs the instance-enabled
+// check + cache lookup only; it must match compileOrGet's front-half semantics
+// and never enqueue.
+//===----------------------------------------------------------------------===//
+
+// A cache hit is served on the fast path with a held read token and NO enqueue.
+TEST(EJitTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  EJitDimPair D[1] = {{0, 1}};
+  P.compileOrGet(40, D, 1, nullptr);
+  EXPECT_TRUE(P.pollOne()); // populate cache
+  ASSERT_EQ(P.pendingCount(), 0u);
+
+  auto fast = P.tryCacheHit(40, D, 1);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_TRUE(fast.hasReadToken);
+  EXPECT_NE(fast.fnPtr, nullptr);
+  EXPECT_EQ(P.pendingCount(), 0u); // no enqueue/dedup on the fast path
+  P.releaseRead(fast.bucketIndex);
+}
+
+// A true miss is NOT terminal on the fast path; the slow path still enqueues.
+TEST(EJitTaskPoolTest, TryCacheHitMissFallsThroughToCompileOrGet) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  EJitDimPair D[1] = {{0, 1}};
+
+  auto fast = P.tryCacheHit(41, D, 1);
+  EXPECT_FALSE(fast.fastPathTerminal);
+  EXPECT_NE(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(P.pendingCount(), 0u); // fast path never enqueues
+
+  auto slow = P.compileOrGet(41, D, 1, nullptr);
+  EXPECT_EQ(slow.status, EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(P.pendingCount(), 1u);
+}
+
+// A disabled instance returns InstanceDisabled on the fast path and never
+// serves cached code.
+TEST(EJitTaskPoolTest, TryCacheHitDisabledInstanceReturnsDisabled) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  EJitDimPair D[1] = {{0, 1}};
+  P.compileOrGet(42, D, 1, nullptr);
+  EXPECT_TRUE(P.pollOne()); // cache now holds func 42
+  P.switchController().setEnabled(0, 1, false);
+
+  auto fast = P.tryCacheHit(42, D, 1);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_EQ(fast.fnPtr, nullptr); // no stale cached code
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(P.pendingCount(), 0u);
+}
+
+//===----------------------------------------------------------------------===//
+// Fixed-dimension fast cache-hit entries (tryCacheHit0D..4D) on the private
+// pool. Same semantics as tryCacheHit() with the matching numDims.
+//===----------------------------------------------------------------------===//
+TEST(EJitTaskPoolTest, FixedDimEntriesServeCacheHit) {
+  EJitTaskPool P(16, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+
+  auto publishDims = [&](uint32_t fi, const EJitDimPair *d, uint32_t n) {
+    ASSERT_EQ(P.compileOrGet(fi, d, n, nullptr).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(P.pollOne());
+  };
+
+  // 0D
+  publishDims(1, nullptr, 0);
+  auto h0 = P.tryCacheHit0D(1);
+  EXPECT_TRUE(h0.fastPathTerminal);
+  EXPECT_EQ(h0.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h0.fnPtr, reinterpret_cast<void *>(C.base + 1));
+  EXPECT_TRUE(h0.hasReadToken);
+  P.releaseRead(h0.bucketIndex);
+
+  // 1D
+  EJitDimPair d1[1] = {{0, 1}};
+  publishDims(2, d1, 1);
+  auto h1 = P.tryCacheHit1D(2, 0, 1);
+  ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h1.fnPtr, reinterpret_cast<void *>(C.base + 2));
+  P.releaseRead(h1.bucketIndex);
+
+  // 2D
+  EJitDimPair d2[2] = {{0, 1}, {1, 2}};
+  publishDims(3, d2, 2);
+  auto h2 = P.tryCacheHit2D(3, 0, 1, 1, 2);
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h2.fnPtr, reinterpret_cast<void *>(C.base + 3));
+  P.releaseRead(h2.bucketIndex);
+
+  // 3D
+  EJitDimPair d3[3] = {{0, 1}, {1, 2}, {2, 3}};
+  publishDims(4, d3, 3);
+  auto h3 = P.tryCacheHit3D(4, 0, 1, 1, 2, 2, 3);
+  ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h3.fnPtr, reinterpret_cast<void *>(C.base + 4));
+  P.releaseRead(h3.bucketIndex);
+
+  // 4D
+  EJitDimPair d4[4] = {{0, 1}, {1, 2}, {2, 3}, {3, 4}};
+  publishDims(5, d4, 4);
+  auto h4 = P.tryCacheHit4D(5, 0, 1, 1, 2, 2, 3, 3, 4);
+  ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h4.fnPtr, reinterpret_cast<void *>(C.base + 5));
+  P.releaseRead(h4.bucketIndex);
+
+  EXPECT_EQ(P.pendingCount(), 0u); // hits never enqueue
+}
+
+// Disabled instance: fixed entry returns InstanceDisabled, no cached code, no
+// enqueue — including when only a later dim is disabled.
+TEST(EJitTaskPoolTest, FixedDimDisabledInstanceReturnsDisabled) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  EJitDimPair d2[2] = {{0, 1}, {1, 2}};
+  P.compileOrGet(60, d2, 2, nullptr);
+  EXPECT_TRUE(P.pollOne());
+  P.switchController().setEnabled(1, 2, false); // disable second dim
+
+  auto fast = P.tryCacheHit2D(60, 0, 1, 1, 2);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_EQ(fast.fnPtr, nullptr);
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(P.pendingCount(), 0u);
+}
+
+// Miss: fixed entry not terminal, no enqueue; slow path still enqueues.
+TEST(EJitTaskPoolTest, FixedDimMissFallsThrough) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+
+  auto fast = P.tryCacheHit1D(61, 0, 1);
+  EXPECT_FALSE(fast.fastPathTerminal);
+  EXPECT_NE(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(P.pendingCount(), 0u);
+
+  EJitDimPair d1[1] = {{0, 1}};
+  EXPECT_EQ(P.compileOrGet(61, d1, 1, nullptr).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(P.pendingCount(), 1u);
+}
+
+// Cache lookup precedes the Off check for fixed entries too.
+TEST(EJitTaskPoolTest, FixedDimServesHitEvenWhenModeOff) {
+  EJitTaskPool P(8, false);
+  P.switchController().setMode(EJitCompileMode::Async);
+  MockCompiler C;
+  P.setCompiler(&MockCompiler::compile, &C);
+  EJitDimPair d1[1] = {{0, 1}};
+  P.compileOrGet(62, d1, 1, nullptr);
+  EXPECT_TRUE(P.pollOne());
+  P.switchController().setMode(EJitCompileMode::Off);
+
+  auto fast = P.tryCacheHit1D(62, 0, 1);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_TRUE(fast.hasReadToken);
+  P.releaseRead(fast.bucketIndex);
+}
+
 TEST(EJitTaskPoolTest, SameFuncDifferentDimsAlreadyPending) {
   EJitTaskPool P(16, false);
   P.switchController().setMode(EJitCompileMode::Async);

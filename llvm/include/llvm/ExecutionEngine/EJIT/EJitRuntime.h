@@ -176,6 +176,36 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
                                            const ejit_dim_pair_t *dims,
                                            uint32_t numDims, void **outFn,
                                            uint32_t *outBucket);
+
+// Fixed-dimension fast paths (0-4 dims). Additive alternatives to
+// ejit_taskpool_compile_or_get that pass the dim identity as scalar arguments
+// instead of an ejit_dim_pair_t* + numDims pair, trimming the cache-hit path
+// (no numDims bound/null checks, no variable-length validation loop, dims built
+// directly on the stack). Return status and outFn/outBucket semantics are
+// identical to ejit_taskpool_compile_or_get with the matching numDims; on a
+// cache hit the caller still owns the read token and must call
+// ejit_taskpool_release_read(*outBucket). 4 dims is the maximum; callers with
+// more dims use the generic entry above.
+ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
+                                              uint32_t *outBucket);
+ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
+                                              uint32_t inst0, void **outFn,
+                                              uint32_t *outBucket);
+ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
+                                              uint32_t inst0, uint32_t dim1,
+                                              uint32_t inst1, void **outFn,
+                                              uint32_t *outBucket);
+ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
+                                              uint32_t inst0, uint32_t dim1,
+                                              uint32_t inst1, uint32_t dim2,
+                                              uint32_t inst2, void **outFn,
+                                              uint32_t *outBucket);
+ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
+                                              uint32_t inst0, uint32_t dim1,
+                                              uint32_t inst1, uint32_t dim2,
+                                              uint32_t inst2, uint32_t dim3,
+                                              uint32_t inst3, void **outFn,
+                                              uint32_t *outBucket);
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);

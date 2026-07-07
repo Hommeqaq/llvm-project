@@ -283,6 +283,13 @@ public:
     void *fnPtr = nullptr;
     uint32_t bucketIndex = 0;
     bool hasReadToken = false;
+    /// Set by tryCacheHit() when the request was fully resolved on the fast
+    /// cache-hit path (a cache hit or a disabled instance). When true the
+    /// caller returns this result directly and MUST NOT enter the
+    /// compileOrGet() slow path; when false the request is a true miss that
+    /// still needs compileOrGet(). Internal control signal only — it does not
+    /// affect status mapping or the C ABI.
+    bool fastPathTerminal = false;
   };
 
   explicit EJitTaskPool(
@@ -307,6 +314,42 @@ public:
   CompileOrGetResult compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
                                   uint32_t numDims, void *fallback);
 
+  /// Flattened fast cache-hit path (spec §5.2 steps 0-1). Performs ONLY the
+  /// terminal front half of compileOrGet(): the instance-enabled check and the
+  /// cache lookup, then classifies the outcome:
+  ///   * CacheHit         — returns fnPtr + bucketIndex + a held read token
+  ///                        (caller releases via releaseRead), cacheHits++.
+  ///   * InstanceDisabled — a disabled dim, instanceDisabled++.
+  /// Both set fastPathTerminal = true; the caller returns the result directly
+  /// and never enters the slow path. A true miss (enabled, no cached code)
+  /// returns fastPathTerminal = false and the caller must fall through to
+  /// compileOrGet(). compileOrGet() itself calls this so the
+  /// ordering/counters/semantics stay identical.
+  CompileOrGetResult tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
+                                 uint32_t numDims);
+
+  /// Fixed-dimension fast cache-hit entries (0-4 dims). Same terminal
+  /// semantics as tryCacheHit() but the instance-enabled check is unrolled and
+  /// the dim identity is built directly on the stack (no numDims loop), so the
+  /// C ABI fixed-dimension entries (ejit_taskpool_compile_or_get_Nd) reach the
+  /// shared cache lookup with the least overhead. 4 is the maximum dimension
+  /// count; higher-dimension callers keep using tryCacheHit().
+  CompileOrGetResult tryCacheHit0D(uint32_t funcIndex);
+  CompileOrGetResult tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
+                                   uint32_t inst0);
+  CompileOrGetResult tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
+                                   uint32_t inst0, uint32_t dim1,
+                                   uint32_t inst1);
+  CompileOrGetResult tryCacheHit3D(uint32_t funcIndex, uint32_t dim0,
+                                   uint32_t inst0, uint32_t dim1,
+                                   uint32_t inst1, uint32_t dim2,
+                                   uint32_t inst2);
+  CompileOrGetResult tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
+                                   uint32_t inst0, uint32_t dim1,
+                                   uint32_t inst1, uint32_t dim2,
+                                   uint32_t inst2, uint32_t dim3,
+                                   uint32_t inst3);
+
   bool pollOne();
   unsigned pollBudget(unsigned maxItems);
 
@@ -324,6 +367,12 @@ public:
 private:
   bool versionsMatch(const EJitCompileRequest &req) const;
   void runCompile(const EJitCompileRequest &req);
+  /// Convert a cache lookup outcome into a CompileOrGetResult with the
+  /// fast-path terminal classification (CacheHit / miss). Shared by
+  /// tryCacheHit() and the fixed-dimension entries so the cache-hit counter is
+  /// incremented exactly once and the semantics stay identical. Does NOT
+  /// perform the instance-enabled check (the callers do that first).
+  CompileOrGetResult classifyHit(const EJitCacheLookupResult &Hit);
 
   EJitSwitchController switch_;
   EJitTaskQueue queue_;

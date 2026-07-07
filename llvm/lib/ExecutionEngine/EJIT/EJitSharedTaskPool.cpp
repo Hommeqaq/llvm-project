@@ -275,109 +275,359 @@ EJitSharedTaskPool::cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
       }
     if (!versionsOk)
       break; // identity matched but stale → miss, token off.
-
-    // fnPtr cross-core gate (§11 prerequisites): a non-owner core may read the
-    // pointer only when code sharing is platform-validated (same VA, sealed,
-    // I/D-cache coherent). Otherwise CLEAN-REJECT — never hand back a pointer
-    // this core may not legally execute.
-    uint32_t self = EJitCoreId::current();
-    uint32_t owner = state_->ownerCoreId.loadAcquire();
-    bool mayReadPtr =
-        (state_->codeSharingEnabled.loadAcquire() != 0) || (self == owner);
-    if (!mayReadPtr) {
-      bucketReadRelease(B);
-      R.readyButNotShareable = true;
-      return R;
-    }
-    void *fn = reinterpret_cast<void *>(Slot.fnPtr.loadAcquire());
-    if (!fn)
-      break;
-
-    // The owner already has execute permission (it sealed the code before
-    // publishing). Return directly while holding the read token.
-    if (self == owner) {
-      R.fnPtr = fn;
-      R.bucketIndex = bucket;
-      R.hasReadToken = true;
-      return R;
-    }
-
-    // Non-owner: execute permission is a per-core property on the target. If
-    // this core has already prepared THIS slot's code (memoized bit), return
-    // immediately under the read lock — no platform call.
-    const bool CanMemoize = self < kEJitSharedMaxMemoCores;
-    const uint64_t CoreBit = CanMemoize ? (uint64_t{1} << self) : uint64_t{0};
-    if (CanMemoize && (Slot.executableCoreMask.loadAcquire() & CoreBit) != 0) {
-      R.fnPtr = fn;
-      R.bucketIndex = bucket;
-      R.hasReadToken = true;
-      return R;
-    }
-
-    // Not prepared yet. Snapshot the identity + the REAL code range, then DROP
-    // the bucket read lock: the per-core platform split/enable_ex calls
-    // (potentially slow) must never run while holding a cross-core bucket lock,
-    // or a concurrent owner publish (which spins for readers==0) would stall.
-    PeerCodeRange Snap;
-    Snap.fn = fn;
-    Snap.slotIndex = s;
-    Snap.bucket = bucket;
-    Snap.funcIndex = Slot.funcIndex;
-    Snap.numDims = Slot.numDims;
-    Snap.generation = Slot.generation;
-    for (uint32_t i = 0; i < Snap.numDims && i < 4; ++i) {
-      Snap.dims[i] = Slot.dims[i];
-      Snap.versions[i] = Slot.versions[i];
-    }
-    Snap.codeStart = Slot.codeStart;
-    Snap.codeSize = Slot.codeSize;
-    Snap.poolBase = Slot.poolBase;
-    Snap.poolSize = Slot.poolSize;
-    bucketReadRelease(B);
-
-    if (!prepareExecForCurrentCore(Snap, self)) {
-      state_->counters.executePrepareFailed.fetchAdd(1);
-      R.readyButNotShareable = true;
-      return R; // clean fallback: no token, no shared pointer handed back.
-    }
-
-    // Re-acquire the read lock and RE-VALIDATE the slot: a publish may have
-    // overwritten it (new code/generation) while we prepared. Only a slot that
-    // is still Ready, same generation + identity + fnPtr, with current
-    // versions, may hand back the prepared pointer; otherwise clean fallback so
-    // a replaced/stale pointer is never returned (spec §11 / §8).
-    if (!bucketTryRead(B)) {
-      R.readyButNotShareable = true;
-      return R;
-    }
-    EJitSharedCacheSlot &S2 = B.slots[Snap.slotIndex];
-    uint32_t curGen2 = state_->generation.loadAcquire();
-    bool stillValid =
-        S2.state.loadAcquire() ==
-            static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
-        S2.generation == curGen2 && S2.generation == Snap.generation &&
-        slotIdentityMatches(S2, Snap.funcIndex, Snap.dims, Snap.numDims) &&
-        reinterpret_cast<void *>(S2.fnPtr.loadAcquire()) == Snap.fn;
-    if (stillValid)
-      for (uint32_t i = 0; i < Snap.numDims; ++i)
-        if (S2.versions[i] !=
-            instanceVersion(Snap.dims[i].dimType, Snap.dims[i].instanceId)) {
-          stillValid = false;
-          break;
-        }
-    if (!stillValid) {
-      bucketReadRelease(B);
-      R.readyButNotShareable = true;
-      return R;
-    }
-    if (CanMemoize)
-      S2.executableCoreMask.fetchOr(CoreBit);
-    R.fnPtr = Snap.fn;
-    R.bucketIndex = Snap.bucket;
-    R.hasReadToken = true;
-    return R; // token held (re-acquired); caller releases after using fnPtr.
+    // Identity + versions match: resolve the fnPtr gate (owner/memoized fast
+    // return, clean reject, or cold peer preparation). Terminal — a bucket
+    // holds at most one slot per identity.
+    return resolveMatchedSlot(B, bucket, s);
   }
 
+  bucketReadRelease(B);
+  return R;
+}
+
+//===----------------------------------------------------------------------===//
+// Shared slot resolution: applied once a slot's identity + versions have
+// matched (bucket read lock held). Dimension-independent, so cacheLookup() and
+// every fixed-dimension cacheLookupNd() share it. The owner core and any core
+// that already memoized execute permission return the hit here with the read
+// token held; a core that may not legally read the cross-core pointer gets a
+// clean readyButNotShareable fallback; the rare non-owner first touch is
+// delegated to the out-of-line peerPrepareSlot().
+//===----------------------------------------------------------------------===//
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
+                                       uint32_t bucket, uint32_t slotIndex) {
+  SharedLookup R;
+  EJitSharedCacheSlot &Slot = B.slots[slotIndex];
+  // fnPtr cross-core gate (§11 prerequisites): a non-owner core may read the
+  // pointer only when code sharing is platform-validated (same VA, sealed,
+  // I/D-cache coherent). Otherwise CLEAN-REJECT — never hand back a pointer
+  // this core may not legally execute.
+  uint32_t self = EJitCoreId::current();
+  uint32_t owner = state_->ownerCoreId.loadAcquire();
+  bool mayReadPtr =
+      (state_->codeSharingEnabled.loadAcquire() != 0) || (self == owner);
+  if (!mayReadPtr) {
+    bucketReadRelease(B);
+    R.readyButNotShareable = true;
+    return R;
+  }
+  void *fn = reinterpret_cast<void *>(Slot.fnPtr.loadAcquire());
+  if (!fn) {
+    bucketReadRelease(B);
+    return R; // identity matched but no pointer yet → miss.
+  }
+
+  // The owner already has execute permission (it sealed the code before
+  // publishing). Return directly while holding the read token.
+  if (self == owner) {
+    R.fnPtr = fn;
+    R.bucketIndex = bucket;
+    R.hasReadToken = true;
+    return R;
+  }
+
+  // Non-owner: execute permission is a per-core property on the target. If this
+  // core has already prepared THIS slot's code (memoized bit), return
+  // immediately under the read lock — no platform call.
+  const bool CanMemoize = self < kEJitSharedMaxMemoCores;
+  const uint64_t CoreBit = CanMemoize ? (uint64_t{1} << self) : uint64_t{0};
+  if (CanMemoize && (Slot.executableCoreMask.loadAcquire() & CoreBit) != 0) {
+    R.fnPtr = fn;
+    R.bucketIndex = bucket;
+    R.hasReadToken = true;
+    return R;
+  }
+
+  // Cold: this core has never prepared this code. Delegate to the out-of-line
+  // helper so the hit path stays small.
+  return peerPrepareSlot(B, bucket, slotIndex);
+}
+
+//===----------------------------------------------------------------------===//
+// Cold non-owner first-touch execute-permission preparation. Out-of-line
+// (noinline) so it never inflates the cache-hit path. Bucket read lock held on
+// entry; released here.
+//===----------------------------------------------------------------------===//
+__attribute__((noinline)) EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
+                                    uint32_t slotIndex) {
+  SharedLookup R;
+  EJitSharedCacheSlot &Slot = B.slots[slotIndex];
+  uint32_t self = EJitCoreId::current();
+  void *fn = reinterpret_cast<void *>(Slot.fnPtr.loadAcquire());
+
+  // Snapshot the identity + the REAL code range, then DROP the bucket read
+  // lock: the per-core platform split/enable_ex calls (potentially slow) must
+  // never run while holding a cross-core bucket lock, or a concurrent owner
+  // publish (which spins for readers==0) would stall.
+  PeerCodeRange Snap;
+  Snap.fn = fn;
+  Snap.slotIndex = slotIndex;
+  Snap.bucket = bucket;
+  Snap.funcIndex = Slot.funcIndex;
+  Snap.numDims = Slot.numDims;
+  Snap.generation = Slot.generation;
+  for (uint32_t i = 0; i < Snap.numDims && i < 4; ++i) {
+    Snap.dims[i] = Slot.dims[i];
+    Snap.versions[i] = Slot.versions[i];
+  }
+  Snap.codeStart = Slot.codeStart;
+  Snap.codeSize = Slot.codeSize;
+  Snap.poolBase = Slot.poolBase;
+  Snap.poolSize = Slot.poolSize;
+  bucketReadRelease(B);
+
+  if (!prepareExecForCurrentCore(Snap, self)) {
+    state_->counters.executePrepareFailed.fetchAdd(1);
+    R.readyButNotShareable = true;
+    return R; // clean fallback: no token, no shared pointer handed back.
+  }
+
+  // Re-acquire the read lock and RE-VALIDATE the slot: a publish may have
+  // overwritten it (new code/generation) while we prepared. Only a slot that is
+  // still Ready, same generation + identity + fnPtr, with current versions, may
+  // hand back the prepared pointer; otherwise clean fallback so a
+  // replaced/stale pointer is never returned (spec §11 / §8).
+  if (!bucketTryRead(B)) {
+    R.readyButNotShareable = true;
+    return R;
+  }
+  EJitSharedCacheSlot &S2 = B.slots[Snap.slotIndex];
+  uint32_t curGen2 = state_->generation.loadAcquire();
+  bool stillValid =
+      S2.state.loadAcquire() ==
+          static_cast<uint32_t>(EJitSharedSlotState::Ready) &&
+      S2.generation == curGen2 && S2.generation == Snap.generation &&
+      slotIdentityMatches(S2, Snap.funcIndex, Snap.dims, Snap.numDims) &&
+      reinterpret_cast<void *>(S2.fnPtr.loadAcquire()) == Snap.fn;
+  if (stillValid)
+    for (uint32_t i = 0; i < Snap.numDims; ++i)
+      if (S2.versions[i] !=
+          instanceVersion(Snap.dims[i].dimType, Snap.dims[i].instanceId)) {
+        stillValid = false;
+        break;
+      }
+  if (!stillValid) {
+    bucketReadRelease(B);
+    R.readyButNotShareable = true;
+    return R;
+  }
+  const bool CanMemoize = self < kEJitSharedMaxMemoCores;
+  const uint64_t CoreBit = CanMemoize ? (uint64_t{1} << self) : uint64_t{0};
+  if (CanMemoize)
+    S2.executableCoreMask.fetchOr(CoreBit);
+  R.fnPtr = Snap.fn;
+  R.bucketIndex = Snap.bucket;
+  R.hasReadToken = true;
+  return R; // token held (re-acquired); caller releases after using fnPtr.
+}
+
+//===----------------------------------------------------------------------===//
+// Fixed-dimension cacheLookup specializations (0-4 dims). Identity hashing,
+// slot identity comparison, and version comparison are unrolled — no numDims
+// loop, no dims[] indirection, no generic numDims>4 guard. The matched-slot
+// fnPtr gate and cold peer preparation are shared via resolveMatchedSlot(), so
+// each specialization stays small. Results are identical to cacheLookup() with
+// the matching numDims. kHashMul mirrors the mixing constant in hashIdentity().
+//===----------------------------------------------------------------------===//
+static constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
+
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::cacheLookup0D(uint32_t funcIndex) {
+  SharedLookup R;
+  uint64_t key = static_cast<uint64_t>(funcIndex); // hashIdentity(fi, _, 0)
+  uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+  if (!bucketTryRead(B))
+    return R;
+  uint32_t curGen = state_->generation.loadAcquire();
+  for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+    EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.state.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedSlotState::Ready))
+      continue;
+    if (Slot.generation != curGen)
+      continue;
+    if (Slot.identityHash != key)
+      continue;
+    if (Slot.funcIndex != funcIndex || Slot.numDims != 0)
+      continue;
+    // 0D: no dims, no versions to compare.
+    return resolveMatchedSlot(B, bucket, s);
+  }
+  bucketReadRelease(B);
+  return R;
+}
+
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::cacheLookup1D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0) {
+  SharedLookup R;
+  uint64_t key = static_cast<uint64_t>(funcIndex);
+  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
+  key *= kHashMul;
+  uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+  if (!bucketTryRead(B))
+    return R;
+  uint32_t curGen = state_->generation.loadAcquire();
+  for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+    EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.state.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedSlotState::Ready))
+      continue;
+    if (Slot.generation != curGen)
+      continue;
+    if (Slot.identityHash != key)
+      continue;
+    if (Slot.funcIndex != funcIndex || Slot.numDims != 1)
+      continue;
+    if (Slot.dims[0].dimType != dim0 || Slot.dims[0].instanceId != inst0)
+      continue;
+    if (Slot.versions[0] != instanceVersion(dim0, inst0))
+      break; // identity matched but stale → miss.
+    return resolveMatchedSlot(B, bucket, s);
+  }
+  bucketReadRelease(B);
+  return R;
+}
+
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::cacheLookup2D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1,
+                                  uint32_t inst1) {
+  SharedLookup R;
+  uint64_t key = static_cast<uint64_t>(funcIndex);
+  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
+  key *= kHashMul;
+  key ^= (static_cast<uint64_t>(dim1) << 32) | static_cast<uint64_t>(inst1);
+  key *= kHashMul;
+  uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+  if (!bucketTryRead(B))
+    return R;
+  uint32_t curGen = state_->generation.loadAcquire();
+  for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+    EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.state.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedSlotState::Ready))
+      continue;
+    if (Slot.generation != curGen)
+      continue;
+    if (Slot.identityHash != key)
+      continue;
+    if (Slot.funcIndex != funcIndex || Slot.numDims != 2)
+      continue;
+    if (Slot.dims[0].dimType != dim0 || Slot.dims[0].instanceId != inst0)
+      continue;
+    if (Slot.dims[1].dimType != dim1 || Slot.dims[1].instanceId != inst1)
+      continue;
+    if (Slot.versions[0] != instanceVersion(dim0, inst0))
+      break;
+    if (Slot.versions[1] != instanceVersion(dim1, inst1))
+      break;
+    return resolveMatchedSlot(B, bucket, s);
+  }
+  bucketReadRelease(B);
+  return R;
+}
+
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::cacheLookup3D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1, uint32_t inst1,
+                                  uint32_t dim2, uint32_t inst2) {
+  SharedLookup R;
+  uint64_t key = static_cast<uint64_t>(funcIndex);
+  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
+  key *= kHashMul;
+  key ^= (static_cast<uint64_t>(dim1) << 32) | static_cast<uint64_t>(inst1);
+  key *= kHashMul;
+  key ^= (static_cast<uint64_t>(dim2) << 32) | static_cast<uint64_t>(inst2);
+  key *= kHashMul;
+  uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+  if (!bucketTryRead(B))
+    return R;
+  uint32_t curGen = state_->generation.loadAcquire();
+  for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+    EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.state.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedSlotState::Ready))
+      continue;
+    if (Slot.generation != curGen)
+      continue;
+    if (Slot.identityHash != key)
+      continue;
+    if (Slot.funcIndex != funcIndex || Slot.numDims != 3)
+      continue;
+    if (Slot.dims[0].dimType != dim0 || Slot.dims[0].instanceId != inst0)
+      continue;
+    if (Slot.dims[1].dimType != dim1 || Slot.dims[1].instanceId != inst1)
+      continue;
+    if (Slot.dims[2].dimType != dim2 || Slot.dims[2].instanceId != inst2)
+      continue;
+    if (Slot.versions[0] != instanceVersion(dim0, inst0))
+      break;
+    if (Slot.versions[1] != instanceVersion(dim1, inst1))
+      break;
+    if (Slot.versions[2] != instanceVersion(dim2, inst2))
+      break;
+    return resolveMatchedSlot(B, bucket, s);
+  }
+  bucketReadRelease(B);
+  return R;
+}
+
+EJitSharedTaskPool::SharedLookup
+EJitSharedTaskPool::cacheLookup4D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1, uint32_t inst1,
+                                  uint32_t dim2, uint32_t inst2, uint32_t dim3,
+                                  uint32_t inst3) {
+  SharedLookup R;
+  uint64_t key = static_cast<uint64_t>(funcIndex);
+  key ^= (static_cast<uint64_t>(dim0) << 32) | static_cast<uint64_t>(inst0);
+  key *= kHashMul;
+  key ^= (static_cast<uint64_t>(dim1) << 32) | static_cast<uint64_t>(inst1);
+  key *= kHashMul;
+  key ^= (static_cast<uint64_t>(dim2) << 32) | static_cast<uint64_t>(inst2);
+  key *= kHashMul;
+  key ^= (static_cast<uint64_t>(dim3) << 32) | static_cast<uint64_t>(inst3);
+  key *= kHashMul;
+  uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+  if (!bucketTryRead(B))
+    return R;
+  uint32_t curGen = state_->generation.loadAcquire();
+  for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+    EJitSharedCacheSlot &Slot = B.slots[s];
+    if (Slot.state.loadAcquire() !=
+        static_cast<uint32_t>(EJitSharedSlotState::Ready))
+      continue;
+    if (Slot.generation != curGen)
+      continue;
+    if (Slot.identityHash != key)
+      continue;
+    if (Slot.funcIndex != funcIndex || Slot.numDims != 4)
+      continue;
+    if (Slot.dims[0].dimType != dim0 || Slot.dims[0].instanceId != inst0)
+      continue;
+    if (Slot.dims[1].dimType != dim1 || Slot.dims[1].instanceId != inst1)
+      continue;
+    if (Slot.dims[2].dimType != dim2 || Slot.dims[2].instanceId != inst2)
+      continue;
+    if (Slot.dims[3].dimType != dim3 || Slot.dims[3].instanceId != inst3)
+      continue;
+    if (Slot.versions[0] != instanceVersion(dim0, inst0))
+      break;
+    if (Slot.versions[1] != instanceVersion(dim1, inst1))
+      break;
+    if (Slot.versions[2] != instanceVersion(dim2, inst2))
+      break;
+    if (Slot.versions[3] != instanceVersion(dim3, inst3))
+      break;
+    return resolveMatchedSlot(B, bucket, s);
+  }
   bucketReadRelease(B);
   return R;
 }
@@ -901,50 +1151,182 @@ void EJitSharedTaskPool::ownerShutdown() {
 //===----------------------------------------------------------------------===//
 // Producer path (§5.2).
 //===----------------------------------------------------------------------===//
-EJitSharedTaskPool::CompileOrGetResult
-EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
-                                 uint32_t numDims, void *fallback) {
+__attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   CompileOrGetResult R;
-  R.fnPtr = fallback;
-  EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p", funcIndex,
-            numDims, fallback);
-  if (!state_ || state_->initState.loadAcquire() != kReady) {
-    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: not Ready", funcIndex);
-    R.status = EJitCompileOrGetStatus::OffMode; // not Ready → clean fallback.
-    return R;
-  }
-  // Parameter check already done by the C API layer.
-
-  // Instance-enabled check (§5.2 step 0).
-  for (uint32_t i = 0; i < numDims; ++i)
-    if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
-      state_->counters.instanceDisabled.fetchAdd(1);
-      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)", funcIndex,
-                i, dims[i].dimType, dims[i].instanceId);
-      R.status = EJitCompileOrGetStatus::InstanceDisabled;
-      return R;
-    }
-  // Cache lookup (§5.2 step 1).
-  EJitSharedTaskPool::SharedLookup Hit = cacheLookup(funcIndex, dims, numDims);
   if (Hit.hasReadToken && Hit.fnPtr) {
     state_->counters.cacheHits.fetchAdd(1);
     R.status = EJitCompileOrGetStatus::CacheHit;
     R.fnPtr = Hit.fnPtr;
     R.bucketIndex = Hit.bucketIndex;
     R.hasReadToken = true;
-    EJIT_DIAG_VERBOSE("shared taskpool hit func=%u bucket=%u fn=%p", funcIndex,
-              Hit.bucketIndex, Hit.fnPtr);
+    R.fastPathTerminal = true;
     return R;
   }
   if (Hit.readyButNotShareable) {
     // The work is already done but this core may not read the cross-core
     // pointer; fall back cleanly WITHOUT re-enqueuing (avoids recompile churn).
-    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: ready but not shareable on this core",
-              funcIndex);
     R.status = EJitCompileOrGetStatus::OffMode;
     R.readyButNotShareable = true;
+    R.fastPathTerminal = true;
     return R;
   }
+  // True miss (Ready, enabled, no shareable cached code): the caller must fall
+  // through to the compileOrGet() slow path (Off / Sync / Async).
+  R.fastPathTerminal = false;
+  return R;
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
+                                uint32_t numDims) {
+  CompileOrGetResult R;
+  // Parameter check already done by the C API layer.
+
+  // Ready check (§5.2 step 0): a not-yet-Ready pool is a clean fallback and
+  // never reads the queue/cache.
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    EJIT_DIAG_VERBOSE("shared taskpool fallback func=%u: not Ready", funcIndex);
+    R.status = EJitCompileOrGetStatus::OffMode; // not Ready → clean fallback.
+    R.fastPathTerminal = true;
+    return R;
+  }
+
+  // Instance-enabled check (§5.2 step 0): a disabled dim falls back and never
+  // reaches the cache, so a deactivated instance is never served stale code.
+  for (uint32_t i = 0; i < numDims; ++i)
+    if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
+      state_->counters.instanceDisabled.fetchAdd(1);
+      EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)",
+                        funcIndex, i, dims[i].dimType, dims[i].instanceId);
+      R.status = EJitCompileOrGetStatus::InstanceDisabled;
+      R.fastPathTerminal = true;
+      return R;
+    }
+
+  // Cache lookup (§5.2 step 1) — runs BEFORE the Off check, so an already
+  // compiled entry is still served even when the pool is globally Off.
+  return classifyHit(cacheLookup(funcIndex, dims, numDims));
+}
+
+//===----------------------------------------------------------------------===//
+// Fixed-dimension fast cache-hit entries (§5.2 steps 0-1, unrolled). Each
+// shares the Ready gate + classifyHit() with tryCacheHit() but the
+// instance-enabled check is unrolled and the dim identity is built directly on
+// the stack, so the C ABI fixed-dimension entries reach the shared
+// cacheLookup() without a numDims loop or variable-length array setup.
+// Semantics are identical to tryCacheHit() with the matching numDims.
+//===----------------------------------------------------------------------===//
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit0D(uint32_t funcIndex) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  return classifyHit(cacheLookup0D(funcIndex));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (!isInstanceEnabled(dim0, inst0)) {
+    state_->counters.instanceDisabled.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::InstanceDisabled;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  return classifyHit(cacheLookup1D(funcIndex, dim0, inst0));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1,
+                                  uint32_t inst1) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1)) {
+    state_->counters.instanceDisabled.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::InstanceDisabled;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  return classifyHit(cacheLookup2D(funcIndex, dim0, inst0, dim1, inst1));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit3D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1, uint32_t inst1,
+                                  uint32_t dim2, uint32_t inst2) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1) ||
+      !isInstanceEnabled(dim2, inst2)) {
+    state_->counters.instanceDisabled.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::InstanceDisabled;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  return classifyHit(
+      cacheLookup3D(funcIndex, dim0, inst0, dim1, inst1, dim2, inst2));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
+                                  uint32_t inst0, uint32_t dim1, uint32_t inst1,
+                                  uint32_t dim2, uint32_t inst2, uint32_t dim3,
+                                  uint32_t inst3) {
+  CompileOrGetResult R;
+  if (!state_ || state_->initState.loadAcquire() != kReady) {
+    R.status = EJitCompileOrGetStatus::OffMode;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1) ||
+      !isInstanceEnabled(dim2, inst2) || !isInstanceEnabled(dim3, inst3)) {
+    state_->counters.instanceDisabled.fetchAdd(1);
+    R.status = EJitCompileOrGetStatus::InstanceDisabled;
+    R.fastPathTerminal = true;
+    return R;
+  }
+  return classifyHit(cacheLookup4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
+                                   inst2, dim3, inst3));
+}
+
+EJitSharedTaskPool::CompileOrGetResult
+EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
+                                 uint32_t numDims, void *fallback) {
+  EJIT_DIAG_VERBOSE("shared taskpool request func=%u dims=%u fallback=%p",
+                    funcIndex, numDims, fallback);
+  // Parameter check already done by the C API layer.
+
+  // Fast cache-hit path (§5.2 steps 0-1). On any terminal outcome (hit,
+  // disabled instance, not-Ready, or ready-but-not-shareable) return directly.
+  CompileOrGetResult R = tryCacheHit(funcIndex, dims, numDims);
+  if (R.fastPathTerminal) {
+    // Non-hit terminals surface the caller's fallback pointer (a hit already
+    // carries the cached fnPtr + read token).
+    if (R.status != EJitCompileOrGetStatus::CacheHit)
+      R.fnPtr = fallback;
+    return R;
+  }
+  // True miss: continue the slow path with the caller's fallback.
+  R.fnPtr = fallback;
   // Off mode (§5.2 step 2).
   if (state_->mode.loadAcquire() ==
       static_cast<uint32_t>(EJitCompileMode::Off)) {

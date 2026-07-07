@@ -1726,4 +1726,420 @@ TEST_F(SharedTaskPoolTest, FourKReinitForcesPeerToReSplit) {
   EXPECT_EQ(fourK.splits[1].second, 3u);
 }
 
+//===----------------------------------------------------------------------===//
+// tryCacheHit(): the flattened fast cache-hit path the C API drives before the
+// compileOrGet slow path. It must preserve every compileOrGet hot-path
+// semantic (ordering, counters, read tokens) while NEVER enqueuing/deduping.
+//===----------------------------------------------------------------------===//
+
+// 1/ A cache hit is served entirely on the fast path: fnPtr + bucket + a held
+//    read token, fastPathTerminal set, and NO enqueue/dedup side effects.
+TEST_F(SharedTaskPoolTest, TryCacheHitServesHitWithoutEnqueue) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 1);
+
+  EJitCoreId::setCurrentForTest(0);
+  EJitSharedDiagnostics before;
+  owner.getDiagnostics(before);
+
+  auto fast = owner.tryCacheHit(1, nullptr, 0);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fast.fnPtr, codeFor(1));
+  EXPECT_TRUE(fast.hasReadToken);
+  EXPECT_FALSE(fast.readyButNotShareable);
+  // A held read token keeps readers > 0 (same ownership contract as
+  // compileOrGet — the caller must release through releaseRead).
+  EXPECT_GT(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+
+  EJitSharedDiagnostics after;
+  owner.getDiagnostics(after);
+  EXPECT_EQ(after.cacheHits, before.cacheHits + 1);     // counted exactly once
+  EXPECT_EQ(after.asyncEnqueues, before.asyncEnqueues); // no enqueue
+  EXPECT_EQ(after.queueDepth, 0u);                      // no dedup slot
+  EXPECT_EQ(after.pendingCount, 0u);
+
+  owner.releaseRead(fast.bucketIndex);
+  EXPECT_EQ(state_->buckets[fast.bucketIndex].readers.loadAcquire(), 0u);
+}
+
+// 2/ A true miss is NOT terminal on the fast path (no enqueue), and the slow
+//    path (compileOrGet) still enqueues/compiles exactly as before.
+TEST_F(SharedTaskPoolTest, TryCacheHitMissFallsThroughToCompileOrGet) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  EJitCoreId::setCurrentForTest(0);
+
+  auto fast = owner.tryCacheHit(5, nullptr, 0);
+  EXPECT_FALSE(fast.fastPathTerminal); // must fall through
+  EXPECT_NE(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(fast.hasReadToken);
+
+  EJitSharedDiagnostics d;
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.asyncEnqueues, 0u); // fast path never enqueues
+  EXPECT_EQ(d.queueDepth, 0u);
+  EXPECT_EQ(d.pendingCount, 0u);
+
+  // The slow path still enqueues the async request unchanged.
+  auto slow = owner.compileOrGet(5, nullptr, 0, codeFor(5));
+  EXPECT_EQ(slow.status, EJitCompileOrGetStatus::EnqueuedPending);
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.asyncEnqueues, 1u);
+  EXPECT_EQ(d.queueDepth, 1u);
+  EXPECT_EQ(d.pendingCount, 1u);
+}
+
+// 3/ A disabled instance returns InstanceDisabled on the fast path and NEVER
+//    hands back cached code, even though a Ready entry exists (deactivate must
+//    not serve stale code). No enqueue.
+TEST_F(SharedTaskPoolTest, TryCacheHitDisabledInstanceReturnsDisabled) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  owner.setInstanceEnabled(1, 4, true);
+  EJitDimPair d0[1] = {dim(1, 4)};
+
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(11, d0, 1, codeFor(11)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  // Sanity: while enabled the entry is a real hit.
+  auto sane = owner.tryCacheHit(11, d0, 1);
+  ASSERT_EQ(sane.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(sane.bucketIndex);
+
+  // Deactivate the instance, then the fast path must reject before the cache.
+  owner.setInstanceEnabled(1, 4, false);
+  EJitSharedDiagnostics before;
+  owner.getDiagnostics(before);
+
+  auto fast = owner.tryCacheHit(11, d0, 1);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_EQ(fast.fnPtr, nullptr); // no stale cached code
+  EXPECT_FALSE(fast.hasReadToken);
+
+  EJitSharedDiagnostics after;
+  owner.getDiagnostics(after);
+  EXPECT_EQ(after.instanceDisabled, before.instanceDisabled + 1);
+  EXPECT_EQ(after.queueDepth, before.queueDepth); // no enqueue
+  EXPECT_EQ(after.asyncEnqueues, before.asyncEnqueues);
+}
+
+// 4/ readyButNotShareable: a peer core that may not read the cross-core pointer
+//    gets a clean OffMode fallback with readyButNotShareable set, no read
+//    token, and NO enqueue/dedup.
+TEST_F(SharedTaskPoolTest, TryCacheHitReadyButNotShareableCleanFallback) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/false);
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(20, nullptr, 0, codeFor(20)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(9);
+  EJitSharedDiagnostics before;
+  peer.getDiagnostics(before);
+
+  auto fast = peer.tryCacheHit(20, nullptr, 0);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(fast.readyButNotShareable);
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(fast.fnPtr, nullptr);
+
+  EJitSharedDiagnostics after;
+  peer.getDiagnostics(after);
+  EXPECT_EQ(after.queueDepth, before.queueDepth); // no enqueue/dedup
+  EXPECT_EQ(after.asyncEnqueues, before.asyncEnqueues);
+  EXPECT_EQ(after.pendingCount, before.pendingCount);
+}
+
+// 5/ Mode Off still returns an existing cache hit on the fast path — the cache
+//    lookup is ordered ahead of the Off check, matching compileOrGet.
+TEST_F(SharedTaskPoolTest, TryCacheHitServesHitEvenWhenModeOff) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true); // comes up Async
+  publish(owner, 30);
+
+  // Flip the cross-core mode to Off after the entry is Ready.
+  owner.setSharedMode(EJitCompileMode::Off);
+  EXPECT_EQ(owner.getSharedMode(), EJitCompileMode::Off);
+
+  EJitCoreId::setCurrentForTest(0);
+  auto fast = owner.tryCacheHit(30, nullptr, 0);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fast.fnPtr, codeFor(30));
+  EXPECT_TRUE(fast.hasReadToken);
+  owner.releaseRead(fast.bucketIndex);
+}
+
+//===----------------------------------------------------------------------===//
+// Fixed-dimension fast cache-hit entries (tryCacheHit0D..4D): the unrolled
+// front-halves the C ABI ejit_taskpool_compile_or_get_Nd entries drive. Each
+// must match the generic tryCacheHit() semantics for the matching numDims.
+//===----------------------------------------------------------------------===//
+
+// 0D/1D/2D/3D/4D cache hit: fnPtr + bucket + read token, no enqueue/dedup.
+TEST_F(SharedTaskPoolTest, FixedDimEntriesServeCacheHit) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  owner.setInstanceEnabled(1, 2, true);
+  owner.setInstanceEnabled(2, 3, true);
+  owner.setInstanceEnabled(3, 4, true);
+
+  auto publishDims = [&](uint32_t fi, const EJitDimPair *d, uint32_t n) {
+    ASSERT_EQ(owner.compileOrGet(fi, d, n, codeFor(fi)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+  };
+
+  // 0D
+  publish(owner, 1);
+  auto h0 = owner.tryCacheHit0D(1);
+  EXPECT_TRUE(h0.fastPathTerminal);
+  EXPECT_EQ(h0.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h0.fnPtr, codeFor(1));
+  EXPECT_TRUE(h0.hasReadToken);
+  EXPECT_GT(state_->buckets[h0.bucketIndex].readers.loadAcquire(), 0u);
+  owner.releaseRead(h0.bucketIndex);
+
+  // 1D
+  EJitDimPair d1[1] = {dim(0, 1)};
+  publishDims(2, d1, 1);
+  auto h1 = owner.tryCacheHit1D(2, 0, 1);
+  ASSERT_EQ(h1.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h1.fnPtr, codeFor(2));
+  EXPECT_TRUE(h1.hasReadToken);
+  owner.releaseRead(h1.bucketIndex);
+
+  // 2D
+  EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
+  publishDims(3, d2, 2);
+  auto h2 = owner.tryCacheHit2D(3, 0, 1, 1, 2);
+  ASSERT_EQ(h2.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h2.fnPtr, codeFor(3));
+  owner.releaseRead(h2.bucketIndex);
+
+  // 3D
+  EJitDimPair d3[3] = {dim(0, 1), dim(1, 2), dim(2, 3)};
+  publishDims(4, d3, 3);
+  auto h3 = owner.tryCacheHit3D(4, 0, 1, 1, 2, 2, 3);
+  ASSERT_EQ(h3.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h3.fnPtr, codeFor(4));
+  owner.releaseRead(h3.bucketIndex);
+
+  // 4D
+  EJitDimPair d4[4] = {dim(0, 1), dim(1, 2), dim(2, 3), dim(3, 4)};
+  publishDims(5, d4, 4);
+  auto h4 = owner.tryCacheHit4D(5, 0, 1, 1, 2, 2, 3, 3, 4);
+  ASSERT_EQ(h4.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(h4.fnPtr, codeFor(5));
+  owner.releaseRead(h4.bucketIndex);
+
+  // Cache hits do not enqueue/dedup.
+  EJitSharedDiagnostics d;
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.queueDepth, 0u);
+  EXPECT_EQ(d.pendingCount, 0u);
+}
+
+// A fixed-dim entry matches the generic path exactly for the same identity.
+TEST_F(SharedTaskPoolTest, FixedDim1DMatchesGeneric) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(2, 5, true);
+  EJitDimPair d1[1] = {dim(2, 5)};
+  ASSERT_EQ(owner.compileOrGet(7, d1, 1, codeFor(7)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  auto generic = owner.tryCacheHit(7, d1, 1);
+  ASSERT_EQ(generic.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(generic.bucketIndex);
+  auto fixed = owner.tryCacheHit1D(7, 2, 5);
+  ASSERT_EQ(fixed.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fixed.fnPtr, generic.fnPtr);
+  EXPECT_EQ(fixed.bucketIndex, generic.bucketIndex);
+  owner.releaseRead(fixed.bucketIndex);
+}
+
+// Disabled instance: fixed entry returns InstanceDisabled, no stale code, no
+// enqueue — including when only a later dim is disabled.
+TEST_F(SharedTaskPoolTest, FixedDimDisabledInstanceReturnsDisabled) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  owner.setInstanceEnabled(1, 2, true);
+  EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
+  ASSERT_EQ(owner.compileOrGet(9, d2, 2, codeFor(9)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  // Disable the SECOND dim only.
+  owner.setInstanceEnabled(1, 2, false);
+  EJitSharedDiagnostics before;
+  owner.getDiagnostics(before);
+  auto fast = owner.tryCacheHit2D(9, 0, 1, 1, 2);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::InstanceDisabled);
+  EXPECT_EQ(fast.fnPtr, nullptr);
+  EXPECT_FALSE(fast.hasReadToken);
+  EJitSharedDiagnostics after;
+  owner.getDiagnostics(after);
+  EXPECT_EQ(after.instanceDisabled, before.instanceDisabled + 1);
+  EXPECT_EQ(after.queueDepth, before.queueDepth);
+}
+
+// Miss: fixed entry is not terminal and does not enqueue; the slow path still
+// enqueues.
+TEST_F(SharedTaskPoolTest, FixedDimMissFallsThrough) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+
+  auto fast = owner.tryCacheHit1D(15, 0, 1);
+  EXPECT_FALSE(fast.fastPathTerminal);
+  EXPECT_NE(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(fast.hasReadToken);
+  EJitSharedDiagnostics d;
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.asyncEnqueues, 0u);
+  EXPECT_EQ(d.queueDepth, 0u);
+
+  EJitDimPair d1[1] = {dim(0, 1)};
+  EXPECT_EQ(owner.compileOrGet(15, d1, 1, codeFor(15)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  owner.getDiagnostics(d);
+  EXPECT_EQ(d.queueDepth, 1u);
+}
+
+// Mode Off still serves an existing cache hit via a fixed entry.
+TEST_F(SharedTaskPoolTest, FixedDimServesHitEvenWhenModeOff) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  publish(owner, 40);
+  owner.setSharedMode(EJitCompileMode::Off);
+  EJitCoreId::setCurrentForTest(0);
+  auto fast = owner.tryCacheHit0D(40);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_EQ(fast.fnPtr, codeFor(40));
+  EXPECT_TRUE(fast.hasReadToken);
+  owner.releaseRead(fast.bucketIndex);
+}
+
+// readyButNotShareable: a peer core that may not read the pointer gets a clean
+// OffMode fallback with no read token and no enqueue via a fixed entry.
+TEST_F(SharedTaskPoolTest, FixedDimReadyButNotShareableCleanFallback) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/false);
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_EQ(owner.compileOrGet(50, nullptr, 0, codeFor(50)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+
+  EJitSharedTaskPool peer;
+  peer.bind(state_.get());
+  EJitCoreId::setCurrentForTest(9);
+  auto fast = peer.tryCacheHit0D(50);
+  EXPECT_TRUE(fast.fastPathTerminal);
+  EXPECT_EQ(fast.status, EJitCompileOrGetStatus::OffMode);
+  EXPECT_TRUE(fast.readyButNotShareable);
+  EXPECT_FALSE(fast.hasReadToken);
+  EXPECT_EQ(fast.fnPtr, nullptr);
+}
+
+// The specialized cacheLookupNd behind each fixed entry must agree with the
+// generic tryCacheHit()/cacheLookup() for the same identity: same fnPtr, same
+// bucket, same CacheHit status across 0D..4D.
+TEST_F(SharedTaskPoolTest, FixedDimCacheLookupMatchesGenericAllDims) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  owner.setInstanceEnabled(1, 2, true);
+  owner.setInstanceEnabled(2, 3, true);
+  owner.setInstanceEnabled(3, 4, true);
+  EJitDimPair d1[1] = {dim(0, 1)};
+  EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
+  EJitDimPair d3[3] = {dim(0, 1), dim(1, 2), dim(2, 3)};
+  EJitDimPair d4[4] = {dim(0, 1), dim(1, 2), dim(2, 3), dim(3, 4)};
+  auto publishDims = [&](uint32_t fi, const EJitDimPair *d, uint32_t n) {
+    ASSERT_EQ(owner.compileOrGet(fi, d, n, codeFor(fi)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+    ASSERT_TRUE(owner.pollOne());
+  };
+  publish(owner, 60);
+  publishDims(61, d1, 1);
+  publishDims(62, d2, 2);
+  publishDims(63, d3, 3);
+  publishDims(64, d4, 4);
+
+  auto cmp = [&](EJitSharedTaskPool::CompileOrGetResult fixed, uint32_t fi,
+                 const EJitDimPair *d, uint32_t n) {
+    auto gen = owner.tryCacheHit(fi, d, n);
+    EXPECT_EQ(fixed.status, EJitCompileOrGetStatus::CacheHit);
+    EXPECT_EQ(fixed.status, gen.status);
+    EXPECT_EQ(fixed.fnPtr, gen.fnPtr);
+    EXPECT_EQ(fixed.bucketIndex, gen.bucketIndex);
+    owner.releaseRead(fixed.bucketIndex);
+    owner.releaseRead(gen.bucketIndex);
+  };
+  cmp(owner.tryCacheHit0D(60), 60, nullptr, 0);
+  cmp(owner.tryCacheHit1D(61, 0, 1), 61, d1, 1);
+  cmp(owner.tryCacheHit2D(62, 0, 1, 1, 2), 62, d2, 2);
+  cmp(owner.tryCacheHit3D(63, 0, 1, 1, 2, 2, 3), 63, d3, 3);
+  cmp(owner.tryCacheHit4D(64, 0, 1, 1, 2, 2, 3, 3, 4), 64, d4, 4);
+}
+
+// Version mismatch: a stale instance version (bumped by a deactivate/activate
+// cycle after publish) must miss on the fixed path exactly as on the generic
+// path — never returning the stale cached pointer.
+TEST_F(SharedTaskPoolTest, FixedDimVersionMismatchMisses) {
+  EJitSharedTaskPool owner;
+  bringUpOwner(owner, /*codeSharing=*/true);
+  EJitCoreId::setCurrentForTest(0);
+  owner.setInstanceEnabled(0, 1, true);
+  owner.setInstanceEnabled(1, 2, true);
+
+  // 1D
+  EJitDimPair d1[1] = {dim(0, 1)};
+  ASSERT_EQ(owner.compileOrGet(70, d1, 1, codeFor(70)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  // Bump the version while leaving the instance ENABLED (disable then enable).
+  owner.setInstanceEnabled(0, 1, false);
+  owner.setInstanceEnabled(0, 1, true);
+  auto genMiss = owner.tryCacheHit(70, d1, 1);
+  auto fixedMiss = owner.tryCacheHit1D(70, 0, 1);
+  EXPECT_FALSE(genMiss.fastPathTerminal);   // stale version → miss
+  EXPECT_FALSE(fixedMiss.fastPathTerminal); // same on the fixed path
+  EXPECT_NE(fixedMiss.status, EJitCompileOrGetStatus::CacheHit);
+  EXPECT_FALSE(fixedMiss.hasReadToken);
+
+  // 2D: bump only the second dim's version.
+  EJitDimPair d2[2] = {dim(0, 1), dim(1, 2)};
+  ASSERT_EQ(owner.compileOrGet(71, d2, 2, codeFor(71)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(owner.pollOne());
+  auto hit2 = owner.tryCacheHit2D(71, 0, 1, 1, 2); // sanity: hits before bump
+  ASSERT_EQ(hit2.status, EJitCompileOrGetStatus::CacheHit);
+  owner.releaseRead(hit2.bucketIndex);
+  owner.setInstanceEnabled(1, 2, false);
+  owner.setInstanceEnabled(1, 2, true);
+  auto fixedMiss2 = owner.tryCacheHit2D(71, 0, 1, 1, 2);
+  EXPECT_FALSE(fixedMiss2.fastPathTerminal);
+  EXPECT_FALSE(fixedMiss2.hasReadToken);
+}
+
 } // namespace

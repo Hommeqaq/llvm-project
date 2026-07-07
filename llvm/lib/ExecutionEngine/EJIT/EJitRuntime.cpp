@@ -457,8 +457,28 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
 
   // ejit_dim_pair_t and EJitDimPair share the same layout; pass through
   // to avoid a stack copy of up to 4 dim pairs.
-  auto r = tp->compileOrGet(funcIndex,
-                            reinterpret_cast<const EJitDimPair *>(dims), numDims,
+  const EJitDimPair *dimsCast = reinterpret_cast<const EJitDimPair *>(dims);
+
+  // Flattened fast cache-hit path: resolve the common terminal outcomes (cache
+  // hit, disabled instance, not-Ready / ready-but-not-shareable fallback)
+  // without entering the full compileOrGet slow path. tryCacheHit preserves the
+  // exact compileOrGet hot-path semantics (ordering, counters, read tokens),
+  // so a hit still hands back outBucket for ejit_taskpool_release_read and a
+  // disabled instance never returns stale code. A true miss falls through to
+  // compileOrGet unchanged (enqueue/dedup/compile).
+  auto fast = tp->tryCacheHit(funcIndex, dimsCast, numDims);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u fast status=%u fn=%p",
+                      funcIndex, static_cast<unsigned>(fast.status),
+                      fast.fnPtr);
+    return taskpoolStatus(fast.status);
+  }
+
+  auto r = tp->compileOrGet(funcIndex, dimsCast, numDims,
                             /*fallback=*/nullptr);
   if (outFn)
     *outFn = r.fnPtr;
@@ -466,6 +486,198 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outBucket = r.bucketIndex;
   EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u status=%u fn=%p",
                     funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
+  return taskpoolStatus(r.status);
+}
+
+//===----------------------------------------------------------------------===//
+// Fixed-dimension C ABI fast paths (0-4 dims).
+//
+// Additive entry points that pass the dim identity as scalar arguments instead
+// of an EJitDimPair* + numDims pair. They skip the generic entry's numDims
+// bound check, null-dims check, and variable-length validation loop, and drive
+// the pool's unrolled tryCacheHitNd() so a cache hit reaches the cache lookup
+// with the least overhead. Semantics (status mapping, read-token / outBucket
+// ownership, InstanceDisabled / OffMode / readyButNotShareable, and the
+// fall-through to compileOrGet on a true miss) are identical to
+// ejit_taskpool_compile_or_get with the matching numDims. The original generic
+// entry is retained unchanged as the fallback for >4 dims and existing wrapper
+// output.
+//===----------------------------------------------------------------------===//
+namespace {
+inline bool ejitTaskpoolDimInRange(uint32_t dimType, uint32_t instanceId) {
+  return dimType < EJitSwitchController::MAX_DIM_TYPES &&
+         instanceId < EJitSwitchController::MAX_INSTANCES;
+}
+} // namespace
+
+ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
+                                              uint32_t *outBucket) {
+  if (outFn)
+    *outFn = nullptr;
+  if (outBucket)
+    *outBucket = 0;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *tp = activeTaskPool();
+  if (!tp)
+    return EJIT_ERR_NOT_ACTIVE;
+
+  auto fast = tp->tryCacheHit0D(funcIndex);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    return taskpoolStatus(fast.status);
+  }
+  auto r = tp->compileOrGet(funcIndex, nullptr, 0, /*fallback=*/nullptr);
+  if (outFn)
+    *outFn = r.fnPtr;
+  if (outBucket)
+    *outBucket = r.bucketIndex;
+  return taskpoolStatus(r.status);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
+                                              uint32_t inst0, void **outFn,
+                                              uint32_t *outBucket) {
+  if (outFn)
+    *outFn = nullptr;
+  if (outBucket)
+    *outBucket = 0;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *tp = activeTaskPool();
+  if (!tp)
+    return EJIT_ERR_NOT_ACTIVE;
+  if (!ejitTaskpoolDimInRange(dim0, inst0))
+    return EJIT_ERR_INVALID_PARAM;
+
+  auto fast = tp->tryCacheHit1D(funcIndex, dim0, inst0);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    return taskpoolStatus(fast.status);
+  }
+  const EJitDimPair dims[1] = {{dim0, inst0}};
+  auto r = tp->compileOrGet(funcIndex, dims, 1, /*fallback=*/nullptr);
+  if (outFn)
+    *outFn = r.fnPtr;
+  if (outBucket)
+    *outBucket = r.bucketIndex;
+  return taskpoolStatus(r.status);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
+                                              uint32_t inst0, uint32_t dim1,
+                                              uint32_t inst1, void **outFn,
+                                              uint32_t *outBucket) {
+  if (outFn)
+    *outFn = nullptr;
+  if (outBucket)
+    *outBucket = 0;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *tp = activeTaskPool();
+  if (!tp)
+    return EJIT_ERR_NOT_ACTIVE;
+  if (!ejitTaskpoolDimInRange(dim0, inst0) ||
+      !ejitTaskpoolDimInRange(dim1, inst1))
+    return EJIT_ERR_INVALID_PARAM;
+
+  auto fast = tp->tryCacheHit2D(funcIndex, dim0, inst0, dim1, inst1);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    return taskpoolStatus(fast.status);
+  }
+  const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
+  auto r = tp->compileOrGet(funcIndex, dims, 2, /*fallback=*/nullptr);
+  if (outFn)
+    *outFn = r.fnPtr;
+  if (outBucket)
+    *outBucket = r.bucketIndex;
+  return taskpoolStatus(r.status);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
+                                              uint32_t inst0, uint32_t dim1,
+                                              uint32_t inst1, uint32_t dim2,
+                                              uint32_t inst2, void **outFn,
+                                              uint32_t *outBucket) {
+  if (outFn)
+    *outFn = nullptr;
+  if (outBucket)
+    *outBucket = 0;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *tp = activeTaskPool();
+  if (!tp)
+    return EJIT_ERR_NOT_ACTIVE;
+  if (!ejitTaskpoolDimInRange(dim0, inst0) ||
+      !ejitTaskpoolDimInRange(dim1, inst1) ||
+      !ejitTaskpoolDimInRange(dim2, inst2))
+    return EJIT_ERR_INVALID_PARAM;
+
+  auto fast =
+      tp->tryCacheHit3D(funcIndex, dim0, inst0, dim1, inst1, dim2, inst2);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    return taskpoolStatus(fast.status);
+  }
+  const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
+  auto r = tp->compileOrGet(funcIndex, dims, 3, /*fallback=*/nullptr);
+  if (outFn)
+    *outFn = r.fnPtr;
+  if (outBucket)
+    *outBucket = r.bucketIndex;
+  return taskpoolStatus(r.status);
+}
+
+ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
+                                              uint32_t inst0, uint32_t dim1,
+                                              uint32_t inst1, uint32_t dim2,
+                                              uint32_t inst2, uint32_t dim3,
+                                              uint32_t inst3, void **outFn,
+                                              uint32_t *outBucket) {
+  if (outFn)
+    *outFn = nullptr;
+  if (outBucket)
+    *outBucket = 0;
+  if (!gEJIT)
+    return EJIT_ERR_NOT_ACTIVE;
+  auto *tp = activeTaskPool();
+  if (!tp)
+    return EJIT_ERR_NOT_ACTIVE;
+  if (!ejitTaskpoolDimInRange(dim0, inst0) ||
+      !ejitTaskpoolDimInRange(dim1, inst1) ||
+      !ejitTaskpoolDimInRange(dim2, inst2) ||
+      !ejitTaskpoolDimInRange(dim3, inst3))
+    return EJIT_ERR_INVALID_PARAM;
+
+  auto fast = tp->tryCacheHit4D(funcIndex, dim0, inst0, dim1, inst1, dim2,
+                                inst2, dim3, inst3);
+  if (fast.fastPathTerminal) {
+    if (outFn)
+      *outFn = fast.fnPtr;
+    if (outBucket)
+      *outBucket = fast.bucketIndex;
+    return taskpoolStatus(fast.status);
+  }
+  const EJitDimPair dims[4] = {
+      {dim0, inst0}, {dim1, inst1}, {dim2, inst2}, {dim3, inst3}};
+  auto r = tp->compileOrGet(funcIndex, dims, 4, /*fallback=*/nullptr);
+  if (outFn)
+    *outFn = r.fnPtr;
+  if (outBucket)
+    *outBucket = r.bucketIndex;
   return taskpoolStatus(r.status);
 }
 

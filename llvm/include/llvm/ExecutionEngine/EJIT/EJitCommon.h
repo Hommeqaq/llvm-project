@@ -59,6 +59,18 @@ constexpr const char *FN_REGISTER_LIFECYCLE = "ejit_register_lifecycle";
 constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
+// Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper
+// when -ejit-wrapper-fixed-dim-entry is enabled and the entry has <= 4 dims.
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_0D =
+    "ejit_taskpool_compile_or_get_0d";
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_1D =
+    "ejit_taskpool_compile_or_get_1d";
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_2D =
+    "ejit_taskpool_compile_or_get_2d";
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
+    "ejit_taskpool_compile_or_get_3d";
+constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
+    "ejit_taskpool_compile_or_get_4d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
 // PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no

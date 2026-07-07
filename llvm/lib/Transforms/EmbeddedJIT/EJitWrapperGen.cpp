@@ -43,6 +43,17 @@ static cl::opt<bool> EJitNoInlineEntry(
     cl::desc("Add noinline attribute to ejit_entry functions to prevent the "
              "CGSCC inliner from duplicating the JIT wrapper into callers"));
 
+// Temporary opt-in: emit the fixed-dimension taskpool fast-path C ABI calls
+// (ejit_taskpool_compile_or_get_Nd, N = dim count) for entries with <= 4 dims
+// instead of the generic ejit_taskpool_compile_or_get. Default OFF so existing
+// wrapper output / lit tests are unaffected; entries with > 4 dims always use
+// the generic entry.
+static cl::opt<bool> EJitWrapperFixedDimEntry(
+    "ejit-wrapper-fixed-dim-entry", cl::init(false), cl::Hidden,
+    cl::desc("Emit fixed-dimension taskpool fast-path calls "
+             "(ejit_taskpool_compile_or_get_Nd) for ejit_entry functions with "
+             "<= 4 dims instead of the generic ejit_taskpool_compile_or_get"));
+
 // Wrapper generation now unconditionally uses the unified taskpool API
 // (ejit_taskpool_compile_or_get + ejit_taskpool_release_read). Both Sync
 // and Async modes are runtime-configurable — the AOT wrapper code is
@@ -470,9 +481,22 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // invalid, branch straight to the AOT fallback without entering either
     // compile path.
     IRBuilder<> Builder(JitEntry);
+    // Emit the fixed-dimension fast-path C API only for 0/1/2-dim entries when
+    // the opt-in flag is set. Rationale (measured on aarch64, -Os): 0D/1D/2D
+    // pass funcIndex + up to 4 dim scalars + 2 out pointers, which still fit in
+    // the 8 integer argument registers (no stack spill) and hit a specialized
+    // cacheLookupNd with the numDims/identity/version loops fully unrolled. A
+    // 3D call needs 9 and a 4D call 11 integer arguments, spilling to the stack
+    // at every call site, which cancels the lookup saving — so 3D/4D keep using
+    // the generic ejit_taskpool_compile_or_get (one dim-array pointer). The
+    // fixed 3D/4D C APIs still exist and are semantically correct for direct
+    // callers; the wrapper just does not select them.
+    bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
-    Value *DimsAlloca =
-        Builder.CreateAlloca(ArrayType::get(DimPairTy, 4), nullptr, "ejit_dims");
+    Value *DimsAlloca = UseFixed
+                            ? nullptr
+                            : Builder.CreateAlloca(ArrayType::get(DimPairTy, 4),
+                                                   nullptr, "ejit_dims");
     Value *OutFnAlloca =
         Builder.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
     Value *OutBucketAlloca =
@@ -483,40 +507,76 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
     Builder.CreateCondBr(IdxValid, JitCall, JitFallback);
 
-    // jit_call: unified taskpool API (ejit_taskpool_compile_or_get). Both
-    // Sync and Async modes share the same AOT wrapper — the runtime compile
-    // mode controls whether compilation is inline or via a background worker.
+    // jit_call: unified taskpool API. Both Sync and Async modes share the same
+    // AOT wrapper — the runtime compile mode controls whether compilation is
+    // inline or via a background worker.
     Builder.SetInsertPoint(JitCall);
-    for (unsigned I = 0; I < DimCount; ++I) {
-      Value *Idxs[] = {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, I)};
-      Value *PairPtr = Builder.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
-                                                 DimsAlloca, Idxs);
-      Value *DimTypePtr =
-          Builder.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr");
-      Value *InstancePtr =
-          Builder.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr");
-      Value *DimTypeVal = Builder.CreateLoad(
-          I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName], "ejit_dimtype");
-      Builder.CreateStore(DimTypeVal, DimTypePtr);
 
+    // Load each dim's (dimType, instanceId) as i32. Shared by both emitters.
+    auto emitDimTypeVal = [&](unsigned I) {
+      return Builder.CreateLoad(I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName],
+                                "ejit_dimtype");
+    };
+    auto emitInstanceVal = [&](unsigned I) -> Value * {
       Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
       unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
-      Value *InstanceId = ArgVal;
       if (BW > 32)
-        InstanceId = Builder.CreateTrunc(ArgVal, I32Ty);
-      else if (BW < 32)
-        InstanceId = Builder.CreateZExt(ArgVal, I32Ty);
-      Builder.CreateStore(InstanceId, InstancePtr);
-    }
+        return Builder.CreateTrunc(ArgVal, I32Ty);
+      if (BW < 32)
+        return Builder.CreateZExt(ArgVal, I32Ty);
+      return ArgVal;
+    };
 
-    Value *DimsPtr =
-        DimCount > 0 ? Builder.CreatePointerCast(DimsAlloca, PtrTy)
-                     : ConstantPointerNull::get(PtrTy);
-    Value *Status = Builder.CreateCall(
-        M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
-        {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount),
-         Builder.CreatePointerCast(OutFnAlloca, PtrTy),
-         Builder.CreatePointerCast(OutBucketAlloca, PtrTy)});
+    Value *OutFnArg = Builder.CreatePointerCast(OutFnAlloca, PtrTy);
+    Value *OutBucketArg = Builder.CreatePointerCast(OutBucketAlloca, PtrTy);
+    Value *Status = nullptr;
+    if (UseFixed) {
+      // ejit_taskpool_compile_or_get_Nd(i32 funcIndex,
+      //     [i32 dimType, i32 instanceId] * N, ptr outFn, ptr outBucket)
+      static const char *const FixedNames[] = {
+          FN_TASKPOOL_COMPILE_OR_GET_0D, FN_TASKPOOL_COMPILE_OR_GET_1D,
+          FN_TASKPOOL_COMPILE_OR_GET_2D, FN_TASKPOOL_COMPILE_OR_GET_3D,
+          FN_TASKPOOL_COMPILE_OR_GET_4D};
+      SmallVector<Type *, 12> ParamTys;
+      SmallVector<Value *, 12> Args;
+      ParamTys.push_back(I32Ty);
+      Args.push_back(FuncIdx);
+      for (unsigned I = 0; I < DimCount; ++I) {
+        Value *DimTypeVal = emitDimTypeVal(I);
+        Value *InstanceId = emitInstanceVal(I);
+        ParamTys.push_back(I32Ty);
+        ParamTys.push_back(I32Ty);
+        Args.push_back(DimTypeVal);
+        Args.push_back(InstanceId);
+      }
+      ParamTys.push_back(PtrTy);
+      ParamTys.push_back(PtrTy);
+      Args.push_back(OutFnArg);
+      Args.push_back(OutBucketArg);
+      FunctionCallee FixedFn = M.getOrInsertFunction(
+          FixedNames[DimCount], FunctionType::get(I32Ty, ParamTys, false));
+      Status = Builder.CreateCall(FixedFn, Args);
+    } else {
+      for (unsigned I = 0; I < DimCount; ++I) {
+        Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
+                         ConstantInt::get(I32Ty, I)};
+        Value *PairPtr = Builder.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
+                                                   DimsAlloca, Idxs);
+        Value *DimTypePtr =
+            Builder.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr");
+        Value *InstancePtr =
+            Builder.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr");
+        Builder.CreateStore(emitDimTypeVal(I), DimTypePtr);
+        Builder.CreateStore(emitInstanceVal(I), InstancePtr);
+      }
+      Value *DimsPtr = DimCount > 0
+                           ? Builder.CreatePointerCast(DimsAlloca, PtrTy)
+                           : ConstantPointerNull::get(PtrTy);
+      Status = Builder.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
+                                  {FuncIdx, DimsPtr,
+                                   ConstantInt::get(I32Ty, DimCount), OutFnArg,
+                                   OutBucketArg});
+    }
     Value *OutFn = Builder.CreateLoad(PtrTy, OutFnAlloca, "ejit_fn");
     Value *HitStatus =
         Builder.CreateICmpEQ(Status, ConstantInt::get(I32Ty, 0));
