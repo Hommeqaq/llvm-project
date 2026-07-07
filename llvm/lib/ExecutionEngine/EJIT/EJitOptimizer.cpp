@@ -35,34 +35,52 @@ EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
   EJitPassBuilder::registerModuleAnalyses(MAM_);
   EJitPassBuilder::crossRegisterProxies(LAM_, FAM_, CGAM_, MAM_);
 
-  // Pre-build cached pass pipelines.
-  // L1: SCCP + ADCE + SimplifyCFG (always runs).
-  L1FPM_.addPass(SCCPPass());
-  L1FPM_.addPass(ADCEPass());
-  L1FPM_.addPass(SimplifyCFGPass());
-
-  // L2: reserved for post-inline cleanup.
-  // TODO: populate once inlining is re-enabled in runPipeline.
-
-  // L3: LoopSimplify → FullUnroll → IndVarSimplify → LoopDeletion →
-  //     Promote → SCCP → SimplifyCFG.
+  // Pre-build the two cached FunctionPassManagers of the optimization pipeline.
   //
-  // FullUnroll handles small bounded loops (budget ~150 instructions).
-  // For larger loops whose trip count is a may_const, IndVarSimplify uses SCEV
-  // to replace the accumulator phi with a closed-form exit value, then
-  // LoopDeletion removes the now-dead loop.  A second SCCP pass propagates the
-  // freshly-computed loop-exit constants through the rest of the function.
-  L3FPM_.addPass(LoopSimplifyPass());
+  // By the time these run, runPipeline has turned the period-index argument and
+  // every may_const field into a compile-time constant. The pipeline's whole job
+  // is to exploit those constants maximally, so it is structured as a fold →
+  // propagate → simplify fixed point followed by loop folding.
+  //
+  // mainFPM_ — Phase 2 (scalar) then Phase 3 (loops):
+  //
+  //   Phase 2 drives the substituted constants to a fixed point. The first round
+  //   peephole-folds the constants (InstCombine), propagates them and folds the
+  //   now-constant branches (SCCP), and deletes the unreachable blocks
+  //   (SimplifyCFG). Folding a branch merges blocks and exposes fresh constants
+  //   and dead code, so a second InstCombine + SimplifyCFG round catches that
+  //   cascade; ADCE then removes whatever became dead.
+  mainFPM_.addPass(InstCombinePass());
+  mainFPM_.addPass(SCCPPass());
+  mainFPM_.addPass(SimplifyCFGPass());
+  mainFPM_.addPass(InstCombinePass());
+  mainFPM_.addPass(SimplifyCFGPass());
+  mainFPM_.addPass(ADCEPass());
+  //   Phase 3 folds loops whose bounds became constant (a no-op on loopless
+  //   functions). LoopSimplify canonicalizes; LoopFullUnroll unrolls small
+  //   bounded loops; IndVarSimplify uses SCEV to replace a larger loop's
+  //   accumulator phi with its closed-form exit value; LoopDeletion removes the
+  //   emptied loop; Promote returns any loop-created allocas to SSA.
+  mainFPM_.addPass(LoopSimplifyPass());
   {
     LoopPassManager LPM;
     LPM.addPass(LoopFullUnrollPass());
     LPM.addPass(IndVarSimplifyPass());
     LPM.addPass(LoopDeletionPass());
-    L3FPM_.addPass(createFunctionToLoopPassAdaptor(std::move(LPM)));
+    mainFPM_.addPass(createFunctionToLoopPassAdaptor(std::move(LPM)));
   }
-  L3FPM_.addPass(PromotePass());
-  L3FPM_.addPass(SCCPPass());
-  L3FPM_.addPass(SimplifyCFGPass());
+  mainFPM_.addPass(PromotePass());
+
+  // cleanupFPM_ — Phase 4, run after the second StructFieldPass. Unrolling turns
+  // a loop-variant array access g_arr[k].field into constant-index GEPs
+  // (g_arr[0]/[1]/...), which only then become substitutable. Once
+  // StructFieldPass replaces them, this fold/propagate/simplify pass collapses
+  // the freshly-constant values and drops what became dead — the same treatment
+  // Phase 2 gave the first wave of constants.
+  cleanupFPM_.addPass(InstCombinePass());
+  cleanupFPM_.addPass(SCCPPass());
+  cleanupFPM_.addPass(SimplifyCFGPass());
+  cleanupFPM_.addPass(ADCEPass());
 }
 
 void EJitOptimizer::clearAnalyses() {
@@ -80,32 +98,26 @@ void EJitOptimizer::runPipeline(Module &M,
                     static_cast<int>(ctx.optLevel), ctx.dimensions.size(),
                     M.getName().str().c_str());
 
-  // 1. Parameter substitution: replace ejit_period_arr_ind args with constants
+  // Phase 1 — specialize: turn the period index and every may_const field into
+  // a compile-time constant.
+  //   (a) Substitute the ejit_period_arr_ind argument with its constant index.
   preReplacePeriodIndices(M, ctx);
-  EJIT_DIAG_DEBUG("pipeline stage1 done: preReplacePeriodIndices");
-
-  // 2. InstCombine: fold constant GEP chains from substituted params
-  //    so StructFieldPass can compute correct byte offsets.
+  EJIT_DIAG_DEBUG("pipeline phase1a done: preReplacePeriodIndices");
+  //   (b) Fold the constant GEP chains that exposes so StructFieldPass can
+  //       compute the byte offset of each may_const field access.
   runInstCombine(M);
-  EJIT_DIAG_DEBUG("pipeline stage2 done: InstCombine");
-
-  // 3. Inline (L2+): currently disabled. The AOT pre-optimization in
-  //    EJitRegisterBitcodePass already runs AlwaysInline + ModuleInliner(O2),
-  //    so callee bodies are already expanded in the embedded bitcode and
-  //    their may_const GEP chains are directly traceable to global variables.
-  //    Skipping this saves JIT compile time at the cost of missing inlines
-  //    that only become profitable after parameter substitution.
-  // if (static_cast<int>(ctx.optLevel) >= 2) {
-  //   ModulePassManager MPM;
-  //   MPM.addPass(AlwaysInlinerPass());
-  //   MPM.run(M, MAM_);
-  // }
-
-  // 4. StructFieldPass: replace may_const loads with runtime constants.
+  EJIT_DIAG_DEBUG("pipeline phase1b done: InstCombine");
+  // Inlining is intentionally not run here: the AOT pre-optimization
+  // (EJitRegisterBitcodePass: AlwaysInline + ModuleInliner(O2)) already expanded
+  // callee bodies in the embedded bitcode, so their may_const GEP chains are
+  // already traceable to the global.
+  //   (c) Replace the may_const loads with their runtime constant values.
   runStructFieldPass(M);
-  EJIT_DIAG_DEBUG("pipeline stage4 done: StructFieldPass");
+  EJIT_DIAG_DEBUG("pipeline phase1c done: StructFieldPass");
 
-  // 5. Core optimization at the configured level
+  // Phases 2-4 — exploit those constants (scalar fixed point → loops →
+  // re-specialize → cleanup). ctx.optLevel is accepted for ABI compatibility
+  // and does not affect the pipeline.
   runOptimizationPipeline(M, ctx.optLevel);
   EJIT_DIAG_VERBOSE("pipeline done func=%s key=0x%016lx", ctx.fnName.c_str(),
                     ctx.cacheKey);
@@ -169,34 +181,21 @@ void EJitOptimizer::runStructFieldPass(Module &M) {
 
 void EJitOptimizer::runOptimizationPipeline(Module &M,
                                             OptimizationLevel level) {
-  EJIT_DIAG_DEBUG("pipeline stage5: core opt level=%d module=%s",
-                  static_cast<int>(level), M.getName().str().c_str());
-  // L1: SCCP + ADCE + SimplifyCFG — constant propagation, dead code
-  // elimination, and CFG cleanup. Captures the vast majority of EJIT
-  // performance gains (may_const load → constant → branch folding).
-  // L1FPM_ is pre-built in the constructor and reused across compilations.
+  // One fixed pipeline; `level` does not affect it.
+  (void)level;
+  EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s",
+                  M.getName().str().c_str());
+
+  // Phases 2-3: scalar fold/propagate/simplify fixed point, then loop folding.
   for (Function &F : M.functions())
     if (!F.isDeclaration())
-      L1FPM_.run(F, FAM_);
+      mainFPM_.run(F, FAM_);
 
-  // L2: SimplifyCFG cleanup. Inline now runs in runPipeline (before
-  // StructFieldPass), so no need to re-run StructFieldPass here.
-  if (static_cast<int>(level) >= 2) {
-    for (Function &F : M.functions())
-      if (!F.isDeclaration())
-        L2FPM_.run(F, FAM_);
-  }
-
-  // L3: Unroll small loops with may_const-dependent bodies. Re-run
-  // StructFieldPass because loop unrolling can turn loop-variant GEP
-  // indices into constants (e.g. g_cfg[i].field → g_cfg[0].field,
-  // g_cfg[1].field after unrolling).
-  if (static_cast<int>(level) >= 3) {
-    for (Function &F : M.functions())
-      if (!F.isDeclaration())
-        L3FPM_.run(F, FAM_);
-
-    runStructFieldPass(M);
-    runInstCombine(M);
-  }
+  // Phase 4: unrolling exposed new constant-index array accesses
+  // (g_arr[k].field → g_arr[0].field, g_arr[1].field, ...). Substitute them,
+  // then fold/propagate/simplify the freshly-constant values.
+  runStructFieldPass(M);
+  for (Function &F : M.functions())
+    if (!F.isDeclaration())
+      cleanupFPM_.run(F, FAM_);
 }

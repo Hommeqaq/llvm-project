@@ -1,13 +1,16 @@
 /**
- * EJIT 优化等级测试 — 覆盖 L1 / L2 / L3
+ * EJIT 优化等级测试 — L1 / L2 / L3
  *
- * 每个等级独立进程 (EJitRegistrationStore 只能 consume 一次),
- * 验证 JIT 编译成功 (entries > 0) 且结果正确。
+ * NOTE: the L1/L2/L3 optimizer tiers have been collapsed into a single fixed
+ * pipeline. optLevel is still accepted (ABI compatibility) but no longer selects
+ * a pipeline — every level runs the full specialization and must produce the
+ * same correct result. This test therefore verifies that JIT compilation
+ * succeeds and the result is correct for whichever level is passed.
+ *
+ * 每个等级独立进程 (EJitRegistrationStore 只能 consume 一次)。
  *
  * 用法:
- *   ./ejit_opt_level L1    # 测试 L1 (SCCP + ADCE + SimplifyCFG)
- *   ./ejit_opt_level L2    # 测试 L2 (L1 + AlwaysInliner + SimplifyCFG)
- *   ./ejit_opt_level L3    # 测试 L3 (L2 + LoopSimplify + LoopFullUnroll + Promote)
+ *   ./ejit_opt_level L1|L2|L3   # all run the same collapsed pipeline
  *
  * 编译:
  *   build/bin/clang -O2 -c ejit_test/ejit_opt_level_test.c -o /tmp/opt_level.o

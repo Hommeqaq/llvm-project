@@ -51,8 +51,12 @@ private:
   /// Run EJitStructFieldPass on all functions.
   void runStructFieldPass(Module &M);
 
-  /// Run core optimization: L1 = SCCP+ADCE+SimplifyCFG,
-  /// L2 = + AlwaysInliner + cleanup, L3 = + LoopUnroll + cleanup.
+  /// Run the EJIT optimization pipeline: a single fused sequence that exploits
+  /// the just-substituted period-index / may_const constants to their fixed
+  /// point (scalar fold/propagate/simplify), folds loops whose bounds became
+  /// constant, re-specializes the array accesses that unrolling turns into
+  /// constant-index GEPs, then does a final cleanup. `level` is accepted for ABI
+  /// compatibility and does not affect the pipeline.
   void runOptimizationPipeline(Module &M, OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
@@ -64,10 +68,13 @@ private:
   CGSCCAnalysisManager CGAM_;
   ModuleAnalysisManager MAM_;
 
-  // Cached pass pipelines — created once, reused across compilations.
-  FunctionPassManager L1FPM_;   // SCCP + ADCE + SimplifyCFG (always runs)
-  FunctionPassManager L2FPM_;   // SimplifyCFG only (L2 inline cleanup)
-  FunctionPassManager L3FPM_;   // LoopSimplify + LoopFullUnroll + Promote + SimplifyCFG
+  // Cached pass managers, built once and reused across compilations:
+  //   mainFPM_    scalar fold/propagate/simplify to a fixed point, then loop
+  //               fold-to-constant (Phases 2-3).
+  //   cleanupFPM_ fold/propagate/simplify after unrolling re-exposes constant
+  //               array accesses and the second StructFieldPass (Phase 4).
+  FunctionPassManager mainFPM_;
+  FunctionPassManager cleanupFPM_;
 
   // Grant the unit-test accessor visibility into the private pipeline steps.
   // runPipeline() remains the only production entry point; this friend keeps

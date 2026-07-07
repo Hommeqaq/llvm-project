@@ -34,6 +34,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #ifndef EJIT_FREESTANDING
 #include <thread>
@@ -2215,6 +2216,49 @@ TEST(EJitOptimizer, OptimizationL3LoopUnroll) {
 }
 
 //===----------------------------------------------------------------------===//
+// Pipeline-collapse proof tests
+//
+// The L1/L2/L3 optimizer tiers were collapsed into one fixed pipeline. These
+// prove the collapse is behavior-preserving:
+//   * level-equivalence — optimizing the SAME module at L1, L2, and L3 yields
+//     byte-identical IR (the optimizer no longer branches on the level);
+//   * no-regression — that IR is the fully optimized form the old L3 produced
+//     (the loop is unrolled and folded to the constant 6). Pre-collapse the L1
+//     output would still contain the loop, so this would have failed.
+//===----------------------------------------------------------------------===//
+
+// Optimize a fresh copy of createLoopFunc at `lvl` and return the printed IR.
+static std::string optimizeLoopFnAt(llvm::ejit::OptimizationLevel lvl) {
+  LLVMContext Ctx;
+  auto M = createTestModule(Ctx, "collapse_equiv");
+  createLoopFunc(Ctx, *M);
+  PeriodArrayRegistry reg;
+  EJitOptimizerTestAccess opt(reg);
+  opt.runInstCombine(*M);
+  opt.runOptimizationPipeline(*M, lvl);
+  std::string Out;
+  raw_string_ostream OS(Out);
+  M->print(OS, nullptr);
+  return Out;
+}
+
+TEST(EJitOptimizer, PipelineCollapseLevelEquivalence) {
+  std::string L1 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L1);
+  std::string L2 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L2);
+  std::string L3 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L3);
+
+  // Collapse proof: every level runs the identical single pipeline.
+  EXPECT_EQ(L1, L2) << "L1 vs L2 IR differs — the tiers were not collapsed";
+  EXPECT_EQ(L2, L3) << "L2 vs L3 IR differs — the tiers were not collapsed";
+
+  // No-regression proof: the single pipeline still fully optimizes at EVERY
+  // level (loop unrolled + folded to constant 6 — the old L3 outcome). Under the
+  // old tiers, L1 kept the loop and this find() would fail.
+  EXPECT_NE(L1.find("ret i32 6"), std::string::npos)
+      << "collapsed pipeline did not fold the loop at L1 (regressed vs old L3)";
+}
+
+//===----------------------------------------------------------------------===//
 // End-to-end tests
 //===----------------------------------------------------------------------===//
 
@@ -2309,6 +2353,44 @@ TEST(EJitEndToEnd, BranchFolding) {
   ASSERT_NE(RetVal, nullptr);
   // mock.val = 1 => branch taken => result = 100
   EXPECT_EQ(RetVal->getSExtValue(), 100);
+}
+
+// Second collapse-proof, on a different function shape: a may_const field
+// driving a branch (not a loop). Specialize it through the full pipeline at L1,
+// L2, and L3 and confirm the output IR is byte-identical (level does not change
+// the pipeline) and fully folded (branch resolved to the constant 100).
+static std::string specializeBranchAt(llvm::ejit::OptimizationLevel lvl) {
+  LLVMContext Ctx;
+  auto M = std::make_unique<Module>("branch_equiv", Ctx);
+  M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  createBranchOnMayConstFunc(Ctx, *M);
+
+  struct MockCfg {
+    int32_t val;
+  } mock = {1}; // non-zero → "then" branch → result 100
+  PeriodArrayRegistry reg;
+  reg.registerStaticVar("g_branch_cfg", &mock);
+
+  EJitOptimizerTestAccess opt(reg);
+  opt.runInstCombine(*M);
+  opt.runStructFieldPass(*M);
+  opt.runOptimizationPipeline(*M, lvl);
+
+  std::string Out;
+  raw_string_ostream OS(Out);
+  M->print(OS, nullptr);
+  return Out;
+}
+
+TEST(EJitEndToEnd, PipelineLevelEquivalenceBranch) {
+  std::string L1 = specializeBranchAt(llvm::ejit::OptimizationLevel::L1);
+  std::string L2 = specializeBranchAt(llvm::ejit::OptimizationLevel::L2);
+  std::string L3 = specializeBranchAt(llvm::ejit::OptimizationLevel::L3);
+
+  EXPECT_EQ(L1, L2) << "L1 vs L2 IR differs — level changed the pipeline";
+  EXPECT_EQ(L2, L3) << "L2 vs L3 IR differs — level changed the pipeline";
+  EXPECT_NE(L1.find("ret i32 100"), std::string::npos)
+      << "pipeline did not fold the may_const branch to the constant 100";
 }
 
 //===----------------------------------------------------------------------===//
