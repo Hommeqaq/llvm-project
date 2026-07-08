@@ -302,3 +302,107 @@ void checkEjitPeriodArrIndLimit(Sema &S, const FunctionDecl *FD) {
     }
   }
 }
+
+/// If \p E is an lvalue that writes an ejit_may_const field, return that field
+/// and set \p BaseVar to the underlying variable (if any). Strips parentheses
+/// and implicit casts, and walks through array-subscript / member chains to
+/// find the innermost variable (e.g. g_cells[i].a -> g_cells, p->a -> p,
+/// s.inner.a -> s).
+static const FieldDecl *findMayConstWriteTarget(Expr *E,
+                                                const VarDecl *&BaseVar) {
+  BaseVar = nullptr;
+  if (!E)
+    return nullptr;
+
+  E = E->IgnoreParenImpCasts();
+  auto *ME = dyn_cast<MemberExpr>(E);
+  if (!ME)
+    return nullptr;
+
+  auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
+  if (!FD || !FD->hasAttr<EjitMayConstAttr>())
+    return nullptr;
+
+  // Walk the base of the MemberExpr to find the underlying variable.
+  Expr *Base = ME->getBase()->IgnoreParenImpCasts();
+  while (true) {
+    if (auto *ASE = dyn_cast<ArraySubscriptExpr>(Base)) {
+      Base = ASE->getBase()->IgnoreParenImpCasts();
+    } else if (auto *InnerME = dyn_cast<MemberExpr>(Base)) {
+      Base = InnerME->getBase()->IgnoreParenImpCasts();
+    } else {
+      break;
+    }
+  }
+  if (auto *DRE = dyn_cast<DeclRefExpr>(Base))
+    if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+      BaseVar = VD;
+
+  return FD;
+}
+
+namespace {
+
+/// Visitor that locates writes to ejit_may_const fields within a function body.
+class EjitMayConstWriteVisitor
+    : public RecursiveASTVisitor<EjitMayConstWriteVisitor> {
+  Sema &S;
+
+public:
+  explicit EjitMayConstWriteVisitor(Sema &S) : S(S) {}
+
+  bool VisitBinaryOperator(BinaryOperator *BO) {
+    if (BO->isAssignmentOp() || BO->isCompoundAssignmentOp())
+      checkWrite(BO->getLHS(), BO->getOperatorLoc());
+    return true;
+  }
+
+  bool VisitUnaryOperator(UnaryOperator *UO) {
+    if (UO->isIncrementDecrementOp())
+      checkWrite(UO->getSubExpr(), UO->getOperatorLoc());
+    return true;
+  }
+
+private:
+  /// If \p Target designates an ejit_may_const field, emit the warning.
+  void checkWrite(Expr *Target, SourceLocation Loc) {
+    const VarDecl *BaseVar = nullptr;
+    const FieldDecl *MayConstField = findMayConstWriteTarget(Target, BaseVar);
+    if (!MayConstField)
+      return;
+    // %0 = the may_const field; %1 = the variable that holds the struct.
+    // Falls back to the field's parent record when no base variable is
+    // identifiable (e.g. writes through unusual rvalue bases).
+    if (BaseVar)
+      S.Diag(Loc, diag::warn_ejit_may_const_modified_without_lc)
+          << MayConstField << BaseVar;
+    else
+      S.Diag(Loc, diag::warn_ejit_may_const_modified_without_lc)
+          << MayConstField << MayConstField->getParent();
+  }
+};
+
+} // anonymous namespace
+
+/// checkEjitMayConstWrites - Warn when a function that is NOT marked
+/// ejit_period_lc writes to an ejit_may_const field. Called from
+/// ActOnFinishFunctionBody after the function body is parsed.
+void checkEjitMayConstWrites(Sema &S, const FunctionDecl *FD, Stmt *Body) {
+  if (!FD || !Body || FD->isInvalidDecl() || FD->isDependentContext())
+    return;
+
+  // ejit_period_lc functions are sanctioned to modify time-window data: the
+  // compiler inserts ejit_deactivate/activate around them, so writes there are
+  // safe and must not be flagged.
+  if (FD->hasAttr<EjitPeriodLcAttr>())
+    return;
+
+  // Skip the traversal entirely when the warning is disabled
+  // (e.g. -Wno-embedded-jit), matching the AnalysisBasedWarnings pattern.
+  if (S.getDiagnostics().isIgnored(
+          diag::warn_ejit_may_const_modified_without_lc, FD->getLocation()))
+    return;
+
+  EjitMayConstWriteVisitor Visitor(S);
+  Visitor.TraverseStmt(Body);
+}

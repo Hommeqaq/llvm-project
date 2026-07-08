@@ -53,3 +53,30 @@ void too_many_ind(
 __attribute__((ejit_period_lc("nonexistent")))
 // expected-error@-1 {{ejit_period_lc(nonexistent) requires a corresponding ejit_period_arr_ind(nonexistent) parameter}}
 void bad_lc(int x);
+
+// === Warning: writing an ejit_may_const field without ejit_period_lc ===
+struct WarnCfg {
+  __attribute__((ejit_may_const)) int cellType;
+  __attribute__((ejit_may_const)) unsigned flags;
+  int plain;
+};
+
+__attribute__((ejit_period_arr("cell"))) struct WarnCfg g_warn[4];
+
+// A plain function (no ejit_period_lc) that writes may_const fields -> warn.
+void bad_writer(int i, int v) {
+  g_warn[i].cellType = v;  // expected-warning {{modifying ejit_may_const field 'cellType' of 'g_warn' without ejit_period_lc attribute}}
+  g_warn[i].flags += v;    // expected-warning {{modifying ejit_may_const field 'flags' of 'g_warn' without ejit_period_lc attribute}}
+  g_warn[i].cellType++;    // expected-warning {{modifying ejit_may_const field 'cellType' of 'g_warn' without ejit_period_lc attribute}}
+  ++g_warn[i].flags;       // expected-warning {{modifying ejit_may_const field 'flags' of 'g_warn' without ejit_period_lc attribute}}
+  g_warn[i].plain = v;     // no warning: 'plain' is not ejit_may_const
+  int r = g_warn[i].cellType; // no warning: read, not a write
+  (void)r;
+}
+
+// An ejit_period_lc function is sanctioned to modify may_const fields -> no warning.
+__attribute__((ejit_period_lc("cell")))
+void good_writer(__attribute__((ejit_period_arr_ind("cell"))) int i, int v) {
+  g_warn[i].cellType = v;  // no warning: ejit_period_lc sanctions the write
+  g_warn[i].flags += v;    // no warning
+}
