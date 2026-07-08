@@ -318,9 +318,28 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // I/D-cache coherent). Otherwise CLEAN-REJECT — never hand back a pointer
   // this core may not legally execute.
   uint32_t self = EJitCoreId::current();
-  uint32_t owner = state_->ownerCoreId.loadAcquire();
-  bool mayReadPtr =
-      (state_->codeSharingEnabled.loadAcquire() != 0) || (self == owner);
+  // ownerCoreId is immutable for the lifetime of a Ready pool: written exactly
+  // once before initState is published Ready (release, "publish last"), and
+  // every hit already observed initState==Ready via the acquire Ready-check at
+  // entry - which makes that write visible here. It never changes during Ready,
+  // so there is no concurrent write to order against; a relaxed re-load
+  // suffices. The slot's state/fnPtr acquire loads still gate code publication
+  // independently below.
+  uint32_t owner = state_->ownerCoreId.loadRelaxed();
+  // codeSharingEnabled's value is fixed at compile time by
+  // EJIT_SRE_SHARED_CODE_POINTERS (the only setCodeSharingEnabled() calls are
+  // flag-gated in EJitCompileDriver.cpp), so the per-hit runtime load is
+  // redundant and replaced by the compile-time constant.
+#if defined(EJIT_SRE_SHARED_CODE_POINTERS)
+  // Sharing unconditionally enabled in this build: any core may read the
+  // published pointer. The !mayReadPtr fallback below is dead-coded out.
+  constexpr bool mayReadPtr = true;
+#else
+  // Sharing unconditionally disabled in this build: only the owner may read
+  // its own published pointer. (Equivalent to the former
+  // (codeSharingEnabled!=0) || (self==owner) with codeSharingEnabled==0.)
+  bool mayReadPtr = (self == owner);
+#endif
   if (!mayReadPtr) {
     bucketReadRelease(B);
     R.readyButNotShareable = true;
