@@ -564,6 +564,20 @@ if(EJIT_SRE_DIAG)
   add_definitions(-DEJIT_SRE_DIAG)
 endif()
 
+# Embed the per-call taskpool statistics counters (cacheHits, compiles, disabled
+# instances, ...). Each increment is an acq_rel atomic RMW on a shared cache
+# line, and cacheHits is hit on every JIT call, so this is the dominant per-call
+# cost on a multi-core target. Default OFF: the increments compile out to zero
+# cost and ejit_taskpool_get_stats() reports zeros; the counter fields remain in
+# their structs so the shared-memory layout / stats ABI is unchanged. Enable
+# with -DEJIT_STATS_ENABLE=ON (or build.sh --stats) for bring-up/field diagnosis.
+# Note: the code-pool stats are a separate cold-path diagnostic and are always
+# compiled; this option gates only the taskpool counters.
+option(EJIT_STATS_ENABLE "Embed EJIT taskpool statistics counters (per-call atomic cost; default OFF)" OFF)
+if(EJIT_STATS_ENABLE)
+  add_definitions(-DEJIT_STATS_ENABLE)
+endif()
+
 option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)
