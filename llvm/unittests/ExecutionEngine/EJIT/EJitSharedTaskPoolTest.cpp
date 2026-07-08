@@ -981,6 +981,25 @@ TEST_F(SharedTaskPoolTest, RealWorkerEntryConsumesThenStops) {
   EXPECT_EQ(d.cacheReadyCount, 3u);
 }
 
+// The real worker must not drain a long queue at full speed. After consumed
+// work it yields through the injected platform hook, giving heartbeat/business
+// tasks scheduler time even when more compile requests remain queued.
+TEST_F(SharedTaskPoolTest, RealWorkerThrottlesBetweenConsumedRequests) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  StopAfterCtx sa{state_.get(), 3};
+  pool.setCompiler(&compileThenStopAfter, &sa);
+  for (uint32_t f = 1; f <= 3; ++f)
+    ASSERT_EQ(pool.compileOrGet(f, nullptr, 0, codeFor(f)).status,
+              EJitCompileOrGetStatus::EnqueuedPending);
+
+  uint64_t before = pool.workerIdleYields();
+  pool.runWorkerLoop();
+  EXPECT_GE(pool.workerConsumeLoops(), 3u);
+  EXPECT_GT(pool.workerIdleYields(), before);
+}
+
 // 七.2 — worker start failure publishes Failed and records the reason.
 TEST_F(SharedTaskPoolTest, WorkerStartFailurePublishesFailed) {
   WorkerHooks hooks;

@@ -23,6 +23,14 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS 1u
+#endif
+
+#ifndef EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS
+#define EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS 100u
+#endif
+
 namespace {
 
 // Compiler reordering barrier used as a portable idle relax (no platform
@@ -1616,13 +1624,21 @@ void EJitSharedTaskPool::runWorkerLoop() {
   // cannot starve the core that must publish Ready or enqueue work. The idle
   // hook runs OUTSIDE any bucket lock / queue slot / dedup critical state
   // (pollOne returns before we idle).
+  uint32_t consumedSinceThrottle = 0;
   for (;;) {
     EJitWorkerStep s = workerPollOnce();
     if (s == EJitWorkerStep::Exit)
       break;
     if (s == EJitWorkerStep::WaitForReady || s == EJitWorkerStep::Idle)
       workerIdle();
-    // Consumed: loop immediately, more work is likely queued.
+    else if (EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS != 0u &&
+             EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS != 0u &&
+             ++consumedSinceThrottle >=
+                 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS) {
+      consumedSinceThrottle = 0;
+      for (uint32_t i = 0; i < EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS; ++i)
+        workerIdle();
+    }
   }
   EJIT_DIAG_VERBOSE("shared worker loop leave");
 }
