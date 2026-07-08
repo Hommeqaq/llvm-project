@@ -258,6 +258,12 @@ struct alignas(kEJitSharedCacheLine) EJitSharedDumpState {
 
 //===----------------------------------------------------------------------===//
 // EJitSharedCounters: lock-free statistics, all monotonic.
+//
+// The increments are gated by EJIT_STATS_ENABLE (see EJitStats.h): when that
+// macro is undefined the EJIT_STAT_INC* call sites compile to nothing, so the
+// per-call cacheHits RMW - the steady-state hot-path cost - vanishes. The
+// FIELDS always remain here (shared-memory layout / stats ABI is stable); with
+// stats off they simply stay zero and ejit_taskpool_get_stats() reports zeros.
 //===----------------------------------------------------------------------===//
 struct EJitSharedCounters {
   EJitAtomicU64 cacheHits;
@@ -347,6 +353,12 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.
                                       ///< Reset on each (re)initialization.
+                                      ///< Stats-only: this field and the
+                                      ///< instanceDisabledPreActivate increment
+                                      ///< are read/written only under
+                                      ///< EJIT_STATS_ENABLE (see EJitStats.h);
+                                      ///< with stats off the acquire-load gate
+                                      ///< on the disabled path is compiled out.
 
   //--- flat dedup slots (own cache line). Each slot stores the OWNER GENERATION
   //    that claimed it (0 = free), not a 1-bit flag: a dedupMark CASes 0->gen

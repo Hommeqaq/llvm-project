@@ -18,6 +18,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
+#include "llvm/ExecutionEngine/EJIT/EJitStats.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedPlatform.h"
 
 using namespace llvm;
@@ -393,7 +394,7 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
   bucketReadRelease(B);
 
   if (!prepareExecForCurrentCore(Snap, self)) {
-    state_->counters.executePrepareFailed.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.executePrepareFailed);
     R.readyButNotShareable = true;
     return R; // clean fallback: no token, no shared pointer handed back.
   }
@@ -1171,7 +1172,7 @@ __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   CompileOrGetResult R;
   if (Hit.hasReadToken && Hit.fnPtr) {
-    state_->counters.cacheHits.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.cacheHits);
     R.status = EJitCompileOrGetStatus::CacheHit;
     R.fnPtr = Hit.fnPtr;
     R.bucketIndex = Hit.bucketIndex;
@@ -1212,10 +1213,7 @@ EJitSharedTaskPool::tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims,
   // reaches the cache, so a deactivated instance is never served stale code.
   for (uint32_t i = 0; i < numDims; ++i)
     if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId)) {
-      state_->counters.instanceDisabled.fetchAdd(1);
-      // Track init→activate window hits separately.
-      if (state_->anyInstanceActivated.loadAcquire() == 0)
-        state_->counters.instanceDisabledPreActivate.fetchAdd(1);
+      EJIT_STAT_INC_INSTANCE_DISABLED(state_);
       EJIT_DIAG_VERBOSE("shared taskpool disabled func=%u dim[%u]=(%u,%u)",
                         funcIndex, i, dims[i].dimType, dims[i].instanceId);
       R.status = EJitCompileOrGetStatus::InstanceDisabled;
@@ -1257,9 +1255,7 @@ EJitSharedTaskPool::tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
     return R;
   }
   if (!isInstanceEnabled(dim0, inst0)) {
-    state_->counters.instanceDisabled.fetchAdd(1);
-    if (state_->anyInstanceActivated.loadAcquire() == 0)
-      state_->counters.instanceDisabledPreActivate.fetchAdd(1);
+    EJIT_STAT_INC_INSTANCE_DISABLED(state_);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -1278,9 +1274,7 @@ EJitSharedTaskPool::tryCacheHit2D(uint32_t funcIndex, uint32_t dim0,
     return R;
   }
   if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1)) {
-    state_->counters.instanceDisabled.fetchAdd(1);
-    if (state_->anyInstanceActivated.loadAcquire() == 0)
-      state_->counters.instanceDisabledPreActivate.fetchAdd(1);
+    EJIT_STAT_INC_INSTANCE_DISABLED(state_);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -1300,9 +1294,7 @@ EJitSharedTaskPool::tryCacheHit3D(uint32_t funcIndex, uint32_t dim0,
   }
   if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1) ||
       !isInstanceEnabled(dim2, inst2)) {
-    state_->counters.instanceDisabled.fetchAdd(1);
-    if (state_->anyInstanceActivated.loadAcquire() == 0)
-      state_->counters.instanceDisabledPreActivate.fetchAdd(1);
+    EJIT_STAT_INC_INSTANCE_DISABLED(state_);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -1324,9 +1316,7 @@ EJitSharedTaskPool::tryCacheHit4D(uint32_t funcIndex, uint32_t dim0,
   }
   if (!isInstanceEnabled(dim0, inst0) || !isInstanceEnabled(dim1, inst1) ||
       !isInstanceEnabled(dim2, inst2) || !isInstanceEnabled(dim3, inst3)) {
-    state_->counters.instanceDisabled.fetchAdd(1);
-    if (state_->anyInstanceActivated.loadAcquire() == 0)
-      state_->counters.instanceDisabledPreActivate.fetchAdd(1);
+    EJIT_STAT_INC_INSTANCE_DISABLED(state_);
     R.status = EJitCompileOrGetStatus::InstanceDisabled;
     R.fastPathTerminal = true;
     return R;
@@ -1384,7 +1374,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     void *fn = nullptr;
     bool ok = compileFn_(compileCtx_, ReqLocal, &fn);
     if (!ok || !fn) {
-      state_->counters.compileFailed.fetchAdd(1);
+      EJIT_STAT_INC(state_->counters.compileFailed);
       EJIT_DIAG("shared taskpool sync compile failed func=%u ok=%u", funcIndex,
                 static_cast<unsigned>(ok));
       R.status = EJitCompileOrGetStatus::CompileFailed;
@@ -1392,7 +1382,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     }
     if (!versionsCurrent(ReqLocal)) {
       if (releaseFn_) releaseFn_(releaseCtx_, fn);
-      state_->counters.compileFailed.fetchAdd(1);
+      EJIT_STAT_INC(state_->counters.compileFailed);
       EJIT_DIAG("shared taskpool sync compile drop func=%u: version changed",
                 funcIndex);
       R.status = EJitCompileOrGetStatus::CompileFailed;
@@ -1403,7 +1393,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     EJitPublishStatus PS =
         cachePublish(ReqLocal, fn, info.codeSize ? &info : nullptr);
     if (PS == EJitPublishStatus::Published) {
-      state_->counters.asyncCompiles.fetchAdd(1);
+      EJIT_STAT_INC(state_->counters.asyncCompiles);
       publishCodePoolStats();
       SharedLookup Hit2 = cacheLookup(funcIndex, dims, numDims);
       if (Hit2.hasReadToken && Hit2.fnPtr) {
@@ -1418,7 +1408,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
     } else {
       if (releaseFn_) releaseFn_(releaseCtx_, fn);
     }
-    state_->counters.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared taskpool sync compile failed func=%u publish=%u", funcIndex,
               static_cast<unsigned>(PS));
     R.status = EJitCompileOrGetStatus::CompileFailed;
@@ -1437,7 +1427,7 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   switch (dedupMark(funcIndex, gen)) {
   case EJitDedupResult::AlreadyPending:
-    state_->counters.alreadyPending.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.alreadyPending);
     EJIT_DIAG_VERBOSE("shared taskpool coalesced func=%u: already pending", funcIndex);
     R.status = EJitCompileOrGetStatus::AlreadyPending;
     return R;
@@ -1450,12 +1440,12 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   }
   if (!queuePush(Req)) {
     dedupClear(funcIndex, gen); // queue full → roll back the in-flight slot.
-    state_->counters.queueFull.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.queueFull);
     EJIT_DIAG("shared taskpool fallback func=%u: queue full", funcIndex);
     R.status = EJitCompileOrGetStatus::QueueFullFallback;
     return R;
   }
-  state_->counters.asyncEnqueues.fetchAdd(1);
+  EJIT_STAT_INC(state_->counters.asyncEnqueues);
   EJIT_DIAG_VERBOSE("shared taskpool enqueued func=%u gen=%u", funcIndex, gen);
   R.status = EJitCompileOrGetStatus::EnqueuedPending;
   return R;
@@ -1506,14 +1496,14 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   // in-flight slot for the same funcIndex.
   if (req.generation != state_->generation.loadAcquire()) {
     dedupClear(req.funcIndex, req.generation);
-    state_->counters.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile drop func=%u: generation changed", req.funcIndex);
     return;
   }
   // Checkpoint 1: invalidated before compile started.
   if (!versionsCurrent(req)) {
     dedupClear(req.funcIndex, req.generation);
-    state_->counters.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile drop func=%u: version changed before compile",
               req.funcIndex);
     return;
@@ -1522,7 +1512,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   bool ok = compileFn_ && compileFn_(compileCtx_, req, &fn);
   if (!ok || !fn) {
     dedupClear(req.funcIndex, req.generation);
-    state_->counters.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile failed func=%u ok=%u fn=%p", req.funcIndex,
               static_cast<unsigned>(ok), fn);
     return;
@@ -1542,7 +1532,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     dedupClear(req.funcIndex, req.generation);
-    state_->counters.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker compile drop func=%u: version/gen changed after compile",
               req.funcIndex);
     return;
@@ -1550,7 +1540,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
   EJitPublishStatus PS = cachePublish(req, fn, &info);
   switch (PS) {
   case EJitPublishStatus::Published:
-    state_->counters.asyncCompiles.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.asyncCompiles);
     publishCodePoolStats();
     dedupClear(req.funcIndex, req.generation);
     EJIT_DIAG_VERBOSE("shared worker publish ok func=%u fn=%p", req.funcIndex, fn);
@@ -1559,7 +1549,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     dedupClear(req.funcIndex, req.generation);
-    state_->counters.compileFailed.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.compileFailed);
     EJIT_DIAG("shared worker publish drop func=%u: version mismatch", req.funcIndex);
     return;
   case EJitPublishStatus::InvalidParam:
@@ -1567,7 +1557,7 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
     if (releaseFn_)
       releaseFn_(releaseCtx_, fn);
     dedupClear(req.funcIndex, req.generation);
-    state_->counters.publishFailed.fetchAdd(1);
+    EJIT_STAT_INC(state_->counters.publishFailed);
     EJIT_DIAG("shared worker publish failed func=%u status=%u", req.funcIndex,
               static_cast<unsigned>(PS));
     return;

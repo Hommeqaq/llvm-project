@@ -28,6 +28,7 @@
 #   --sre-shared-taskpool / --no-sre-shared-taskpool  cross-core shared taskpool, single shared worker (default OFF; needs --sre-taskpool)
 #   --sre-taskpool-worker-stack-size=<bytes>  shared worker task stack size (default: 1048576)
 #   --sre-shared-code-pointers / --no-sre-shared-code-pointers  allow non-owner cores to read shared cache fnPtrs (default OFF; needs platform same-VA + cache coherence)
+#   --stats / --no-stats  embed EJIT taskpool statistics counters (default OFF; per-call atomic cost on the hot path)
 #   -h              show help
 #===----------------------------------------------------------------------===#
 
@@ -113,6 +114,7 @@ do_configure() {
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS} \
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS} \
         -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS} \
+        -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE} \
         "-DEJIT_DEFAULT_TARGET_TRIPLE=${EJIT_TARGET_TRIPLE:-${default_triple}}" \
         -DLLVM_ENABLE_ZLIB=OFF \
         -DLLVM_ENABLE_ZSTD=OFF \
@@ -138,6 +140,7 @@ do_configure() {
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS} \
         -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS} \
         -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS} \
+        -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE} \
         "-DEJIT_DEFAULT_TARGET_TRIPLE=${EJIT_TARGET_TRIPLE:-${default_triple}}" \
         -DLLVM_USE_SPLIT_DWARF=ON \
         -DLLVM_ENABLE_ZLIB=OFF \
@@ -178,6 +181,7 @@ do_configure() {
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS}
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS}
       -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS}
+      -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE}
     "
     # shellcheck disable=SC2086
     cmake -S "${LLVM_SRC}" -B "${build_dir}" \
@@ -219,6 +223,7 @@ do_configure() {
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS}
       -DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS}
       -DEJIT_SRE_SHARED_CODE_POINTERS=${EJIT_SRE_SHARED_CODE_POINTERS}
+      -DEJIT_STATS_ENABLE=${EJIT_STATS_ENABLE}
     "
     # shellcheck disable=SC2086
     cmake -S "${LLVM_SRC}" -B "${build_dir}" \
@@ -292,9 +297,10 @@ EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=1048576
 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_ITEMS=1
 EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=100
 EJIT_SRE_SHARED_CODE_POINTERS=OFF
+EJIT_STATS_ENABLE=OFF
 
 if [[ "${1:-}" = "-h" || "${1:-}" = "--help" ]]; then
-  sed -n '2,29p' "$0"
+  sed -n '2,31p' "$0"
   exit 0
 fi
 
@@ -323,8 +329,10 @@ while [[ $# -gt 0 ]]; do
     --sre-taskpool-worker-throttle-delay-ticks=*) EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS="${1#--sre-taskpool-worker-throttle-delay-ticks=}" ;;
     --sre-shared-code-pointers) EJIT_SRE_SHARED_CODE_POINTERS=ON ;;
     --no-sre-shared-code-pointers) EJIT_SRE_SHARED_CODE_POINTERS=OFF ;;
+    --stats) EJIT_STATS_ENABLE=ON ;;
+    --no-stats) EJIT_STATS_ENABLE=OFF ;;
     -h|--help)
-      sed -n '2,29p' "$0"
+      sed -n '2,31p' "$0"
       exit 0
       ;;
     *) err "Unknown argument: $1"; exit 1 ;;
