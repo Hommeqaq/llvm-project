@@ -248,29 +248,14 @@ uint32_t ejit_taskpool_get_worker_core();
 /// non-empty, the next time a specialization whose entry name exactly matches
 /// \p name is JIT-compiled, the engine saves (in memory) its post-optimization
 /// IR and emitted assembly for later printing. Pass NULL or "" to disable
-/// further capture (already-saved entries are retained). The special name "*"
-/// is a wildcard that captures EVERY specialization (see ejit_dump_all). For
-/// performance analysis of individual functions.
+/// further capture (already-saved entries are retained). Capture is exact-name
+/// only, and shared IR/ASM payloads are allocated to the generated text size.
 void ejit_dump_func(const char *name);
 
-/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
-/// NULL or "") through the platform log, one line per IR/ASM line, labeled
-/// "dump IR func=..." / "dump ASM func=...". Names with no saved capture are
-/// reported as missing. Paired with ejit_dump_func(): capture at compile
-/// time, print selectively later.
+/// Print the saved IR+ASM for \p name through the platform log, one line per
+/// IR/ASM line. Names with no saved capture are reported as missing. Passing
+/// NULL or "" only lists captured names; it does not dump all payloads.
 void ejit_print_dumped(const char *name);
-
-/// Convenience switch to capture IR+ASM for ALL JIT-compiled specializations
-/// (equivalent to ejit_dump_func("*")). When \p enable is true, every
-/// specialization's post-optimization IR and emitted assembly is saved (one
-/// entry per function name, overwritten on re-compile, so the store is bounded
-/// by the number of distinct entry functions); print later with
-/// ejit_print_dumped(NULL). When false, capture is disabled. NOTE: on a
-/// cross-core shared taskpool the captures live on the owner core (the one
-/// that runs the JIT worker); print from the owner core to see all entries,
-/// or use ejit_dump_func(name) for a single function whose capture is shared
-/// across cores.
-void ejit_dump_all(bool enable);
 
 /// Runtime diagnostic log level. Mirrors the EJIT_DIAG* macro thresholds.
 ///   EJIT_LOG_OFF    — no diagnostic output

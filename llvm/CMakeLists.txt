@@ -581,7 +581,7 @@ if(EJIT_TRIM_LLVM_BACKEND_EXPERIMENTAL)
 endif()
 
 # Re-enable textual assembly (.s) emission for the JIT IR/ASM diagnostic dump
-# (ejit_dump_func / ejit_dump_all) even in an EJIT_TRIM_LLVM_BACKEND build.
+# (ejit_dump_func / ejit_print_dumped) even in an EJIT_TRIM_LLVM_BACKEND build.
 # The trim normally #ifdef's out the AssemblyFile codegen path
 # (CodeGenTargetMachineImpl::createMCStreamer) to save image size; this option
 # overrides that so ejit_print_dumped can produce ASM on target. Cost: the

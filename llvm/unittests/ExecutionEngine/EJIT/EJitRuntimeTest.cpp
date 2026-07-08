@@ -677,7 +677,6 @@ extern void ejit_register_static_var(const char *, void *);
 extern void ejit_register_lifecycle(const char *, uint32_t *);
 extern void ejit_set_log_level(int level);
 extern int ejit_get_log_level(void);
-extern void ejit_dump_all(bool enable);
 extern void ejit_print_registry(void);
 extern void ejit_print_func_meta(const char *funcName);
 // P0 diagnostics: code pool stats + active period map. Declared returning int
@@ -2793,7 +2792,7 @@ TEST(EJitPipelineIR, PeriodIndexReplacementAndFold) {
 //===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
-// Log level + diagnostics C-API (ejit_set_log_level, ejit_dump_all,
+// Log level + diagnostics C-API (ejit_set_log_level,
 // ejit_print_registry, ejit_print_func_meta)
 //===----------------------------------------------------------------------===//
 
@@ -2817,12 +2816,6 @@ TEST(EJitDiagLogLevel, ClampsOutOfRange) {
   ejit_set_log_level(99);
   EXPECT_EQ(ejit_get_log_level(), 3);
   ejit_set_log_level(1); // restore
-}
-
-// ejit_dump_all must not crash whether or not the runtime is initialized.
-TEST(EJitDumpAll, ToggleWithoutCrash) {
-  ejit_dump_all(true);
-  ejit_dump_all(false);
 }
 
 // Registry / func-meta prints must not crash on an uninitialized runtime and on

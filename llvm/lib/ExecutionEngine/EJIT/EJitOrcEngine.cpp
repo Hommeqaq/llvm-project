@@ -23,6 +23,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -147,11 +148,15 @@ using DumpMutexType = std::mutex;
 // set/read is benign (worst case a missed or extra dump).
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 EJitSharedTaskPoolState *gDumpSharedState = nullptr;
+static void clearSharedDumpSlots(EJitSharedDumpState &D);
 #endif
 static std::string gDumpFuncFilter;
+static void clearLocalDumpStore();
 
 void setDumpFuncFilter(const std::string &name) {
   gDumpFuncFilter = name;
+  if (name.empty())
+    clearLocalDumpStore();
   EJIT_DIAG_DEBUG("set_dump_filter value=%s &filter=%p",
             gDumpFuncFilter.empty() ? "(off)" : gDumpFuncFilter.c_str(),
             (void *)&gDumpFuncFilter);
@@ -171,14 +176,8 @@ void setDumpFuncFilter(const std::string &name) {
     D.filterName[len] = 0;
     D.filterLen = len;
     // A filter change invalidates all captured slots so stale results don't
-    // surface after re-arming.
-    for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
-      D.slots[s].valid.storeRelease(0);
-      D.slots[s].nameLen = 0;
-      D.slots[s].irSize = 0;
-      D.slots[s].asmSize = 0;
-    }
-    D.nextSlot = 0;
+    // surface after re-arming. It also releases dynamic dump payloads.
+    clearSharedDumpSlots(D);
     D.filterEnabled.storeRelease(len ? 1u : 0u);
     D.lock.storeRelease(0);
     EJIT_DIAG_DEBUG("set_dump_filter shared enabled=%u len=%u &shared=%p",
@@ -191,8 +190,8 @@ void setDumpFuncFilter(const std::string &name) {
 void setDumpSharedState(EJitSharedTaskPoolState *state) {
   gDumpSharedState = state;
   EJIT_DIAG_DEBUG("set_dump_shared_state state=%p", (void *)state);
-  // If a filter was set before the shared state was bound — e.g. ejit_dump_all
-  // or ejit_dump_func called during the init_array phase, before ejit_init —
+  // If a filter was set before the shared state was bound — e.g. ejit_dump_func
+  // called during the init_array phase, before ejit_init —
   // propagate it into the now-bound shared state. Otherwise the owner worker
   // (possibly a different core) sees an empty shared filter and never captures,
   // even though the producer thinks dump is armed.
@@ -255,6 +254,11 @@ struct DumpEntry {
 static DumpMutexType gDumpMutex;
 static std::map<std::string, DumpEntry> gDumpStore;
 
+static void clearLocalDumpStore() {
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  gDumpStore.clear();
+}
+
 static void dumpBytesSafe(const char *label, const char *data, size_t n) {
   EJIT_DIAG("=== %s begin size=%u ===", label, (unsigned)n);
   size_t i = 0;
@@ -304,10 +308,70 @@ static uint32_t copyDumpBytes(char *dst, uint32_t cap, const char *src,
   return n;
 }
 
+static void freeSharedDumpPayload(EJitSharedDumpSlot &Slot) {
+  if (Slot.irPtr)
+    std::free(reinterpret_cast<void *>(Slot.irPtr));
+  if (Slot.asmPtr)
+    std::free(reinterpret_cast<void *>(Slot.asmPtr));
+  Slot.irPtr = 0;
+  Slot.asmPtr = 0;
+  Slot.irSize = 0;
+  Slot.asmSize = 0;
+}
+
+static void clearSharedDumpSlots(EJitSharedDumpState &D) {
+  for (uint32_t s = 0; s < kEJitSharedDumpSlotCount; ++s) {
+    EJitSharedDumpSlot &Slot = D.slots[s];
+    Slot.valid.storeRelease(0);
+    Slot.truncated.storeRelease(0);
+    Slot.nameLen = 0;
+    freeSharedDumpPayload(Slot);
+    Slot.keyHi = 0;
+    Slot.keyLo = 0;
+    Slot.reserved0 = 0;
+    for (uint32_t i = 0; i < kEJitSharedDumpNameBytes; ++i)
+      Slot.name[i] = 0;
+  }
+  D.nextSlot = 0;
+}
+
+static bool allocSharedDumpPayload(const std::string &Text, uintptr_t &Ptr,
+                                   uint32_t &Size) {
+  Ptr = 0;
+  Size = 0;
+  if (Text.empty())
+    return true;
+  if (Text.size() > 0xffffffffu)
+    return false;
+  char *Buf = static_cast<char *>(std::malloc(Text.size() + 1));
+  if (!Buf)
+    return false;
+  std::memcpy(Buf, Text.data(), Text.size());
+  Buf[Text.size()] = 0;
+  Ptr = reinterpret_cast<uintptr_t>(Buf);
+  Size = static_cast<uint32_t>(Text.size());
+  return true;
+}
+
 static void captureSharedDump(const std::string &fnName, uint64_t cacheKey,
                               const std::string &IR, const std::string &ASM) {
   if (!gDumpSharedState)
     return;
+  uintptr_t NewIR = 0;
+  uintptr_t NewASM = 0;
+  uint32_t NewIRSize = 0;
+  uint32_t NewASMSize = 0;
+  if (!allocSharedDumpPayload(IR, NewIR, NewIRSize) ||
+      !allocSharedDumpPayload(ASM, NewASM, NewASMSize)) {
+    if (NewIR)
+      std::free(reinterpret_cast<void *>(NewIR));
+    if (NewASM)
+      std::free(reinterpret_cast<void *>(NewASM));
+    EJIT_DIAG("capture shared failed func=%s ir=%u asm=%u: alloc failed",
+              fnName.c_str(), (unsigned)IR.size(), (unsigned)ASM.size());
+    return;
+  }
+
   EJitSharedDumpState &D = gDumpSharedState->dump;
   sharedDumpLock(D);
   // Find an existing slot for fnName (overwrite it in place). Distinct names
@@ -335,23 +399,23 @@ static void captureSharedDump(const std::string &fnName, uint64_t cacheKey,
     D.nextSlot = (target + 1) % kEJitSharedDumpSlotCount;
   }
   EJitSharedDumpSlot &Slot = D.slots[target];
-  bool nameTrunc = false, irTrunc = false, asmTrunc = false;
+  bool nameTrunc = false;
   Slot.valid.storeRelease(0); // invalidate while writing (readers hold the lock)
+  freeSharedDumpPayload(Slot);
   Slot.nameLen = copyDumpBytes(Slot.name, kEJitSharedDumpNameBytes,
                                fnName.data(), fnName.size(), nameTrunc);
-  Slot.irSize = copyDumpBytes(Slot.ir, kEJitSharedDumpSlotTextBytes, IR.data(),
-                              IR.size(), irTrunc);
-  Slot.asmSize = copyDumpBytes(Slot.asmText, kEJitSharedDumpSlotTextBytes,
-                               ASM.data(), ASM.size(), asmTrunc);
+  Slot.irPtr = NewIR;
+  Slot.asmPtr = NewASM;
+  Slot.irSize = NewIRSize;
+  Slot.asmSize = NewASMSize;
   Slot.keyHi = (uint32_t)(cacheKey >> 32);
   Slot.keyLo = (uint32_t)(cacheKey & 0xffffffffu);
-  Slot.truncated.storeRelease((nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) |
-                              (asmTrunc ? 2u : 0u));
+  Slot.truncated.storeRelease(nameTrunc ? 4u : 0u);
   Slot.valid.storeRelease(1);
   sharedDumpUnlock(D);
   EJIT_DIAG_DEBUG("capture shared func=%s slot=%u ir=%u asm=%u trunc=0x%x &shared=%p",
             fnName.c_str(), target, (unsigned)IR.size(), (unsigned)ASM.size(),
-            (nameTrunc ? 4u : 0u) | (irTrunc ? 1u : 0u) | (asmTrunc ? 2u : 0u),
+            nameTrunc ? 4u : 0u,
             (void *)gDumpSharedState);
 }
 
@@ -378,12 +442,14 @@ static bool printSharedDumped(const char *name) {
     uint32_t trunc = Slot.truncated.loadAcquire();
     EJIT_DIAG("print_dumped shared hit requested=%s stored=%s slot=%u "
               "key_hi=0x%08x key_lo=0x%08x ir_size=%u asm_size=%u trunc=0x%x",
-              hasName ? name : "(all)", Slot.name, s, Slot.keyHi, Slot.keyLo,
+              hasName ? name : "(list)", Slot.name, s, Slot.keyHi, Slot.keyLo,
               Slot.irSize, Slot.asmSize, trunc);
-    if (Slot.irSize)
-      dumpBytesSafe("dump IR", Slot.ir, Slot.irSize);
-    if (Slot.asmSize)
-      dumpBytesSafe("dump ASM", Slot.asmText, Slot.asmSize);
+    if (hasName && Slot.irSize && Slot.irPtr)
+      dumpBytesSafe("dump IR", reinterpret_cast<const char *>(Slot.irPtr),
+                    Slot.irSize);
+    if (hasName && Slot.asmSize && Slot.asmPtr)
+      dumpBytesSafe("dump ASM", reinterpret_cast<const char *>(Slot.asmPtr),
+                    Slot.asmSize);
     any = true;
     if (hasName)
       break; // single-name query: done after the first match
@@ -391,7 +457,7 @@ static bool printSharedDumped(const char *name) {
   sharedDumpUnlock(D);
   if (!any)
     EJIT_DIAG_DEBUG("print_dumped shared miss name=%s &shared=%p",
-                    hasName ? name : "(all)", (void *)gDumpSharedState);
+                    hasName ? name : "(list)", (void *)gDumpSharedState);
   return any;
 }
 #endif
@@ -424,7 +490,7 @@ static void printOneDumpSafe(const char *requestedName,
   (void)keyLo;
   EJIT_DIAG("print_dumped hit requested=%s stored=%s key_hi=0x%08x "
             "key_lo=0x%08x ir_size=%u asm_size=%u",
-            requestedName ? requestedName : "(all)", storedName.c_str(), keyHi,
+            requestedName ? requestedName : "(list)", storedName.c_str(), keyHi,
             keyLo, (unsigned)e.IR.size(), (unsigned)e.ASM.size());
   if (!e.IR.empty())
     dumpLinesSafe("dump IR", e.IR);
@@ -432,17 +498,16 @@ static void printOneDumpSafe(const char *requestedName,
     dumpLinesSafe("dump ASM", e.ASM);
 }
 
-/// Print the saved IR+ASM for \p name (or all saved entries when \p name is
-/// null/empty) through EJIT_DIAG, one line per IR/ASM line. Names with no
-/// saved capture are reported as missing.
+/// Print the saved IR+ASM for \p name through EJIT_DIAG, one line per IR/ASM
+/// line. A null/empty name only lists saved entry names to avoid accidental
+/// large log storms.
 void printDumped(const char *name) {
   EJIT_DIAG_DEBUG("print_dumped enter name=%s &filter=%p &store=%p",
-            (name && name[0]) ? name : "(all)", (void *)&gDumpFuncFilter,
+            (name && name[0]) ? name : "(list)", (void *)&gDumpFuncFilter,
             (void *)&gDumpStore);
   bool hasName = name && name[0];
-  // Try the local (owner-side, untruncated) store first — it has the full
-  // IR/ASM for every captured function. For a specific name this is a direct
-  // hit on the owner core; for "print all" it lists every capture in full.
+  // Try the local store first. A specific name prints the full local payload;
+  // an empty name only lists available entries.
   {
     std::lock_guard<DumpMutexType> lock(gDumpMutex);
     if (hasName) {
@@ -452,16 +517,23 @@ void printDumped(const char *name) {
         return;
       }
     } else if (!gDumpStore.empty()) {
-      for (auto &kv : gDumpStore)
-        printOneDumpSafe(nullptr, kv.first, kv.second);
+      EJIT_DIAG("print_dumped saved entries=%u", (unsigned)gDumpStore.size());
+      for (auto &kv : gDumpStore) {
+        (void)kv;
+        EJIT_DIAG("print_dumped saved name=%s key_hi=0x%08x key_lo=0x%08x "
+                  "ir_size=%u asm_size=%u",
+                  kv.first.c_str(), (uint32_t)(kv.second.cacheKey >> 32),
+                  (uint32_t)(kv.second.cacheKey & 0xffffffffu),
+                  (unsigned)kv.second.IR.size(), (unsigned)kv.second.ASM.size());
+      }
       return;
     }
   }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   // Local miss / empty (e.g. a non-owner core, whose per-core gDumpStore is
   // empty): serve from the cross-core shared per-name table. The table holds
-  // the last N captured functions (truncated to the slot text size); a specific
-  // name retrieves its slot, NULL lists all of them.
+  // the last N captured functions. A specific name retrieves its payload;
+  // NULL lists metadata only.
   if (printSharedDumped(name))
     return;
 #endif
@@ -644,22 +716,20 @@ EJitOrcEngine::Create(const Config &config,
           // ejit_print_dumped(). Bare-metal-safe (strings only, no
           // raw_fd_ostream). Captures the post-optimization IR and the emitted
           // assembly (from the same TargetMachine the JIT compiles with).
-          // The filter value "*" is a wildcard: every specialization is captured
-          // (ejit_dump_all(true) sets it). The local gDumpStore keeps one entry
-          // per function name (overwritten on re-compile), so dump-all is
-          // bounded by the number of distinct entry functions; the cross-core
-          // shared result keeps only the latest capture (see ejit_print_dumped).
+          // Capture is exact-name only. The local gDumpStore keeps one dynamic
+          // IR/ASM payload per captured function name (overwritten on
+          // re-compile); the shared dump table keeps cross-core visible dynamic
+          // payloads for recent captures.
           {
             std::string DumpFilter;
             bool hasFilter = getActiveDumpFilter(DumpFilter);
-            bool wildcard = hasFilter && DumpFilter == "*";
-            bool match = wildcard || (hasFilter && ctx->fnName == DumpFilter);
+            bool match = hasFilter && ctx->fnName == DumpFilter;
             EJIT_DIAG_DEBUG("dump check filter=%s fn=%s key_hi=0x%08x "
-                            "key_lo=0x%08x match=%d wildcard=%d &filter=%p",
+                            "key_lo=0x%08x match=%d &filter=%p",
                             hasFilter ? DumpFilter.c_str() : "(off)",
                             ctx->fnName.c_str(), (uint32_t)(ctx->cacheKey >> 32),
                             (uint32_t)(ctx->cacheKey & 0xffffffffu), match ? 1 : 0,
-                            wildcard ? 1 : 0, (void *)&gDumpFuncFilter);
+                            (void *)&gDumpFuncFilter);
             if (match) {
               // IR capture always runs first so it succeeds even if the ASM
               // diagnostic path is disabled or fails.
