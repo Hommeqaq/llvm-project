@@ -66,7 +66,22 @@ void bucketWriteRelease(EJitSharedCacheBucket &b) {
 
 constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 
+// Per-core inline-cache table (static storage, zero-filled by the loader - no
+// dynamic init). Indexed by EJitCoreId::current() and funcIndex; a core/func
+// out of range simply misses. Each core writes only its own row, so rows do not
+// contend cross-core.
+EJitICacheSlot gEJitICache[EJIT_ICACHE_MAX_CORES][EJIT_ICACHE_FUNC_SLOTS];
+
 } // namespace
+
+void llvm::ejit::ejitIcacheClearAll() {
+  for (uint32_t c = 0; c < EJIT_ICACHE_MAX_CORES; ++c)
+    for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f) {
+      EJitICacheSlot &s = gEJitICache[c][f];
+      s.fnPtr.storeRelaxed(0);
+      s.valid.storeRelaxed(0);
+    }
+}
 
 //===----------------------------------------------------------------------===//
 // Switch controller helpers (§5.1) over shared arrays.
@@ -92,6 +107,95 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
   if (dimType >= kEJitSharedDimTypes || instanceId >= kEJitSharedInstances)
     return 0;
   return state_->version[dimType][instanceId].loadAcquire();
+}
+
+//===----------------------------------------------------------------------===//
+// Per-function inline cache (spec: EJIT inline cache).
+//
+// Pure-load probe: no read-token RMW, no bucket slot scan. A hit hands back a
+// pinned fnPtr the caller invokes directly (no releaseRead). Correctness rests
+// on (a) the version re-check (no stale specialization after a period toggle)
+// and (b) the per-core slot pinning the code (no use-after-free: while a core
+// holds a cached fnPtr its slot is stable - no reentrancy - so a reclaimer's HP
+// scan sees the pin and defers the free).
+//===----------------------------------------------------------------------===//
+bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
+                                   uint32_t numDims, void **outFn) {
+  if (!outFn)
+    return false;
+  *outFn = nullptr;
+  // Safety gate: auto-disable while reclamation may free code without the
+  // HP-scan retire (see setReleaser). v1 production wires no releaser, so this
+  // never trips and the cache is unconditionally safe.
+  if (!icacheReclamationSafe_)
+    return false;
+  if (!state_ || numDims > 4 || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
+    return false;
+  // The cache is only meaningful once the pool is Ready.
+  if (state_->initState.loadAcquire() != kReady)
+    return false;
+  uint32_t self = EJitCoreId::current();
+  if (self >= EJIT_ICACHE_MAX_CORES)
+    return false;
+  // Cross-core fnPtr gate (compile-time, mirrors resolveMatchedSlot): a non-owner
+  // core may only read a cached pointer when code sharing is platform-validated.
+  uint32_t owner = state_->ownerCoreId.loadRelaxed();
+#if defined(EJIT_SRE_SHARED_CODE_POINTERS)
+  constexpr bool mayReadPtr = true;
+#else
+  bool mayReadPtr = (self == owner);
+#endif
+  if (!mayReadPtr)
+    return false;
+
+  EJitICacheSlot &s = gEJitICache[self][funcIndex];
+  if (s.valid.loadAcquire() == 0)
+    return false;
+  // Owner re-init invalidates every cached specialization.
+  if (s.generation != state_->generation.loadAcquire())
+    return false;
+  if (s.numDims != numDims)
+    return false;
+  for (uint32_t i = 0; i < numDims; ++i) {
+    // A disabled instance must never serve cached code (its period is
+    // deactivated); the version check below also catches the flip, but this is
+    // cheap defense-in-depth and matches tryCacheHit's enabled gate.
+    if (!isInstanceEnabled(dims[i].dimType, dims[i].instanceId))
+      return false;
+    if (s.dimTypes[i] != dims[i].dimType ||
+        s.instances[i] != dims[i].instanceId)
+      return false;
+    if (s.versions[i] != instanceVersion(dims[i].dimType, dims[i].instanceId))
+      return false;
+  }
+  uintptr_t p = s.fnPtr.loadAcquire();
+  if (p == 0)
+    return false;
+  *outFn = reinterpret_cast<void *>(p);
+  return true;
+}
+
+void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, const EJitDimPair *dims,
+                                    uint32_t numDims, void *fnPtr) {
+  if (!icacheReclamationSafe_)
+    return;
+  if (!state_ || !fnPtr || numDims > 4 || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
+    return;
+  uint32_t self = EJitCoreId::current();
+  if (self >= EJIT_ICACHE_MAX_CORES)
+    return;
+  EJitICacheSlot &s = gEJitICache[self][funcIndex];
+  s.numDims = numDims;
+  s.generation = state_->generation.loadAcquire();
+  for (uint32_t i = 0; i < numDims; ++i) {
+    s.dimTypes[i] = dims[i].dimType;
+    s.instances[i] = dims[i].instanceId;
+    s.versions[i] = instanceVersion(dims[i].dimType, dims[i].instanceId);
+  }
+  // Publish fnPtr then valid (release) so a probe's acquire load of valid sees a
+  // coherent slot, and a reclaimer's acquire load of fnPtr sees the pinned code.
+  s.fnPtr.storeRelease(reinterpret_cast<uintptr_t>(fnPtr));
+  s.valid.storeRelease(1);
 }
 
 void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,

@@ -53,6 +53,19 @@ static cl::opt<bool> EJitWrapperFixedDimEntry(
              "(ejit_taskpool_compile_or_get_Nd) for ejit_entry functions with "
              "<= 4 dims instead of the generic ejit_taskpool_compile_or_get"));
 
+// Emit a per-function inline-cache probe (ejit_icache_try[_Nd]) before the
+// taskpool compile_or_get call. On a hit the wrapper calls the cached
+// specialization directly with NO read-token (no readers_ RMW, no slot scan),
+// eliminating the dominant per-call cost on the cache-hit path. On a miss it
+// falls through to ejit_taskpool_compile_or_get unchanged. Default off: the
+// runtime probe is a no-op (always MISS) until the inline-cache runtime table
+// is enabled, so turning this on is safe but has no effect without the runtime
+// side.
+static cl::opt<bool> EJitInlineCache(
+    "ejit-inline-cache", cl::init(false), cl::Hidden,
+    cl::desc("Emit a per-function inline-cache probe (ejit_icache_try) before "
+             "the taskpool compile_or_get call in ejit_entry wrappers"));
+
 // Wrapper generation now unconditionally uses the unified taskpool API
 // (ejit_taskpool_compile_or_get + ejit_taskpool_release_read). Both Sync
 // and Async modes are runtime-configurable — the AOT wrapper code is
@@ -306,6 +319,13 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   M.getOrInsertFunction(
       FN_TASKPOOL_RELEASE_READ,
       FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
+  // ejit_icache_try(i32 funcIndex, ptr dims, i32 numDims, ptr outFn) -> i32.
+  // Declared once (the fixed-dim _Nd variants are declared per-call below, like
+  // the compile_or_get_Nd family). Only when the inline cache is enabled.
+  if (EJitInlineCache)
+    M.getOrInsertFunction(
+        FN_ICACHE_TRY,
+        FunctionType::get(I32Ty, {I32Ty, PtrTy, I32Ty, PtrTy}, false));
 
   auto isAlreadyWrapped = [](Function &F) -> bool {
     if (!F.getEntryBlock().getName().starts_with("jit_entry"))
@@ -442,12 +462,22 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // Save original entry block
     BasicBlock &OrigEntry = F->getEntryBlock();
 
-    // Create four new blocks: jit_entry (funcIndex guard), jit_call (taskpool
-    // request), jit_fallback (AOT body) and jit_dispatch (run JIT code).
+    // Create the wrapper blocks: jit_entry (funcIndex guard), jit_call
+    // (taskpool request), jit_fallback (AOT body), jit_dispatch (run JIT code
+    // via the taskpool, with a read token). With -ejit-inline-cache two extra
+    // blocks sit between the guard and the request: jit_icache (probe the
+    // per-function cache) and jit_icache_dispatch (call the cached
+    // specialization directly, with NO read token).
     auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F, &OrigEntry);
     auto *JitCall = BasicBlock::Create(Ctx, "jit_call", F);
     auto *JitFallback = BasicBlock::Create(Ctx, "jit_fallback", F);
     auto *JitDispatch = BasicBlock::Create(Ctx, "jit_dispatch", F);
+    BasicBlock *JitIcache = nullptr;
+    BasicBlock *JitIcacheDispatch = nullptr;
+    if (EJitInlineCache) {
+      JitIcache = BasicBlock::Create(Ctx, "jit_icache", F);
+      JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
+    }
 
     // Update PHI incoming blocks in successors that reference OrigEntry.
     //
@@ -500,18 +530,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         Builder.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
     Value *OutBucketAlloca =
         Builder.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
-    Value *FuncIdx = Builder.CreateLoad(
-        I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
-    Value *IdxValid = Builder.CreateICmpNE(
-        FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
-    Builder.CreateCondBr(IdxValid, JitCall, JitFallback);
-
-    // jit_call: unified taskpool API. Both Sync and Async modes share the same
-    // AOT wrapper — the runtime compile mode controls whether compilation is
-    // inline or via a background worker.
-    Builder.SetInsertPoint(JitCall);
-
-    // Load each dim's (dimType, instanceId) as i32. Shared by both emitters.
+    // outFn/outBucket pointer args + the (dimType, instanceId) emitters are
+    // shared by jit_icache and jit_call. Defined once here; the emitters
+    // capture Builder and emit at whichever insert point is current when called.
+    Value *OutFnArg = Builder.CreatePointerCast(OutFnAlloca, PtrTy);
+    Value *OutBucketArg = Builder.CreatePointerCast(OutBucketAlloca, PtrTy);
     auto emitDimTypeVal = [&](unsigned I) {
       return Builder.CreateLoad(I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName],
                                 "ejit_dimtype");
@@ -525,9 +548,84 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         return Builder.CreateZExt(ArgVal, I32Ty);
       return ArgVal;
     };
+    Value *FuncIdx = Builder.CreateLoad(
+        I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
+    Value *IdxValid = Builder.CreateICmpNE(
+        FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
+    // With the inline cache a valid funcIndex probes the cache first; otherwise
+    // go straight to the taskpool request. An invalid funcIndex always falls
+    // back to the AOT body without entering the taskpool.
+    Builder.CreateCondBr(IdxValid, EJitInlineCache ? JitIcache : JitCall,
+                         JitFallback);
 
-    Value *OutFnArg = Builder.CreatePointerCast(OutFnAlloca, PtrTy);
-    Value *OutBucketArg = Builder.CreatePointerCast(OutBucketAlloca, PtrTy);
+    // jit_icache: probe the per-function inline cache. On a hit call the cached
+    // specialization directly (NO read token); on a miss fall through to the
+    // taskpool request (jit_call), which re-fills the cache on success.
+    if (EJitInlineCache) {
+      Builder.SetInsertPoint(JitIcache);
+      Value *IHit = nullptr;
+      if (UseFixed) {
+        static const char *const IcacheNames[] = {
+            FN_ICACHE_TRY_0D, FN_ICACHE_TRY_1D, FN_ICACHE_TRY_2D,
+            FN_ICACHE_TRY_3D, FN_ICACHE_TRY_4D};
+        SmallVector<Type *, 12> ParamTys;
+        SmallVector<Value *, 12> IArgs;
+        ParamTys.push_back(I32Ty);
+        IArgs.push_back(FuncIdx);
+        for (unsigned I = 0; I < DimCount; ++I) {
+          ParamTys.push_back(I32Ty);
+          ParamTys.push_back(I32Ty);
+          IArgs.push_back(emitDimTypeVal(I));
+          IArgs.push_back(emitInstanceVal(I));
+        }
+        ParamTys.push_back(PtrTy);
+        IArgs.push_back(OutFnArg);
+        FunctionCallee IFn = M.getOrInsertFunction(
+            IcacheNames[DimCount], FunctionType::get(I32Ty, ParamTys, false));
+        IHit = Builder.CreateCall(IFn, IArgs);
+      } else {
+        for (unsigned I = 0; I < DimCount; ++I) {
+          Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
+                           ConstantInt::get(I32Ty, I)};
+          Value *PairPtr = Builder.CreateInBoundsGEP(
+              ArrayType::get(DimPairTy, 4), DimsAlloca, Idxs);
+          Value *DimTypePtr =
+              Builder.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr");
+          Value *InstancePtr =
+              Builder.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr");
+          Builder.CreateStore(emitDimTypeVal(I), DimTypePtr);
+          Builder.CreateStore(emitInstanceVal(I), InstancePtr);
+        }
+        Value *DimsPtr = DimCount > 0
+                             ? Builder.CreatePointerCast(DimsAlloca, PtrTy)
+                             : ConstantPointerNull::get(PtrTy);
+        IHit = Builder.CreateCall(
+            M.getFunction(FN_ICACHE_TRY),
+            {FuncIdx, DimsPtr, ConstantInt::get(I32Ty, DimCount), OutFnArg});
+      }
+      Value *IHitBool = Builder.CreateICmpEQ(IHit, ConstantInt::get(I32Ty, 1));
+      Builder.CreateCondBr(IHitBool, JitIcacheDispatch, JitCall);
+
+      // jit_icache_dispatch: call the cached specialization directly. NO
+      // ejit_taskpool_release_read — the inline cache pins the code.
+      Builder.SetInsertPoint(JitIcacheDispatch);
+      Value *ICFn = Builder.CreateLoad(PtrTy, OutFnAlloca, "ejit_ic_fn");
+      SmallVector<Value *, 8> ICArgs;
+      for (auto &Arg : F->args())
+        ICArgs.push_back(&Arg);
+      if (F->getReturnType()->isVoidTy()) {
+        Builder.CreateCall(F->getFunctionType(), ICFn, ICArgs);
+        Builder.CreateRetVoid();
+      } else {
+        Value *RetVal = Builder.CreateCall(F->getFunctionType(), ICFn, ICArgs);
+        Builder.CreateRet(RetVal);
+      }
+    }
+
+    // jit_call: unified taskpool API. Both Sync and Async modes share the same
+    // AOT wrapper — the runtime compile mode controls whether compilation is
+    // inline or via a background worker.
+    Builder.SetInsertPoint(JitCall);
     Value *Status = nullptr;
     if (UseFixed) {
       // ejit_taskpool_compile_or_get_Nd(i32 funcIndex,

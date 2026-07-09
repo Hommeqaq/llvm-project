@@ -79,6 +79,41 @@ enum class EJitWorkerStep : uint32_t {
   Exit,     ///< Failed/Stopping/Uninitialized: leave the loop.
 };
 
+//===----------------------------------------------------------------------===//
+// Per-function inline cache (spec: EJIT inline cache).
+//
+// A per-core, monomorphic cache slot per funcIndex. While a slot holds a fnPtr
+// it PINS that code: a reclaimer (releaseFn_) must scan every core's slot before
+// freeing old code (hazard-pointer style). A core only ever writes its OWN row,
+// and - with no interrupt reentrancy into ejit_entry - never overwrites its slot
+// during a cached call, so the pinned fnPtr is stable for the call's duration.
+// The probe is pure loads (version re-check via the shared version array): no
+// read-token RMW, no bucket slot scan. The table is static storage (zero-filled
+// by the loader, no dynamic init), indexed by EJitCoreId::current(); a core/func
+// out of range simply misses (no caching). Sizes are tunable per platform.
+//===----------------------------------------------------------------------===//
+#ifndef EJIT_ICACHE_MAX_CORES
+#define EJIT_ICACHE_MAX_CORES 8u
+#endif
+#ifndef EJIT_ICACHE_FUNC_SLOTS
+#define EJIT_ICACHE_FUNC_SLOTS 64u
+#endif
+
+struct EJitICacheSlot {
+  EJitAtomicU32 valid;   // 0=empty, 1=filled (release-store on fill / acquire-load on probe)
+  uint32_t numDims;      // plain: written before valid=1, read after valid==1 (owning core)
+  uint32_t generation;   // pool generation snapshot at fill (owner re-init => miss)
+  uint32_t dimTypes[4];
+  uint32_t instances[4];
+  uint32_t versions[4];
+  EJitAtomicUPtr fnPtr;  // (uintptr_t)specialization; 0=empty (HP-scanned by reclaimer)
+};
+
+// Test/diagnostic: clear every core's icache slot. The table is process-static
+// storage shared across pool instances, so tests clear it between cases to avoid
+// stale cross-test leakage.
+void ejitIcacheClearAll();
+
 class EJitSharedTaskPool {
 public:
   /// Owner-private compile callback (reaches the owner's EJit/ORC). Returns
@@ -198,6 +233,14 @@ public:
   void setReleaser(ReleaseCallback fn, void *ctx) {
     releaseFn_ = fn;
     releaseCtx_ = ctx;
+    // Reclamation is now wired: physical code may be freed on retire/eviction.
+    // The inline cache pins fnPtrs in per-core slots; without a hazard-pointer
+    // retire scan (the HP-scan follow-up) a cached fnPtr could be freed while a
+    // core still holds it. So the cache auto-disables (icacheTry always misses,
+    // icacheFill is a no-op) until the HP-scan retire is installed, which flips
+    // icacheReclamationSafe_ back to true. While no releaser is wired (v1
+    // production) code is never freed and the cache is unconditionally safe.
+    icacheReclamationSafe_ = (fn == nullptr);
   }
   void setPrepareCodeCallback(PrepareCodeCallback fn, void *ctx) {
     prepareCodeFn_ = fn;
@@ -345,6 +388,22 @@ public:
   /// truth the compile gate (compileCold) and ejit_is_active consult. Returns
   /// false for an out-of-range dimType/instanceId (never reads out of bounds).
   bool isInstanceActive(uint32_t dimType, uint32_t instanceId) const;
+
+  //--- per-function inline cache -------------------------------------------
+  // Probe the calling core's icache. On a hit *outFn is set to a pinned,
+  // directly-callable specialization (call it with NO releaseRead) and returns
+  // true; on a miss returns false. Pure loads (version re-check) - no read-token
+  // RMW, no slot scan. Returns false when the pool is not Ready, the calling
+  // core/funcIndex is out of the icache table range, or this core may not read
+  // cross-core code (the code-sharing gate).
+  bool icacheTry(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+                 void **outFn);
+  // Fill the calling core's icache slot with a freshly resolved specialization
+  // (call on a taskpool cache hit or a successful compile). Snapshots the
+  // current per-dim versions + pool generation. No-op for out-of-range
+  // core/funcIndex or a null fnPtr.
+  void icacheFill(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+                  void *fnPtr);
 
   //--- consumer path (worker / test) -----------------------------------------
   bool pollOne();
@@ -521,6 +580,9 @@ private:
   EJitCompileMode configuredMode_ = EJitCompileMode::Async;
   bool codeSharingEnabled_ = false;
   bool isOwner_ = false;
+  // Inline-cache safety gate: true while the cache is safe to use (no releaser
+  // wired, or the HP-scan retire is installed). See setReleaser().
+  bool icacheReclamationSafe_ = true;
 
   // Worker observability + startup-wait bound (owner-local).
   EJitAtomicU64 workerConsumeLoops_{0};

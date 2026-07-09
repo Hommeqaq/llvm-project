@@ -72,6 +72,17 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
     "ejit_taskpool_compile_or_get_4d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
+// Per-function inline-cache probe (spec: EJIT inline cache). Called by the
+// ejit_entry wrapper BEFORE ejit_taskpool_compile_or_get. Returns 1 on hit
+// (*outFn set to a pinned, directly-callable specialization; the caller calls
+// it with NO ejit_taskpool_release_read) or 0 on miss (fall through to
+// ejit_taskpool_compile_or_get). Emitted only when -ejit-inline-cache is on.
+constexpr const char *FN_ICACHE_TRY = "ejit_icache_try";
+constexpr const char *FN_ICACHE_TRY_0D = "ejit_icache_try_0d";
+constexpr const char *FN_ICACHE_TRY_1D = "ejit_icache_try_1d";
+constexpr const char *FN_ICACHE_TRY_2D = "ejit_icache_try_2d";
+constexpr const char *FN_ICACHE_TRY_3D = "ejit_icache_try_3d";
+constexpr const char *FN_ICACHE_TRY_4D = "ejit_icache_try_4d";
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
 // PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
 // array-pointer dimension in the active-state hot path.

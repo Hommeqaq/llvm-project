@@ -2161,4 +2161,89 @@ TEST_F(SharedTaskPoolTest, FixedDimVersionMismatchMisses) {
   EXPECT_FALSE(fixedMiss2.hasReadToken);
 }
 
+//===----------------------------------------------------------------------===//
+// Per-function inline cache: probe/fill, version invalidation, monomorphic
+// identity, and range guards. Asserts behavior (boolean + pointer), not stats.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, InlineCacheHitMissAndVersionInvalidation) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool); // core 0 owner, Ready, code sharing off (owner-only).
+  EJitCoreId::setCurrentForTest(0);
+
+  constexpr uint32_t kFunc = 3;
+  constexpr uint32_t kDim = 0, kInst = 5;
+  const EJitDimPair dims[1] = {{kDim, kInst}};
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // The shared pool starts every instance disabled (inactive); activate it.
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, true));
+
+  // Cold icache misses.
+  EXPECT_FALSE(pool.icacheTry(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, nullptr);
+
+  // Fill on a resolve -> subsequent probe hits, returning the pinned fnPtr.
+  pool.icacheFill(kFunc, dims, 1, fn);
+  EXPECT_TRUE(pool.icacheTry(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, fn);
+
+  // A period toggle bumps the version -> cached entry is stale -> miss.
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, false));
+  EXPECT_FALSE(pool.icacheTry(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, nullptr);
+  ASSERT_TRUE(pool.setInstanceEnabled(kDim, kInst, true));
+  EXPECT_FALSE(pool.icacheTry(kFunc, dims, 1, &out)); // version bumped again
+  EXPECT_EQ(out, nullptr);
+
+  // Re-resolve refills the new version snapshot -> hit.
+  pool.icacheFill(kFunc, dims, 1, fn);
+  EXPECT_TRUE(pool.icacheTry(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, fn);
+
+  // A different instance identity misses (monomorphic per funcIndex).
+  const EJitDimPair dimsOther[1] = {{kDim, 6}};
+  EXPECT_FALSE(pool.icacheTry(kFunc, dimsOther, 1, &out));
+  EXPECT_EQ(out, nullptr);
+
+  // Out-of-range funcIndex misses without touching memory.
+  EXPECT_FALSE(pool.icacheTry(EJIT_ICACHE_FUNC_SLOTS, dims, 1, &out));
+  EXPECT_EQ(out, nullptr);
+
+  ejitIcacheClearAll();
+}
+
+// Safety gate: wiring a releaser (reclamation on, no HP-scan retire yet)
+// auto-disables the icache so a cached fnPtr can never be freed mid-use.
+TEST_F(SharedTaskPoolTest, InlineCacheAutoDisablesWhenReclamationWired) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+
+  constexpr uint32_t kFunc = 3;
+  const EJitDimPair dims[1] = {{0, 5}};
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // Before a releaser: fill -> hit.
+  pool.icacheFill(kFunc, dims, 1, fn);
+  EXPECT_TRUE(pool.icacheTry(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, fn);
+
+  // Wire a releaser: icache auto-disables (miss + no-op fill) until the HP-scan
+  // retire is installed.
+  ReleaseLog rel;
+  pool.setReleaser(&mockRelease, &rel);
+  EXPECT_FALSE(pool.icacheTry(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, nullptr);
+  pool.icacheFill(kFunc, dims, 1, fn);
+  EXPECT_FALSE(pool.icacheTry(kFunc, dims, 1, &out));
+  EXPECT_EQ(out, nullptr);
+
+  ejitIcacheClearAll();
+}
+
 } // namespace

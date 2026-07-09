@@ -206,6 +206,35 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
                                               uint32_t inst2, uint32_t dim3,
                                               uint32_t inst3, void **outFn,
                                               uint32_t *outBucket);
+
+// Per-function inline-cache probe (emitted by the ejit_entry wrapper when
+// -ejit-inline-cache is on, called BEFORE ejit_taskpool_compile_or_get).
+//
+// On a hit the probe writes a pinned, directly-callable specialization pointer
+// to *outFn and returns 1: the wrapper calls it with NO ejit_taskpool_release_read
+// (the inline cache pins the code; see ejit_icache_safe_release). On a miss it
+// writes null to *outFn and returns 0: the wrapper falls through to
+// ejit_taskpool_compile_or_get unchanged. The probe performs only relaxed/acquire
+// version loads + compares - no read-token RMW, no slot scan.
+//
+// The fixed-dimension variants (0-4 dims) mirror ejit_taskpool_compile_or_get_Nd:
+// they pass the dim identity as scalars (no dims array / numDims loop) and are
+// selected by the wrapper for entries with <= 2 dims (fit in arg registers).
+// Returns 1 on hit, 0 on miss.
+int ejit_icache_try(uint32_t funcIndex, const ejit_dim_pair_t *dims,
+                    uint32_t numDims, void **outFn);
+int ejit_icache_try_0d(uint32_t funcIndex, void **outFn);
+int ejit_icache_try_1d(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
+                       void **outFn);
+int ejit_icache_try_2d(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
+                       uint32_t dim1, uint32_t inst1, void **outFn);
+int ejit_icache_try_3d(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
+                       uint32_t dim1, uint32_t inst1, uint32_t dim2,
+                       uint32_t inst2, void **outFn);
+int ejit_icache_try_4d(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
+                       uint32_t dim1, uint32_t inst1, uint32_t dim2,
+                       uint32_t inst2, uint32_t dim3, uint32_t inst3,
+                       void **outFn);
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);
