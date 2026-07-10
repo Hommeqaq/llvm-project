@@ -119,6 +119,78 @@ static void reportTimingSlot(const WrapperTimingSlot &S) {
             static_cast<unsigned long long>(S.TotalMin),
             static_cast<unsigned long long>(S.TotalMax));
 }
+
+//===----------------------------------------------------------------------===//
+// Region timing (global, lock-free). Independent of -ejit-wrapper-timing: the
+// bracket (begin/end) works in any build; the per-hit accumulation only fires
+// when AOT wrappers emit ejit_taskpool_trace_wrapper (-ejit-wrapper-timing on).
+// While a region is active, trace_wrapper routes to accumulateRegionHit()
+// instead of the per-function 1024-window path above. Storage is shared atomics
+// (fetchAdd + CAS min/max) so the hot path holds no lock; the sequential
+// parent-function measurement creates no contention. min sentinels are
+// UINT64_MAX (set at begin) so the first sample establishes the real min.
+//===----------------------------------------------------------------------===//
+static EJitAtomicU32 gRegionActive;
+static EJitAtomicU64 gRegionStartCycle;
+static EJitAtomicU64 gRegionLastDelta;
+
+static EJitAtomicU64 gRegionCount;
+static EJitAtomicU64 gRegionGetFnSum, gRegionFnCallSum, gRegionReleaseSum,
+    gRegionTotalSum;
+static EJitAtomicU64 gRegionGetFnMin, gRegionGetFnMax;
+static EJitAtomicU64 gRegionFnCallMin, gRegionFnCallMax;
+static EJitAtomicU64 gRegionReleaseMin, gRegionReleaseMax;
+static EJitAtomicU64 gRegionTotalMin, gRegionTotalMax;
+
+static void atomicMinU64(EJitAtomicU64 &slot, uint64_t v) {
+  uint64_t cur = slot.loadRelaxed();
+  while (v < cur) {
+    if (slot.compareExchange(cur, v))
+      break;
+  }
+}
+static void atomicMaxU64(EJitAtomicU64 &slot, uint64_t v) {
+  uint64_t cur = slot.loadRelaxed();
+  while (v > cur) {
+    if (slot.compareExchange(cur, v))
+      break;
+  }
+}
+
+static void resetRegionAccumulators() {
+  gRegionCount.storeRelaxed(0);
+  gRegionGetFnSum.storeRelaxed(0);
+  gRegionFnCallSum.storeRelaxed(0);
+  gRegionReleaseSum.storeRelaxed(0);
+  gRegionTotalSum.storeRelaxed(0);
+  gRegionGetFnMin.storeRelaxed(UINT64_MAX);
+  gRegionGetFnMax.storeRelaxed(0);
+  gRegionFnCallMin.storeRelaxed(UINT64_MAX);
+  gRegionFnCallMax.storeRelaxed(0);
+  gRegionReleaseMin.storeRelaxed(UINT64_MAX);
+  gRegionReleaseMax.storeRelaxed(0);
+  gRegionTotalMin.storeRelaxed(UINT64_MAX);
+  gRegionTotalMax.storeRelaxed(0);
+}
+
+// Accumulate one hit into the global region aggregate. Called on the
+// trace_wrapper hot path only while gRegionActive is set.
+static void accumulateRegionHit(uint64_t getFn, uint64_t fnCall,
+                                uint64_t release, uint64_t total) {
+  gRegionCount.fetchAdd(1);
+  gRegionGetFnSum.fetchAdd(getFn);
+  gRegionFnCallSum.fetchAdd(fnCall);
+  gRegionReleaseSum.fetchAdd(release);
+  gRegionTotalSum.fetchAdd(total);
+  atomicMinU64(gRegionGetFnMin, getFn);
+  atomicMaxU64(gRegionGetFnMax, getFn);
+  atomicMinU64(gRegionFnCallMin, fnCall);
+  atomicMaxU64(gRegionFnCallMax, fnCall);
+  atomicMinU64(gRegionReleaseMin, release);
+  atomicMaxU64(gRegionReleaseMax, release);
+  atomicMinU64(gRegionTotalMin, total);
+  atomicMaxU64(gRegionTotalMax, total);
+}
 } // namespace
 
 #ifdef EJIT_SRE_SHARED_TASKPOOL
@@ -200,6 +272,11 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
 
 void ejit_shutdown(void) {
   EJIT_DIAG("shutting down");
+  // Flush a region the harness left armed so its partial window is not lost.
+  if (gRegionActive.loadRelaxed()) {
+    EJIT_DIAG("wrapper_timing_region: flushing active region at shutdown");
+    ejit_timing_region_end();
+  }
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   setDumpSharedState(nullptr);
 #endif
@@ -882,6 +959,15 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
   uint64_t fnCall = tAfterFn - tBeforeFn;
   uint64_t release = tAfterRelease - tAfterFn;
   uint64_t total = tAfterRelease - tBeforeLookup;
+
+  // Region mode: accumulate into the single global lock-free aggregate and skip
+  // the per-function 1024-window path. Mutually exclusive with the legacy path;
+  // when no region is active the relaxed load is the only overhead.
+  if (gRegionActive.loadRelaxed()) {
+    accumulateRegionHit(getFn, fnCall, release, total);
+    return;
+  }
+
   gWrapperTimingLock.lock();
   unsigned SlotIdx = funcIndex % (sizeof(gWrapperTimingSlots) /
                                   sizeof(gWrapperTimingSlots[0]));
@@ -912,6 +998,115 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
   (void)tAfterRelease;
 #endif
   gWrapperTimingLock.unlock();
+}
+
+void ejit_timing_region_begin(void) {
+  if (gRegionActive.loadRelaxed()) {
+    EJIT_DIAG("wrapper_timing_region_begin: region already active, ignored");
+    return;
+  }
+  resetRegionAccumulators();
+  gRegionLastDelta.storeRelaxed(0);
+  gRegionStartCycle.storeRelease(ejit_taskpool_trace_now());
+  gRegionActive.storeRelease(1);
+  EJIT_DIAG("wrapper_timing_region_begin: armed");
+}
+
+uint64_t ejit_timing_region_end(void) {
+  if (!gRegionActive.loadRelaxed()) {
+    EJIT_DIAG("wrapper_timing_region_end: no active region, ignored");
+    return 0;
+  }
+  uint64_t stop = ejit_taskpool_trace_now();
+  uint64_t start = gRegionStartCycle.loadRelaxed();
+  gRegionActive.storeRelease(0);
+  uint64_t delta = stop - start;
+  gRegionLastDelta.storeRelaxed(delta);
+
+  uint64_t count = gRegionCount.loadRelaxed();
+  EJIT_DIAG("wrapper_timing_region total_cycles=%llu dispatch_hits=%llu",
+            static_cast<unsigned long long>(delta),
+            static_cast<unsigned long long>(count));
+  if (count > 0) {
+    EJIT_DIAG("wrapper_timing_region_agg count=%llu "
+              "get_fn sum=%llu avg=%llu min=%llu max=%llu "
+              "fn_call sum=%llu avg=%llu min=%llu max=%llu "
+              "release sum=%llu avg=%llu min=%llu max=%llu "
+              "total sum=%llu avg=%llu min=%llu max=%llu",
+              static_cast<unsigned long long>(count),
+              static_cast<unsigned long long>(gRegionGetFnSum.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionGetFnSum.loadRelaxed() / count),
+              static_cast<unsigned long long>(gRegionGetFnMin.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionGetFnMax.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionFnCallSum.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionFnCallSum.loadRelaxed() / count),
+              static_cast<unsigned long long>(gRegionFnCallMin.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionFnCallMax.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionReleaseSum.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionReleaseSum.loadRelaxed() / count),
+              static_cast<unsigned long long>(gRegionReleaseMin.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionReleaseMax.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionTotalSum.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionTotalSum.loadRelaxed() / count),
+              static_cast<unsigned long long>(gRegionTotalMin.loadRelaxed()),
+              static_cast<unsigned long long>(gRegionTotalMax.loadRelaxed()));
+  }
+  // Accumulators are left intact so a post-end snapshot can read them; the next
+  // begin() resets them.
+  return delta;
+}
+
+ejit_status_t ejit_timing_region_snapshot(ejit_timing_region_stats_t *out) {
+  if (!out)
+    return EJIT_ERR_INVALID_PARAM;
+  uint64_t count = gRegionCount.loadRelaxed();
+  out->totalCycles = gRegionLastDelta.loadRelaxed();
+  out->count = count;
+  out->getFnSum = gRegionGetFnSum.loadRelaxed();
+  out->getFnMin = count ? gRegionGetFnMin.loadRelaxed() : 0;
+  out->getFnMax = gRegionGetFnMax.loadRelaxed();
+  out->fnCallSum = gRegionFnCallSum.loadRelaxed();
+  out->fnCallMin = count ? gRegionFnCallMin.loadRelaxed() : 0;
+  out->fnCallMax = gRegionFnCallMax.loadRelaxed();
+  out->releaseSum = gRegionReleaseSum.loadRelaxed();
+  out->releaseMin = count ? gRegionReleaseMin.loadRelaxed() : 0;
+  out->releaseMax = gRegionReleaseMax.loadRelaxed();
+  out->totalSum = gRegionTotalSum.loadRelaxed();
+  out->totalMin = count ? gRegionTotalMin.loadRelaxed() : 0;
+  out->totalMax = gRegionTotalMax.loadRelaxed();
+  return EJIT_OK;
+}
+
+void ejit_print_timing_region(void) {
+  ejit_timing_region_stats_t s;
+  ejit_timing_region_snapshot(&s); // always EJIT_OK for non-null out
+  EJIT_DIAG("timing_region total_cycles=%llu dispatch_hits=%llu",
+            static_cast<unsigned long long>(s.totalCycles),
+            static_cast<unsigned long long>(s.count));
+  if (s.count > 0) {
+    EJIT_DIAG("timing_region_agg count=%llu "
+              "get_fn sum=%llu avg=%llu min=%llu max=%llu "
+              "fn_call sum=%llu avg=%llu min=%llu max=%llu "
+              "release sum=%llu avg=%llu min=%llu max=%llu "
+              "total sum=%llu avg=%llu min=%llu max=%llu",
+              static_cast<unsigned long long>(s.count),
+              static_cast<unsigned long long>(s.getFnSum),
+              static_cast<unsigned long long>(s.getFnSum / s.count),
+              static_cast<unsigned long long>(s.getFnMin),
+              static_cast<unsigned long long>(s.getFnMax),
+              static_cast<unsigned long long>(s.fnCallSum),
+              static_cast<unsigned long long>(s.fnCallSum / s.count),
+              static_cast<unsigned long long>(s.fnCallMin),
+              static_cast<unsigned long long>(s.fnCallMax),
+              static_cast<unsigned long long>(s.releaseSum),
+              static_cast<unsigned long long>(s.releaseSum / s.count),
+              static_cast<unsigned long long>(s.releaseMin),
+              static_cast<unsigned long long>(s.releaseMax),
+              static_cast<unsigned long long>(s.totalSum),
+              static_cast<unsigned long long>(s.totalSum / s.count),
+              static_cast<unsigned long long>(s.totalMin),
+              static_cast<unsigned long long>(s.totalMax));
+  }
 }
 
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {

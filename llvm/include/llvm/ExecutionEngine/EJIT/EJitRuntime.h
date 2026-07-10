@@ -226,6 +226,46 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  uint64_t tAfterFn,
                                  uint64_t tAfterRelease);
 
+// Region timing bracket. Independent of -ejit-wrapper-timing: the bracket
+// (begin/end) works in any build; the per-hit accumulation only fires when AOT
+// wrappers emit ejit_taskpool_trace_wrapper (i.e. -ejit-wrapper-timing is on).
+// Call ejit_timing_region_begin() at the start of a measured region (e.g. a
+// parent function that calls many ejit_entry functions) and
+// ejit_timing_region_end() at the end. While active, ejit_taskpool_trace_wrapper
+// accumulates into a single global lock-free aggregate instead of the
+// per-function 1024-window path; end() prints the bracket cycle total plus
+// per-metric sum/avg/min/max. The bracket is path-independent (it wraps the
+// region regardless of whether wrappers dispatch to JIT or fall through to
+// AOT), so an OFF run (ejit not activated) and an ON run each yield a
+// comparable total_cycles. begin/end must run on the same core with no
+// ejit_entry calls in flight during the call itself. end() returns the bracket
+// delta (0 if no region was active).
+void ejit_timing_region_begin(void);
+uint64_t ejit_timing_region_end(void);
+
+// Snapshot the current (or last-closed) region's accumulators without printing
+// or resetting. Returns EJIT_OK and fills *out, or EJIT_ERR_INVALID_PARAM if
+// out is null. totalCycles is 0 while a region is active (bracket not closed)
+// and the closed delta after ejit_timing_region_end(). Lets a harness read
+// region stats programmatically instead of parsing wrapper_timing_region logs.
+typedef struct {
+  uint64_t totalCycles; ///< Bracket delta (0 until end() is called).
+  uint64_t count;       ///< Number of trace_wrapper hits accumulated.
+  uint64_t getFnSum, getFnMin, getFnMax;
+  uint64_t fnCallSum, fnCallMin, fnCallMax;
+  uint64_t releaseSum, releaseMin, releaseMax;
+  uint64_t totalSum, totalMin, totalMax;
+} ejit_timing_region_stats_t;
+ejit_status_t ejit_timing_region_snapshot(ejit_timing_region_stats_t *out);
+
+// Print the current timing-region snapshot through the platform log (the same
+// fields as ejit_timing_region_snapshot / the wrapper_timing_region lines),
+// in the style of ejit_print_active / ejit_print_code_pool_stats. Lets a
+// harness dump region stats on demand without capturing the struct. Works with
+// or without an active region (and without ejit_init - the accumulators are
+// process-global); output is a no-op when EJIT_DIAG_ENABLE is undefined.
+void ejit_print_timing_region(void);
+
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 unsigned ejit_taskpool_poll_one(void);
 unsigned ejit_taskpool_poll_budget(unsigned maxItems);

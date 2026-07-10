@@ -2855,3 +2855,127 @@ TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
 TEST(EJitDiagnostics, PrintActiveNoCrash) {
   ejit_print_active(); // uninitialized: prints a notice
 }
+
+//===----------------------------------------------------------------------===//
+// Wrapper timing region tests
+//
+// Exercises the Phase 1 region mode: a path-independent bracket plus a global
+// lock-free per-hit aggregate. trace_wrapper is called directly with controlled
+// timestamps so the sums/min/max are deterministic (independent of the cycle
+// counter). The bracket delta itself is counter-dependent and not asserted for
+// magnitude - only that end()'s return matches the snapshot's totalCycles.
+//===----------------------------------------------------------------------===//
+
+extern "C" {
+extern uint64_t ejit_taskpool_trace_now(void);
+extern void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
+                                        void *fnPtr, uint32_t bucketIndex,
+                                        uint64_t tBeforeLookup,
+                                        uint64_t tAfterLookup,
+                                        uint64_t tBeforeFn, uint64_t tAfterFn,
+                                        uint64_t tAfterRelease);
+extern void ejit_timing_region_begin(void);
+extern uint64_t ejit_timing_region_end(void);
+// Mirrors ejit_timing_region_stats_t in EJitRuntime.h. The test deliberately
+// does not include the C runtime header; keep the two layouts in sync.
+typedef struct {
+  uint64_t totalCycles;
+  uint64_t count;
+  uint64_t getFnSum, getFnMin, getFnMax;
+  uint64_t fnCallSum, fnCallMin, fnCallMax;
+  uint64_t releaseSum, releaseMin, releaseMax;
+  uint64_t totalSum, totalMin, totalMax;
+} ejit_timing_region_stats_test_t;
+extern int ejit_timing_region_snapshot(ejit_timing_region_stats_test_t *out);
+extern void ejit_print_timing_region(void);
+}
+
+// Ensure no region is armed regardless of prior test state: end() is a warned
+// no-op when nothing is active.
+static void ensureNoActiveTimingRegion() { ejit_timing_region_end(); }
+
+TEST(EJitWrapperTimingRegion, AccumulatesGlobalSums) {
+  ensureNoActiveTimingRegion();
+
+  ejit_timing_region_begin();
+  // Hit 1: getFn=10, fnCall=100, release=5, total=115
+  ejit_taskpool_trace_wrapper(1, 0, (void *)0x1000, 0, 0, 10, 10, 110, 115);
+  // Hit 2: getFn=20, fnCall=200, release=5, total=225
+  ejit_taskpool_trace_wrapper(1, 0, (void *)0x1000, 0, 0, 20, 20, 220, 225);
+
+  ejit_timing_region_stats_test_t s;
+  ASSERT_EQ(ejit_timing_region_snapshot(&s), kEjitStatusOk);
+  EXPECT_EQ(s.count, 2u);
+  EXPECT_EQ(s.getFnSum, 30u);    // 10 + 20
+  EXPECT_EQ(s.fnCallSum, 300u);  // 100 + 200
+  EXPECT_EQ(s.releaseSum, 10u);  // 5 + 5
+  EXPECT_EQ(s.totalSum, 340u);   // 115 + 225
+  EXPECT_EQ(s.getFnMin, 10u);
+  EXPECT_EQ(s.getFnMax, 20u);
+  EXPECT_EQ(s.fnCallMin, 100u);
+  EXPECT_EQ(s.fnCallMax, 200u);
+  EXPECT_EQ(s.releaseMin, 5u);
+  EXPECT_EQ(s.releaseMax, 5u);
+  EXPECT_EQ(s.totalMin, 115u);
+  EXPECT_EQ(s.totalMax, 225u);
+  // Bracket still open while active.
+  EXPECT_EQ(s.totalCycles, 0u);
+
+  uint64_t delta = ejit_timing_region_end();
+  // After end, snapshot reflects the closed region's delta (counter-dependent,
+  // so only assert it equals end()'s return, not its magnitude).
+  ASSERT_EQ(ejit_timing_region_snapshot(&s), kEjitStatusOk);
+  EXPECT_EQ(s.totalCycles, delta);
+  EXPECT_EQ(s.count, 2u);
+}
+
+TEST(EJitWrapperTimingRegion, InactiveDoesNotTouchRegionAccumulators) {
+  ensureNoActiveTimingRegion();
+  // begin()+end() is the only thing that resets the global accumulators (end()
+  // leaves them for a post-end snapshot), so do a reset cycle first to guarantee
+  // a clean baseline regardless of prior test state.
+  ejit_timing_region_begin();
+  ejit_timing_region_end();
+  // No active region: trace_wrapper must take the legacy 1024-window path and
+  // leave the region aggregate untouched.
+  ejit_taskpool_trace_wrapper(1, 0, (void *)0x2000, 0, 0, 5, 5, 50, 55);
+  ejit_timing_region_stats_test_t s;
+  ASSERT_EQ(ejit_timing_region_snapshot(&s), kEjitStatusOk);
+  EXPECT_EQ(s.count, 0u);
+  EXPECT_EQ(s.getFnSum, 0u);
+  EXPECT_EQ(s.totalSum, 0u);
+}
+
+TEST(EJitWrapperTimingRegion, BeginResetsAccumulators) {
+  ensureNoActiveTimingRegion();
+  ejit_timing_region_begin();
+  ejit_taskpool_trace_wrapper(2, 0, (void *)0x3000, 1, 0, 7, 7, 70, 77);
+  ejit_timing_region_end();
+
+  // A second begin must zero the previous region's accumulators.
+  ejit_timing_region_begin();
+  ejit_timing_region_stats_test_t s;
+  ASSERT_EQ(ejit_timing_region_snapshot(&s), kEjitStatusOk);
+  EXPECT_EQ(s.count, 0u);
+  EXPECT_EQ(s.getFnSum, 0u);
+  EXPECT_EQ(s.totalCycles, 0u); // begin clears the last delta too
+  ejit_timing_region_end();
+}
+
+TEST(EJitWrapperTimingRegion, SnapshotNullOutRejected) {
+  // A null out pointer is rejected with EJIT_ERR_INVALID_PARAM (-1), matching
+  // the ejit_get_code_pool_stats null-out convention. Must not crash.
+  EXPECT_EQ(ejit_timing_region_snapshot(nullptr), -1);
+}
+
+TEST(EJitWrapperTimingRegion, PrintRegionNoCrash) {
+  // Prints (or no-ops when EJIT_DIAG_ENABLE is off) the current region
+  // snapshot; must not crash with no active region, mid-region, and after end.
+  ensureNoActiveTimingRegion();
+  ejit_print_timing_region();
+  ejit_timing_region_begin();
+  ejit_taskpool_trace_wrapper(1, 0, (void *)0x1000, 0, 0, 10, 10, 110, 115);
+  ejit_print_timing_region();
+  ejit_timing_region_end();
+  ejit_print_timing_region();
+}
