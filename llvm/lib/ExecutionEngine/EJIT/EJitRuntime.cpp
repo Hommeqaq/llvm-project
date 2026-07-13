@@ -59,6 +59,8 @@ struct WrapperTimingSlot {
   uint64_t FnCallSum = 0;
   uint64_t ReleaseSum = 0;
   uint64_t TotalSum = 0;
+  uint64_t BlockStartCycle = 0; // tBeforeLookup of the first call in this window
+  uint64_t BlockEndCycle = 0;   // tAfterRelease of the last call in this window
 };
 
 static TimingSpinLock gWrapperTimingLock;
@@ -77,6 +79,8 @@ static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
   S.FnCallSum = 0;
   S.ReleaseSum = 0;
   S.TotalSum = 0;
+  S.BlockStartCycle = 0;
+  S.BlockEndCycle = 0;
 }
 
 // [[maybe_unused]]: only called from the EVERY>0 periodic branch; an EVERY=0
@@ -84,14 +88,83 @@ static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
 [[maybe_unused]] static void reportTimingSlot(const WrapperTimingSlot &S) {
   if (S.Count == 0)
     return;
+  uint64_t blockAvg = 0;
+  if (S.BlockEndCycle >= S.BlockStartCycle && S.Count > 0)
+    blockAvg = (S.BlockEndCycle - S.BlockStartCycle) / S.Count;
   EJIT_DIAG("wrapper_timing_agg func=%u status=%u fn=%p bucket=%u count=%llu "
-            "get_fn_avg=%llu fn_call_avg=%llu release_avg=%llu total_avg=%llu",
+            "get_fn_avg=%llu fn_call_avg=%llu release_avg=%llu total_avg=%llu "
+            "block_avg=%llu",
             S.FuncIndex, S.Status, S.FnPtr, S.BucketIndex,
             static_cast<unsigned long long>(S.Count),
             static_cast<unsigned long long>(S.GetFnSum / S.Count),
             static_cast<unsigned long long>(S.FnCallSum / S.Count),
             static_cast<unsigned long long>(S.ReleaseSum / S.Count),
-            static_cast<unsigned long long>(S.TotalSum / S.Count));
+            static_cast<unsigned long long>(S.TotalSum / S.Count),
+            static_cast<unsigned long long>(blockAvg));
+}
+
+// Fallback-path telemetry: counts ejit_entry calls that fell back to the AOT
+// body (compile_or_get returned a non-hit status), broken down by reason, with
+// the compile_or_get (get_fn) cost. Emitted on the jit_call -> jit_fallback
+// edge only (post-init misses; pre-init calls short-circuit at jit_entry before
+// compile_or_get runs and are not counted here). Mirrors WrapperTimingSlot's
+// windowing - one summary per EJIT_WRAPPER_TIMING_REPORT_EVERY samples, gated
+// by the same EVERY macro. Compare against wrapper_timing_agg (which counts
+// ONLY status=0 dispatch hits) to see whether a PERF measurement that covers
+// both paths is inflated by AOT fallback calls.
+struct FallbackTimingSlot {
+  bool Valid = false;
+  uint32_t FuncIndex = 0;
+  uint64_t Count = 0;
+  uint64_t GetFnSum = 0;
+  uint64_t Pending = 0;    // EJIT_PENDING: async compile queued, not ready
+  uint64_t QueueFull = 0;  // EJIT_ERR_QUEUE_FULL / EJIT_ERR_DEDUP_FULL
+  uint64_t Disabled = 0;   // EJIT_ERR_DISABLED / EJIT_ERR_INSTANCE_DISABLED
+  uint64_t Failed = 0;     // compile failed / invalid param / other
+  bool FirstSeen = false;  // one-shot first-fallback log per function
+};
+
+static FallbackTimingSlot gFallbackTimingSlots[32];
+
+static void resetFallbackSlot(FallbackTimingSlot &S, uint32_t FuncIndex) {
+  S.Valid = true;
+  S.FuncIndex = FuncIndex;
+  S.Count = 0;
+  S.GetFnSum = 0;
+  S.Pending = S.QueueFull = S.Disabled = S.Failed = 0;
+  S.FirstSeen = false;
+}
+
+// [[maybe_unused]]: only called from the EVERY>0 periodic branch; an EVERY=0
+// build (suppress periodic output) would otherwise flag this as unused.
+[[maybe_unused]] static void
+reportFallbackSlot(const FallbackTimingSlot &S) {
+  if (S.Count == 0)
+    return;
+  EJIT_DIAG("wrapper_timing_fallback_agg func=%u count=%llu get_fn_avg=%llu "
+            "pending=%llu queuefull=%llu disabled=%llu failed=%llu",
+            S.FuncIndex,
+            static_cast<unsigned long long>(S.Count),
+            static_cast<unsigned long long>(S.GetFnSum / S.Count),
+            static_cast<unsigned long long>(S.Pending),
+            static_cast<unsigned long long>(S.QueueFull),
+            static_cast<unsigned long long>(S.Disabled),
+            static_cast<unsigned long long>(S.Failed));
+}
+
+// Flush residual timing windows at shutdown so a partial window (< EVERY) is
+// not lost - dispatch slots print wrapper_timing_agg, fallback slots print
+// wrapper_timing_fallback_agg. No-op when periodic output is suppressed
+// (EVERY=0), matching the rest of the timing path.
+static void flushWrapperTimingSlots() {
+#if EJIT_WRAPPER_TIMING_REPORT_EVERY > 0
+  gWrapperTimingLock.lock();
+  for (WrapperTimingSlot &S : gWrapperTimingSlots)
+    reportTimingSlot(S);
+  for (FallbackTimingSlot &S : gFallbackTimingSlots)
+    reportFallbackSlot(S);
+  gWrapperTimingLock.unlock();
+#endif
 }
 } // namespace
 
@@ -174,6 +247,10 @@ ejit_status_t ejit_init(const ejit_config_t *config) {
 
 void ejit_shutdown(void) {
   EJIT_DIAG("shutting down");
+  // Flush partial timing windows so a short residual (< EVERY) is still
+  // reported - especially useful for rare fallbacks that never reach the
+  // periodic threshold on their own.
+  flushWrapperTimingSlots();
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   setDumpSharedState(nullptr);
 #endif
@@ -846,6 +923,15 @@ uint64_t ejit_taskpool_trace_now(void) {
 #endif
 }
 
+// Per-call pair-sample telemetry (see EJitRuntime.h). Placed in the shared
+// section (.mc_shared) so the JIT-resolved copy in ejit_fn and the runtime's
+// trace_wrapper access the SAME location - under per-core-BSS builds, a plain
+// global would be per-core and the JIT (fixed address) could miss the core's
+// copy, breaking the per-call pairing.
+EJIT_SHARED_SECTION volatile uint32_t g_ejit_pair_request = 0;
+EJIT_SHARED_SECTION volatile uint32_t g_ejit_pair_ready = 0;
+EJIT_SHARED_SECTION volatile uint64_t g_ejit_pair_perf_dur = 0;
+
 void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  void *fnPtr, uint32_t bucketIndex,
                                  uint64_t tBeforeLookup,
@@ -856,6 +942,26 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
   uint64_t fnCall = tAfterFn - tBeforeFn;
   uint64_t release = tAfterRelease - tAfterFn;
   uint64_t total = tAfterRelease - tBeforeLookup;
+  // Per-call pair sample: PERF (inside ejit_fn) runs before trace_wrapper on
+  // the same call and, if it saw g_ejit_pair_request, stashed its body
+  // duration into g_ejit_pair_perf_dur. Here we read it and pair with this
+  // call's fn_call. One line per ~EJIT_PAIR_EVERY dispatches (low frequency).
+#if EJIT_PAIR_EVERY > 0
+  if (funcIndex == 0 && g_ejit_pair_ready) {
+    EJIT_DIAG("pair_sample func=%u perf=%llu fn_call=%llu diff=%lld",
+              funcIndex,
+              static_cast<unsigned long long>(g_ejit_pair_perf_dur),
+              static_cast<unsigned long long>(fnCall),
+              static_cast<long long>((int64_t)fnCall -
+                                     (int64_t)g_ejit_pair_perf_dur));
+    g_ejit_pair_ready = 0;
+  }
+  if (funcIndex == 0 && !g_ejit_pair_request) {
+    static uint64_t gPairArmCtr = 0;
+    if ((++gPairArmCtr) % EJIT_PAIR_EVERY == 0)
+      g_ejit_pair_request = 1;
+  }
+#endif
   gWrapperTimingLock.lock();
   unsigned SlotIdx = funcIndex % (sizeof(gWrapperTimingSlots) /
                                   sizeof(gWrapperTimingSlots[0]));
@@ -880,6 +986,9 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
     S.BucketIndex = bucketIndex;
   }
 
+  if (S.Count == 0)
+    S.BlockStartCycle = tBeforeLookup;
+
   ++S.Count;
   S.GetFnSum += getFn;
   S.FnCallSum += fnCall;
@@ -888,6 +997,7 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
 
 #if EJIT_WRAPPER_TIMING_REPORT_EVERY > 0
   if ((S.Count % EJIT_WRAPPER_TIMING_REPORT_EVERY) == 0) {
+    S.BlockEndCycle = tAfterRelease;
     reportTimingSlot(S);
     S.Count = 0;
     S.GetFnSum = 0;
@@ -897,6 +1007,54 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
   }
 #else
   (void)tAfterRelease;
+#endif
+  gWrapperTimingLock.unlock();
+}
+
+void ejit_taskpool_trace_fallback(uint32_t funcIndex, uint32_t status,
+                                  uint64_t tBeforeLookup,
+                                  uint64_t tAfterLookup) {
+  uint64_t getFn = tAfterLookup - tBeforeLookup;
+  gWrapperTimingLock.lock();
+  unsigned SlotIdx = funcIndex % (sizeof(gFallbackTimingSlots) /
+                                  sizeof(gFallbackTimingSlots[0]));
+  FallbackTimingSlot &S = gFallbackTimingSlots[SlotIdx];
+  // Key by funcIndex only (not status): a function may fall back for different
+  // reasons across its lifetime, and keying on status would displace the slot
+  // on every reason change. The reason is recorded as a histogram instead.
+  if (!S.Valid || S.FuncIndex != funcIndex) {
+    reportFallbackSlot(S);
+    resetFallbackSlot(S, funcIndex);
+  }
+
+  ++S.Count;
+  S.GetFnSum += getFn;
+  int32_t st = static_cast<int32_t>(status);
+  if (st == EJIT_PENDING)
+    ++S.Pending;
+  else if (st == EJIT_ERR_QUEUE_FULL || st == EJIT_ERR_DEDUP_FULL)
+    ++S.QueueFull;
+  else if (st == EJIT_ERR_DISABLED || st == EJIT_ERR_INSTANCE_DISABLED)
+    ++S.Disabled;
+  else
+    ++S.Failed;
+
+#if EJIT_WRAPPER_TIMING_REPORT_EVERY > 0
+  // One-shot: log the very first fallback for this function so a rare
+  // fallback (< EVERY, never triggers the periodic agg) is still visible.
+  // FirstSeen survives the periodic reset below; only resetFallbackSlot
+  // (function change) clears it.
+  if (!S.FirstSeen) {
+    S.FirstSeen = true;
+    EJIT_DIAG("wrapper_timing_fallback_first func=%u status=%d",
+              funcIndex, static_cast<int>(st));
+  }
+  if ((S.Count % EJIT_WRAPPER_TIMING_REPORT_EVERY) == 0) {
+    reportFallbackSlot(S);
+    S.Count = 0;
+    S.GetFnSum = 0;
+    S.Pending = S.QueueFull = S.Disabled = S.Failed = 0;
+  }
 #endif
   gWrapperTimingLock.unlock();
 }

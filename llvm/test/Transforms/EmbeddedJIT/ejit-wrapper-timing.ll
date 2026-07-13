@@ -3,6 +3,7 @@
 
 ; OFF-NOT: @ejit_taskpool_trace_now
 ; OFF-NOT: @ejit_taskpool_trace_wrapper
+; OFF-NOT: @ejit_taskpool_trace_fallback
 
 ; ON-LABEL: define i32 @timed_entry(
 ; ON: call i64 @ejit_taskpool_trace_now()
@@ -14,6 +15,7 @@
 ; ON: call void @ejit_taskpool_release_read
 ; ON: call i64 @ejit_taskpool_trace_now()
 ; ON: call void @ejit_taskpool_trace_wrapper
+; ON: call void @ejit_taskpool_trace_fallback
 
 define i32 @timed_entry(i32 %cell) !ejit.metadata !0 {
 entry:

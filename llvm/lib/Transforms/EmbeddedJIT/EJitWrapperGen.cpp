@@ -602,9 +602,27 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     Value *OutFn = Builder.CreateLoad(PtrTy, OutFnAlloca, "ejit_fn");
     Value *HitStatus =
         Builder.CreateICmpEQ(Status, ConstantInt::get(I32Ty, 0));
-    Builder.CreateCondBr(
-        Builder.CreateAnd(HitStatus, Builder.CreateIsNotNull(OutFn)),
-        JitDispatch, JitFallback);
+    Value *DispatchReady =
+        Builder.CreateAnd(HitStatus, Builder.CreateIsNotNull(OutFn));
+    if (EJitWrapperTiming) {
+      // Route the fallback edge through a trace block so post-init misses
+      // (status != 0 -> AOT body) are counted against dispatch hits
+      // (trace_wrapper). trace_fallback carries the compile_or_get (get_fn)
+      // timing only; the AOT body runs in jit_fallback outside this call.
+      auto *JitFallbackTrace =
+          BasicBlock::Create(Ctx, "jit_fallback_trace", F);
+      Builder.CreateCondBr(DispatchReady, JitDispatch, JitFallbackTrace);
+      Builder.SetInsertPoint(JitFallbackTrace);
+      FunctionCallee TraceFallback = M.getOrInsertFunction(
+          FN_TASKPOOL_TRACE_FALLBACK,
+          FunctionType::get(Type::getVoidTy(Ctx),
+                            {I32Ty, I32Ty, I64Ty, I64Ty}, false));
+      Builder.CreateCall(TraceFallback,
+                         {FuncIdx, Status, TBeforeLookup, TAfterLookup});
+      Builder.CreateBr(JitFallback);
+    } else {
+      Builder.CreateCondBr(DispatchReady, JitDispatch, JitFallback);
+    }
 
     // jit_dispatch: cast function pointer, call, and release the read token.
     Builder.SetInsertPoint(JitDispatch);

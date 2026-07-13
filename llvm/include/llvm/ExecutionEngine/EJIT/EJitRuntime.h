@@ -226,6 +226,33 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  uint64_t tAfterFn,
                                  uint64_t tAfterRelease);
 
+// Called on the wrapper's fallback edge (jit_call -> jit_fallback), i.e. every
+// ejit_entry invocation where compile_or_get returned a non-hit status (cache
+// miss / not-ready / disabled / compile failed), so the AOT body runs instead
+// of the JIT body. Aggregated per funcIndex with a reason histogram and the
+// compile_or_get (get_fn) cost; one summary per EJIT_WRAPPER_TIMING_REPORT_EVERY
+// samples. Compare against ejit_taskpool_trace_wrapper (which counts ONLY
+// status=0 dispatch hits) to separate dispatch vs fallback call populations.
+void ejit_taskpool_trace_fallback(uint32_t funcIndex, uint32_t status,
+                                  uint64_t tBeforeLookup,
+                                  uint64_t tAfterLookup);
+
+// Low-frequency per-call pair sample (analysis only). PERF instrumentation
+// inside ejit_fn stashes that call's body duration into g_ejit_pair_perf_dur
+// when g_ejit_pair_request is set; ejit_taskpool_trace_wrapper reads it on the
+// SAME call and prints it next to fn_call, so per-call PERF vs fn_call can be
+// compared directly (instead of comparing two separately-averaged windows).
+// External linkage so the JIT resolves these symbols into the specialized
+// ejit_fn. Print cadence: one pair_sample line per ~EJIT_PAIR_EVERY dispatches
+// (default 500000) to avoid flooding the serial console. Set EJIT_PAIR_EVERY=0
+// to disable.
+#ifndef EJIT_PAIR_EVERY
+#define EJIT_PAIR_EVERY 500000u
+#endif
+extern volatile uint32_t g_ejit_pair_request;
+extern volatile uint32_t g_ejit_pair_ready;
+extern volatile uint64_t g_ejit_pair_perf_dur;
+
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 unsigned ejit_taskpool_poll_one(void);
 unsigned ejit_taskpool_poll_budget(unsigned maxItems);
