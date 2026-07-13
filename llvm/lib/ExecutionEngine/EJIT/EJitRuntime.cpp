@@ -56,30 +56,13 @@ struct WrapperTimingSlot {
   uint32_t BucketIndex = 0;
   uint64_t Count = 0;
   uint64_t GetFnSum = 0;
-  uint64_t GetFnMin = 0;
-  uint64_t GetFnMax = 0;
   uint64_t FnCallSum = 0;
-  uint64_t FnCallMin = 0;
-  uint64_t FnCallMax = 0;
   uint64_t ReleaseSum = 0;
-  uint64_t ReleaseMin = 0;
-  uint64_t ReleaseMax = 0;
   uint64_t TotalSum = 0;
-  uint64_t TotalMin = 0;
-  uint64_t TotalMax = 0;
 };
 
 static TimingSpinLock gWrapperTimingLock;
 static WrapperTimingSlot gWrapperTimingSlots[32];
-
-static void updateTimingRange(uint64_t V, uint64_t &Sum, uint64_t &Min,
-                              uint64_t &Max, bool First) {
-  Sum += V;
-  if (First || V < Min)
-    Min = V;
-  if (First || V > Max)
-    Max = V;
-}
 
 static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
                             uint32_t Status, void *FnPtr,
@@ -90,34 +73,23 @@ static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
   S.FnPtr = FnPtr;
   S.BucketIndex = BucketIndex;
   S.Count = 0;
-  S.GetFnSum = S.GetFnMin = S.GetFnMax = 0;
-  S.FnCallSum = S.FnCallMin = S.FnCallMax = 0;
-  S.ReleaseSum = S.ReleaseMin = S.ReleaseMax = 0;
-  S.TotalSum = S.TotalMin = S.TotalMax = 0;
+  S.GetFnSum = 0;
+  S.FnCallSum = 0;
+  S.ReleaseSum = 0;
+  S.TotalSum = 0;
 }
 
 static void reportTimingSlot(const WrapperTimingSlot &S) {
   if (S.Count == 0)
     return;
   EJIT_DIAG("wrapper_timing_agg func=%u status=%u fn=%p bucket=%u count=%llu "
-            "get_fn_avg=%llu min=%llu max=%llu "
-            "fn_call_avg=%llu min=%llu max=%llu "
-            "release_avg=%llu min=%llu max=%llu "
-            "total_avg=%llu min=%llu max=%llu",
+            "get_fn_avg=%llu fn_call_avg=%llu release_avg=%llu total_avg=%llu",
             S.FuncIndex, S.Status, S.FnPtr, S.BucketIndex,
             static_cast<unsigned long long>(S.Count),
             static_cast<unsigned long long>(S.GetFnSum / S.Count),
-            static_cast<unsigned long long>(S.GetFnMin),
-            static_cast<unsigned long long>(S.GetFnMax),
             static_cast<unsigned long long>(S.FnCallSum / S.Count),
-            static_cast<unsigned long long>(S.FnCallMin),
-            static_cast<unsigned long long>(S.FnCallMax),
             static_cast<unsigned long long>(S.ReleaseSum / S.Count),
-            static_cast<unsigned long long>(S.ReleaseMin),
-            static_cast<unsigned long long>(S.ReleaseMax),
-            static_cast<unsigned long long>(S.TotalSum / S.Count),
-            static_cast<unsigned long long>(S.TotalMin),
-            static_cast<unsigned long long>(S.TotalMax));
+            static_cast<unsigned long long>(S.TotalSum / S.Count));
 }
 } // namespace
 
@@ -892,21 +864,20 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
     resetTimingSlot(S, funcIndex, status, fnPtr, bucketIndex);
   }
 
-  bool First = S.Count == 0;
   ++S.Count;
-  updateTimingRange(getFn, S.GetFnSum, S.GetFnMin, S.GetFnMax, First);
-  updateTimingRange(fnCall, S.FnCallSum, S.FnCallMin, S.FnCallMax, First);
-  updateTimingRange(release, S.ReleaseSum, S.ReleaseMin, S.ReleaseMax, First);
-  updateTimingRange(total, S.TotalSum, S.TotalMin, S.TotalMax, First);
+  S.GetFnSum += getFn;
+  S.FnCallSum += fnCall;
+  S.ReleaseSum += release;
+  S.TotalSum += total;
 
 #if EJIT_WRAPPER_TIMING_REPORT_EVERY > 0
   if ((S.Count % EJIT_WRAPPER_TIMING_REPORT_EVERY) == 0) {
     reportTimingSlot(S);
     S.Count = 0;
-    S.GetFnSum = S.GetFnMin = S.GetFnMax = 0;
-    S.FnCallSum = S.FnCallMin = S.FnCallMax = 0;
-    S.ReleaseSum = S.ReleaseMin = S.ReleaseMax = 0;
-    S.TotalSum = S.TotalMin = S.TotalMax = 0;
+    S.GetFnSum = 0;
+    S.FnCallSum = 0;
+    S.ReleaseSum = 0;
+    S.TotalSum = 0;
   }
 #else
   (void)tAfterRelease;
