@@ -31,7 +31,7 @@ extern "C" uint64_t SRE_CycleCountGet64(void);
 #endif
 
 #ifndef EJIT_WRAPPER_TIMING_REPORT_EVERY
-#define EJIT_WRAPPER_TIMING_REPORT_EVERY 1024u
+#define EJIT_WRAPPER_TIMING_REPORT_EVERY 10000u
 #endif
 
 namespace {

@@ -213,7 +213,7 @@ unsigned ejit_taskpool_pending_count(void);
 
 // Diagnostic wrapper timing helpers. AOT wrappers only call these when built
 // with -ejit-wrapper-timing. Runtime aggregates repeated calls and prints one
-// summary per EJIT_WRAPPER_TIMING_REPORT_EVERY samples (default 1024; set to 0
+// summary per EJIT_WRAPPER_TIMING_REPORT_EVERY samples (default 10000; set to 0
 // to suppress periodic output) to avoid flooding board logs. The timestamp unit
 // is platform-defined: SRE/freestanding builds use SRE_CycleCountGet64(), host
 // fallback uses steady_clock nanoseconds.
