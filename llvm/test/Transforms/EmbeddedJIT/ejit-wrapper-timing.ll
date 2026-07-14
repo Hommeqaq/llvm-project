@@ -8,7 +8,6 @@
 ; ON: call i64 @ejit_taskpool_trace_now()
 ; ON: call i32 @ejit_taskpool_compile_or_get_1d
 ; ON: call i64 @ejit_taskpool_trace_now()
-; ON: call i64 @ejit_taskpool_trace_now()
 ; ON: call i32 %ejit_fn
 ; ON: call i64 @ejit_taskpool_trace_now()
 ; ON: call void @ejit_taskpool_release_read

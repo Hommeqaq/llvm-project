@@ -31,7 +31,7 @@ extern "C" uint64_t SRE_CycleCountGet64(void);
 #endif
 
 #ifndef EJIT_WRAPPER_TIMING_REPORT_EVERY
-#define EJIT_WRAPPER_TIMING_REPORT_EVERY 10000u
+#define EJIT_WRAPPER_TIMING_REPORT_EVERY 100000u
 #endif
 
 namespace {
@@ -850,13 +850,14 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  void *fnPtr, uint32_t bucketIndex,
                                  uint64_t tBeforeLookup,
                                  uint64_t tAfterLookup,
-                                 uint64_t tBeforeFn, uint64_t tAfterFn,
+                                 uint64_t tAfterFn,
                                  uint64_t tAfterRelease) {
   uint64_t getFn = tAfterLookup - tBeforeLookup;
-  uint64_t fnCall = tAfterFn - tBeforeFn;
+  uint64_t fnCall = tAfterFn - tAfterLookup;
   uint64_t release = tAfterRelease - tAfterFn;
   uint64_t total = tAfterRelease - tBeforeLookup;
-  gWrapperTimingLock.lock();
+  // No lock: under per-core BSS each core has its own gWrapperTimingSlots,
+  // so there is no cross-core contention on the slot.
   unsigned SlotIdx = funcIndex % (sizeof(gWrapperTimingSlots) /
                                   sizeof(gWrapperTimingSlots[0]));
   WrapperTimingSlot &S = gWrapperTimingSlots[SlotIdx];
@@ -898,7 +899,6 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
 #else
   (void)tAfterRelease;
 #endif
-  gWrapperTimingLock.unlock();
 }
 
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {
