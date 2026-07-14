@@ -542,8 +542,8 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     if (EJitWrapperTiming) {
       TraceNow = M.getOrInsertFunction(FN_TASKPOOL_TRACE_NOW,
                                        FunctionType::get(I64Ty, false));
-      SmallVector<Type *, 9> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty,
-                                         I64Ty, I64Ty, I64Ty, I64Ty, I64Ty};
+      SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty,
+                                         I64Ty, I64Ty, I64Ty, I64Ty};
       TraceWrapper = M.getOrInsertFunction(
           FN_TASKPOOL_TRACE_WRAPPER,
           FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
@@ -615,9 +615,6 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Args.push_back(&Arg);
 
     if (F->getReturnType()->isVoidTy()) {
-      Value *TBeforeFn = nullptr;
-      if (EJitWrapperTiming)
-        TBeforeFn = Builder.CreateCall(TraceNow, {}, "ejit_t_before_fn");
       Builder.CreateCall(F->getFunctionType(), OutFn, Args);
       Value *TAfterFn = nullptr;
       if (EJitWrapperTiming)
@@ -630,13 +627,10 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
             Builder.CreateCall(TraceNow, {}, "ejit_t_after_release");
         Builder.CreateCall(TraceWrapper,
                            {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
-                            TAfterLookup, TBeforeFn, TAfterFn, TAfterRelease});
+                            TAfterLookup, TAfterFn, TAfterRelease});
       }
       Builder.CreateRetVoid();
     } else {
-      Value *TBeforeFn = nullptr;
-      if (EJitWrapperTiming)
-        TBeforeFn = Builder.CreateCall(TraceNow, {}, "ejit_t_before_fn");
       Value *RetVal = Builder.CreateCall(F->getFunctionType(), OutFn, Args);
       Value *TAfterFn = nullptr;
       if (EJitWrapperTiming)
@@ -649,7 +643,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
             Builder.CreateCall(TraceNow, {}, "ejit_t_after_release");
         Builder.CreateCall(TraceWrapper,
                            {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
-                            TAfterLookup, TBeforeFn, TAfterFn, TAfterRelease});
+                            TAfterLookup, TAfterFn, TAfterRelease});
       }
       Builder.CreateRet(RetVal);
     }

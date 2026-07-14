@@ -222,7 +222,6 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  void *fnPtr, uint32_t bucketIndex,
                                  uint64_t tBeforeLookup,
                                  uint64_t tAfterLookup,
-                                 uint64_t tBeforeFn,
                                  uint64_t tAfterFn,
                                  uint64_t tAfterRelease);
 
