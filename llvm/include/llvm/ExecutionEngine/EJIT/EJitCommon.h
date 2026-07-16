@@ -79,9 +79,21 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
     "ejit_taskpool_compile_or_get_4d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
+// Per-function inline-cache probe (v2 sticky monomorphic). Called by the
+// ejit_entry wrapper BEFORE ejit_taskpool_compile_or_get when -ejit-inline-cache
+// is on. On a hit (*outFn set to a frozen specialization) the wrapper calls it
+// directly with NO ejit_taskpool_release_read; on a miss it falls through to
+// compile_or_get. Signature: i32 ejit_icache_try(i32 funcIndex, ptr outFn).
+constexpr const char *FN_ICACHE_TRY = "ejit_icache_try";
 constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
 constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =
     "ejit_taskpool_trace_wrapper";
+// Wrapper-timing sentinel status passed to ejit_taskpool_trace_wrapper for
+// icache-hit samples so they aggregate as their own report line (get_fn_avg =
+// probe cost, release_avg = 0), separate from the slow-path compile_or_get
+// samples. Collision-free: real ejit_status_t as uint32_t is 0 or
+// 0xFFFFFFF6..0xFFFFFFFF (EJIT_OK / EJIT_ERR_* = -1..-10).
+constexpr uint32_t kEJitIcacheHitTimingStatus = 0xFEu;
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
 // PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
 // array-pointer dimension in the active-state hot path.

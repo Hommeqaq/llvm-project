@@ -377,7 +377,12 @@ def doit_gc_merge(args):
         "ejit_taskpool_set_instance_enabled", "ejit_taskpool_pending_count",
         "ejit_taskpool_get_stats", "ejit_taskpool_print_stats", "ejit_taskpool_get_worker_core",
         "ejit_taskpool_print_compiled", "ejit_taskpool_trace_now",
-        "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped"
+        "ejit_taskpool_trace_wrapper", "ejit_dump_func", "ejit_print_dumped",
+        # Inline-cache probe (referenced by -ejit-inline-cache wrappers). Always
+        # defined (unconditional in EJitRuntime.cpp); retained as a GC root
+        # because gc-merge runs before the business object - and its wrapper
+        # references - is linked, so --gc-sections would otherwise discard it.
+        "ejit_icache_try"
     ]
 
     defined = set()

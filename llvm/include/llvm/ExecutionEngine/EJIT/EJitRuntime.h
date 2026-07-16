@@ -209,6 +209,19 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
 void ejit_taskpool_set_instance_enabled(uint32_t dimType, uint32_t instanceId,
                                         uint32_t enabled);
 void ejit_taskpool_release_read(uint32_t bucketIndex);
+
+// Per-function inline-cache probe (emitted by the ejit_entry wrapper when
+// -ejit-inline-cache is on, called BEFORE ejit_taskpool_compile_or_get).
+//
+// On a hit the probe writes a frozen, directly-callable specialization pointer
+// to *outFn and returns 1: the wrapper calls it with NO ejit_taskpool_release_read
+// (the inline cache never frees code in production; see setReleaser's safety
+// gate). On a miss it writes null to *outFn and returns 0: the wrapper falls
+// through to ejit_taskpool_compile_or_get unchanged, which fills the cache on
+// success. The probe is a single acquire load + null check - no version/dims
+// re-validation (the specialization is invariant per the v2 contract).
+// Returns 1 on hit, 0 on miss.
+int ejit_icache_try(uint32_t funcIndex, void **outFn);
 unsigned ejit_taskpool_pending_count(void);
 
 // Diagnostic wrapper timing helpers. AOT wrappers only call these when built

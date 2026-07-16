@@ -2620,4 +2620,82 @@ TEST_F(SharedTaskPoolTest, DISABLED_HotHitContendedBench) {
 }
 #endif // __aarch64__
 
+//===----------------------------------------------------------------------===//
+// Per-function inline cache (v2 sticky monomorphic): frozen read, one-shot
+// fill, range guards, and the reclamation safety gate. Asserts behavior
+// (boolean + pointer), not stats.
+//===----------------------------------------------------------------------===//
+TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool); // core 0 owner, Ready, code sharing off (owner-only).
+  constexpr uint32_t kFunc = 3;
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // Cold icache misses (empty slot).
+  EXPECT_FALSE(pool.icacheTry(kFunc, &out));
+  EXPECT_EQ(out, nullptr);
+
+  // Fill on a resolve -> subsequent probe hits, returning the frozen fnPtr.
+  pool.icacheFill(kFunc, fn);
+  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  EXPECT_EQ(out, fn);
+
+  // Frozen: a period toggle bumps the version, but v2 does NOT re-validate, so
+  // the cached specialization is still served (the slot is never refilled or
+  // invalidated). This is the v2 contract - the specialization is invariant.
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
+  ASSERT_TRUE(pool.setInstanceEnabled(0, 5, false)); // bump version
+  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  EXPECT_EQ(out, fn);
+
+  // One-shot: a later fill with a DIFFERENT pointer does not overwrite - the
+  // first resolver wins and the slot is frozen.
+  void *fn2 = codeFor(1000);
+  pool.icacheFill(kFunc, fn2);
+  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  EXPECT_EQ(out, fn); // still the first pointer
+
+  // Out-of-range funcIndex misses without touching memory.
+  EXPECT_FALSE(pool.icacheTry(EJIT_ICACHE_FUNC_SLOTS, &out));
+  EXPECT_EQ(out, nullptr);
+
+  ejitIcacheClearAll();
+}
+
+// Safety gate: wiring a releaser means code may be freed, and v2 does no
+// HP-scan retire, so the cache auto-disables (icacheTry always misses,
+// icacheFill no-op) to avoid UAF. Unwiring the releaser re-enables it.
+TEST_F(SharedTaskPoolTest, InlineCacheAutoDisablesWhenReclamationWired) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  void *fn = codeFor(kFunc);
+  void *out = nullptr;
+
+  // Before a releaser: fill -> hit.
+  pool.icacheFill(kFunc, fn);
+  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  EXPECT_EQ(out, fn);
+
+  // Wire a releaser: icache auto-disables (miss + no-op fill).
+  ReleaseLog rel;
+  pool.setReleaser(&mockRelease, &rel);
+  EXPECT_FALSE(pool.icacheTry(kFunc, &out));
+  EXPECT_EQ(out, nullptr);
+  pool.icacheFill(kFunc, fn); // no-op: the gate blocks the fill
+  EXPECT_FALSE(pool.icacheTry(kFunc, &out));
+  EXPECT_EQ(out, nullptr);
+
+  // Unwire the releaser: the gate re-opens; fill -> hit works again.
+  pool.setReleaser(nullptr, nullptr);
+  pool.icacheFill(kFunc, fn);
+  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  EXPECT_EQ(out, fn);
+
+  ejitIcacheClearAll();
+}
+
 } // namespace

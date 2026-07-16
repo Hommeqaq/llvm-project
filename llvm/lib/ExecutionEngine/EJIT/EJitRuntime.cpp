@@ -481,6 +481,25 @@ inline EJitTaskPool *activeTaskPool() {
   return gEJIT ? gEJIT->taskPool() : nullptr;
 }
 #endif
+
+// Fill the calling core's icache slot on a successful taskpool resolve (cache
+// hit or fresh compile), so a cold icache is filled on the first taskpool hit,
+// not only on a fresh compile. v2: one-shot, fnPtr-only (the specialization is
+// invariant - no dims/version snapshot). No-op without the shared pool or a
+// null fnPtr. Always defined (a no-op without the shared taskpool) so call sites
+// need no #ifdef guards.
+inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr) {
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  if (!fnPtr)
+    return;
+  EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
+  if (sp)
+    sp->icacheFill(funcIndex, fnPtr);
+#else
+  (void)funcIndex;
+  (void)fnPtr;
+#endif
+}
 } // namespace
 
 ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
@@ -548,6 +567,7 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u fast status=%u fn=%p",
                       funcIndex, static_cast<unsigned>(fast.status),
                       fast.fnPtr);
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr);
     return taskpoolStatus(fast.status);
   }
 
@@ -559,6 +579,7 @@ ejit_status_t ejit_taskpool_compile_or_get(uint32_t funcIndex,
     *outBucket = r.bucketIndex;
   EJIT_DIAG_VERBOSE("taskpool_compile_or_get func=%u status=%u fn=%p",
                     funcIndex, static_cast<unsigned>(r.status), r.fnPtr);
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr);
   return taskpoolStatus(r.status);
 }
 
@@ -601,6 +622,7 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr);
     return taskpoolStatus(fast.status);
   }
   auto r = tp->compileOrGet(funcIndex, nullptr, 0, /*fallback=*/nullptr);
@@ -608,6 +630,7 @@ ejit_status_t ejit_taskpool_compile_or_get_0d(uint32_t funcIndex, void **outFn,
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr);
   return taskpoolStatus(r.status);
 }
 
@@ -632,6 +655,7 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr);
     return taskpoolStatus(fast.status);
   }
   const EJitDimPair dims[1] = {{dim0, inst0}};
@@ -640,6 +664,7 @@ ejit_status_t ejit_taskpool_compile_or_get_1d(uint32_t funcIndex, uint32_t dim0,
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr);
   return taskpoolStatus(r.status);
 }
 
@@ -666,6 +691,7 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr);
     return taskpoolStatus(fast.status);
   }
   const EJitDimPair dims[2] = {{dim0, inst0}, {dim1, inst1}};
@@ -674,6 +700,7 @@ ejit_status_t ejit_taskpool_compile_or_get_2d(uint32_t funcIndex, uint32_t dim0,
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr);
   return taskpoolStatus(r.status);
 }
 
@@ -703,6 +730,7 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr);
     return taskpoolStatus(fast.status);
   }
   const EJitDimPair dims[3] = {{dim0, inst0}, {dim1, inst1}, {dim2, inst2}};
@@ -711,6 +739,7 @@ ejit_status_t ejit_taskpool_compile_or_get_3d(uint32_t funcIndex, uint32_t dim0,
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr);
   return taskpoolStatus(r.status);
 }
 
@@ -742,6 +771,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
       *outFn = fast.fnPtr;
     if (outBucket)
       *outBucket = fast.bucketIndex;
+    ejitIcacheFillOnSuccess(funcIndex, fast.fnPtr);
     return taskpoolStatus(fast.status);
   }
   const EJitDimPair dims[4] = {
@@ -751,6 +781,7 @@ ejit_status_t ejit_taskpool_compile_or_get_4d(uint32_t funcIndex, uint32_t dim0,
     *outFn = r.fnPtr;
   if (outBucket)
     *outBucket = r.bucketIndex;
+  ejitIcacheFillOnSuccess(funcIndex, r.fnPtr);
   return taskpoolStatus(r.status);
 }
 
@@ -791,6 +822,36 @@ void ejit_taskpool_release_read(uint32_t bucketIndex) {
     return;
   }
   tp->releaseRead(bucketIndex);
+}
+
+//===----------------------------------------------------------------------===//
+// Per-function inline-cache probe (v2 sticky monomorphic).
+//
+// Forwards to EJitSharedTaskPool::icacheTry (shared pool only): a frozen,
+// one-load probe that on a hit returns a directly-callable specialization with
+// NO ejit_taskpool_release_read. On a miss returns 0 so the wrapper falls
+// through to ejit_taskpool_compile_or_get, which fills the cache on success.
+// Emitted by the ejit_entry wrapper only when -ejit-inline-cache is on.
+//===----------------------------------------------------------------------===//
+int ejit_icache_try(uint32_t funcIndex, void **outFn) {
+  if (outFn)
+    *outFn = nullptr;
+  if (!gEJIT)
+    return 0;
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  EJitSharedTaskPool *sp = gEJIT->sharedTaskPool();
+  if (sp) {
+    void *fn = nullptr;
+    if (sp->icacheTry(funcIndex, &fn)) {
+      if (outFn)
+        *outFn = fn;
+      return 1;
+    }
+  }
+#else
+  (void)funcIndex;
+#endif
+  return 0;
 }
 
 #ifdef EJIT_SRE_TASKPOOL_TESTING

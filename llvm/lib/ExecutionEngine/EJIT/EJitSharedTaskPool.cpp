@@ -121,7 +121,21 @@ constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 /// cacheLookupNd block can also reference it.
 constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 
+// Per-function inline-cache table (v2 sticky monomorphic). Process-static
+// storage, zero-filled by the loader (no dynamic init). One global slot per
+// funcIndex; written once (first resolution) and read forever. Indexed by
+// funcIndex only (no per-core dimension) - under EJIT_SRE_SHARED_CODE_POINTERS
+// off only the owner core uses the cache, and with it on all cores share the
+// one slot, so a single global copy suffices. See the header for the safety
+// model.
+EJitAtomicUPtr gEJitICache[EJIT_ICACHE_FUNC_SLOTS];
+
 } // namespace
+
+void llvm::ejit::ejitIcacheClearAll() {
+  for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f)
+    gEJitICache[f].storeRelaxed(0);
+}
 
 //===----------------------------------------------------------------------===//
 // Switch controller helpers (§5.1) over shared arrays.
@@ -147,6 +161,65 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
   if (dimType >= kEJitSharedDimTypes || instanceId >= kEJitSharedInstances)
     return 0;
   return state_->version[dimType][instanceId].loadAcquire();
+}
+
+//===----------------------------------------------------------------------===//
+// Per-function inline cache (v2 sticky monomorphic).
+//
+// icacheTry: a frozen read - one acquire load + null check. No version / dims /
+// generation re-validation: the slot is written once (first resolution) and
+// never refilled, so the pointer is always the correct (invariant)
+// specialization. Lifetime is safe because JIT code is never freed in
+// production; the safety gate auto-disables the cache if a releaser is wired
+// (v2 does no HP-scan retire). The code-sharing gate retains the cross-core
+// pointer discipline of resolveMatchedSlot.
+//===----------------------------------------------------------------------===//
+bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, void **outFn) {
+  if (!outFn)
+    return false;
+  *outFn = nullptr;
+  // Safety gate: auto-disable while a releaser is wired (v2 does no HP-scan
+  // retire, so freeing code + a cached fnPtr = UAF). Production wires no
+  // releaser, so this never trips and the cache is unconditionally safe.
+  if (!icacheReclamationSafe_)
+    return false;
+  if (!state_ || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
+    return false;
+  // The cache is only meaningful once the pool is Ready.
+  if (state_->initState.loadAcquire() != kReady)
+    return false;
+  // Cross-core fnPtr gate (compile-time, mirrors resolveMatchedSlot): a
+  // non-owner core may only read a cached pointer when code sharing is
+  // platform-validated.
+  uint32_t self = EJitCoreId::current();
+  uint32_t owner = state_->ownerCoreId.loadRelaxed();
+#if defined(EJIT_SRE_SHARED_CODE_POINTERS)
+  constexpr bool mayReadPtr = true;
+#else
+  bool mayReadPtr = (self == owner);
+#endif
+  if (!mayReadPtr)
+    return false;
+  // Frozen read: the slot is immutable after the one-shot fill, so a single
+  // acquire load is correct with no re-validation.
+  uintptr_t p = gEJitICache[funcIndex].loadAcquire();
+  if (p == 0)
+    return false;
+  *outFn = reinterpret_cast<void *>(p);
+  return true;
+}
+
+void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr) {
+  if (!icacheReclamationSafe_)
+    return;
+  if (!state_ || !fnPtr || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
+    return;
+  // One-shot: the first resolver wins. Later resolves carry the same invariant
+  // pointer and no-op. compareExchange is acq_rel on success / acquire on
+  // failure, pairing with icacheTry's acquire load.
+  uintptr_t desired = reinterpret_cast<uintptr_t>(fnPtr);
+  uintptr_t expected = 0;
+  (void)gEJitICache[funcIndex].compareExchange(expected, desired);
 }
 
 void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,

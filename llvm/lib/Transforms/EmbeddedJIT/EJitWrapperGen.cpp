@@ -58,6 +58,21 @@ static cl::opt<bool> EJitWrapperTiming(
     cl::desc("Emit diagnostic timing probes around taskpool lookup, indirect "
              "JIT call, and read-token release in ejit_entry wrappers"));
 
+// Emit a per-function inline-cache probe (ejit_icache_try) before the taskpool
+// compile_or_get call. On a hit the wrapper calls the cached specialization
+// directly with NO read-token (no readers_ RMW, no slot scan, no release_read),
+// eliminating the dominant per-call cost on the cache-hit path. On a miss it
+// falls through to ejit_taskpool_compile_or_get unchanged. v2: the cache is
+// sticky monomorphic - the slot is filled once (first resolution) and read
+// forever, so the probe is a single load with no version/dims re-validation.
+// Default off. When combined with -ejit-wrapper-timing the icache hit path is
+// instrumented too (its own sentinel-status report line) so the wrapper log
+// still shows the fast path's ejit/fn overhead.
+static cl::opt<bool> EJitInlineCache(
+    "ejit-inline-cache", cl::init(false), cl::Hidden,
+    cl::desc("Emit a per-function inline-cache probe (ejit_icache_try) before "
+             "the taskpool compile_or_get call in ejit_entry wrappers"));
+
 // Wrapper generation now unconditionally uses the unified taskpool API
 // (ejit_taskpool_compile_or_get + ejit_taskpool_release_read). Both Sync
 // and Async modes are runtime-configurable — the AOT wrapper code is
@@ -311,6 +326,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   M.getOrInsertFunction(
       FN_TASKPOOL_RELEASE_READ,
       FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false));
+  // ejit_icache_try(i32 funcIndex, ptr outFn) -> i32. Declared once (the wrapper
+  // calls it via M.getFunction). Only when the inline cache is enabled.
+  if (EJitInlineCache)
+    M.getOrInsertFunction(
+        FN_ICACHE_TRY, FunctionType::get(I32Ty, {I32Ty, PtrTy}, false));
 
   auto isAlreadyWrapped = [](Function &F) -> bool {
     if (!F.getEntryBlock().getName().starts_with("jit_entry"))
@@ -453,6 +473,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     auto *JitCall = BasicBlock::Create(Ctx, "jit_call", F);
     auto *JitFallback = BasicBlock::Create(Ctx, "jit_fallback", F);
     auto *JitDispatch = BasicBlock::Create(Ctx, "jit_dispatch", F);
+    BasicBlock *JitIcache = nullptr;
+    BasicBlock *JitIcacheDispatch = nullptr;
+    if (EJitInlineCache) {
+      JitIcache = BasicBlock::Create(Ctx, "jit_icache", F);
+      JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
+    }
 
     // Update PHI incoming blocks in successors that reference OrigEntry.
     //
@@ -506,11 +532,77 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         Builder.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
     Value *OutBucketAlloca =
         Builder.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
+    Value *OutFnArg = Builder.CreatePointerCast(OutFnAlloca, PtrTy);
+    // Timing callees are shared by the icache hit path and the slow taskpool
+    // path, so declare them once here (idempotent getOrInsertFunction).
+    FunctionCallee TraceNow{};
+    FunctionCallee TraceWrapper{};
+    if (EJitWrapperTiming) {
+      TraceNow = M.getOrInsertFunction(FN_TASKPOOL_TRACE_NOW,
+                                       FunctionType::get(I64Ty, false));
+      SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty,
+                                         I64Ty, I64Ty, I64Ty, I64Ty};
+      TraceWrapper = M.getOrInsertFunction(
+          FN_TASKPOOL_TRACE_WRAPPER,
+          FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
+    }
     Value *FuncIdx = Builder.CreateLoad(
         I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
     Value *IdxValid = Builder.CreateICmpNE(
         FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
-    Builder.CreateCondBr(IdxValid, JitCall, JitFallback);
+    Builder.CreateCondBr(IdxValid, EJitInlineCache ? JitIcache : JitCall,
+                         JitFallback);
+
+    // jit_icache: probe the per-function inline cache. On a hit call the cached
+    // specialization directly (NO read token, NO release_read); on a miss fall
+    // through to the taskpool request (jit_call), which fills the cache on
+    // success. No dim identity is computed here - dims are only needed on the
+    // miss path - so a cache hit pays no dim loads. Timing (when
+    // -ejit-wrapper-timing): probe cost + fn-call cost are logged via
+    // ejit_taskpool_trace_wrapper with the icache-hit sentinel so the wrapper
+    // log shows this fast path's ejit/fn overhead (get_fn=probe, release=0) as
+    // its own report line.
+    if (EJitInlineCache) {
+      Builder.SetInsertPoint(JitIcache);
+      Value *TBeforeIcache = nullptr;
+      if (EJitWrapperTiming)
+        TBeforeIcache = Builder.CreateCall(TraceNow, {}, "ejit_t_before_icache");
+      Value *IHit = Builder.CreateCall(M.getFunction(FN_ICACHE_TRY),
+                                       {FuncIdx, OutFnArg}, "ejit_icache_hit");
+      Value *TAfterIcache = nullptr;
+      if (EJitWrapperTiming)
+        TAfterIcache = Builder.CreateCall(TraceNow, {}, "ejit_t_after_icache");
+      Value *IHitBool = Builder.CreateICmpEQ(IHit, ConstantInt::get(I32Ty, 1));
+      Builder.CreateCondBr(IHitBool, JitIcacheDispatch, JitCall);
+
+      // jit_icache_dispatch: call the cached specialization directly. NO
+      // ejit_taskpool_release_read - the inline cache never frees code in
+      // production.
+      Builder.SetInsertPoint(JitIcacheDispatch);
+      Value *ICFn = Builder.CreateLoad(PtrTy, OutFnAlloca, "ejit_ic_fn");
+      SmallVector<Value *, 8> ICArgs;
+      for (auto &Arg : F->args())
+        ICArgs.push_back(&Arg);
+      auto emitIcacheTiming = [&] {
+        Value *TAfterFn = Builder.CreateCall(TraceNow, {}, "ejit_t_after_fn");
+        Builder.CreateCall(TraceWrapper,
+                           {FuncIdx,
+                            ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
+                            ICFn, ConstantInt::get(I32Ty, 0), TBeforeIcache,
+                            TAfterIcache, TAfterFn, TAfterFn});
+      };
+      if (F->getReturnType()->isVoidTy()) {
+        Builder.CreateCall(F->getFunctionType(), ICFn, ICArgs);
+        if (EJitWrapperTiming)
+          emitIcacheTiming();
+        Builder.CreateRetVoid();
+      } else {
+        Value *RetVal = Builder.CreateCall(F->getFunctionType(), ICFn, ICArgs);
+        if (EJitWrapperTiming)
+          emitIcacheTiming();
+        Builder.CreateRet(RetVal);
+      }
+    }
 
     // jit_call: unified taskpool API. Both Sync and Async modes share the same
     // AOT wrapper — the runtime compile mode controls whether compilation is
@@ -532,21 +624,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       return ArgVal;
     };
 
-    Value *OutFnArg = Builder.CreatePointerCast(OutFnAlloca, PtrTy);
     Value *OutBucketArg = Builder.CreatePointerCast(OutBucketAlloca, PtrTy);
     Value *Status = nullptr;
-    FunctionCallee TraceNow{};
-    FunctionCallee TraceWrapper{};
     Value *TBeforeLookup = nullptr;
     Value *TAfterLookup = nullptr;
     if (EJitWrapperTiming) {
-      TraceNow = M.getOrInsertFunction(FN_TASKPOOL_TRACE_NOW,
-                                       FunctionType::get(I64Ty, false));
-      SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty,
-                                         I64Ty, I64Ty, I64Ty, I64Ty};
-      TraceWrapper = M.getOrInsertFunction(
-          FN_TASKPOOL_TRACE_WRAPPER,
-          FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
       TBeforeLookup =
           Builder.CreateCall(TraceNow, {}, "ejit_t_before_lookup");
     }
