@@ -838,9 +838,16 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
 
   Triple TT((*ModuleOrErr)->getTargetTriple());
   if (TT.isAArch64() && TT.isOSBinFormatELF()) {
-    // These declarations resolve to process addresses, not co-located JIT
-    // storage. Clearing dso_local forces AArch64 PIC codegen to use GOT/PLT
-    // style indirection instead of near-page ADRP relocations.
+    // EXPERIMENT (GOT-elimination): the dso_local clearing below was added in
+    // 7d031c3ba138 to force AArch64 GOT/PLT indirection for external symbols
+    // (a workaround for PC-relative relocation overflow when JIT code pools are
+    // far from the main binary). It is the measured root cause of the per-global
+    // GOT overhead (62 GOT loads vs 0 in AOT on DlschCcScheduler). This block is
+    // disabled to test whether the pools are now within PC-relative reach: if so,
+    // codegen emits ADRP/BL (no GOT) and ejit_jit_verify_test passes; if not,
+    // JITLink reports a relocation overflow (confirming pools must be co-located).
+    // Re-enable this block to restore the GOT/PLT fallback.
+#if 0
     for (Function &F : (*ModuleOrErr)->functions()) {
       if (F.isDeclaration() && !F.isIntrinsic())
         F.setDSOLocal(false);
@@ -849,6 +856,7 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
       if (GV.isDeclaration())
         GV.setDSOLocal(false);
     }
+#endif
   }
 
   // ejit_entry functions may have internal linkage (e.g. declared `static` in
