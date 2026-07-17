@@ -51,13 +51,16 @@ private:
   /// Run EJitStructFieldPass on all functions.
   void runStructFieldPass(Module &M);
 
-  /// Run the EJIT optimization pipeline: a single fused sequence that exploits
-  /// the just-substituted period-index / may_const constants to their fixed
-  /// point (scalar fold/propagate/simplify), folds loops whose bounds became
-  /// constant, re-specializes the array accesses that unrolling turns into
-  /// constant-index GEPs, then does a final cleanup. `level` is accepted for ABI
-  /// compatibility and does not affect the pipeline.
+  /// Run the post-specialization optimization pipeline: lower llvm.expect, then
+  /// the real LLVM -Ox function-simplification pipeline (selected by `level`:
+  /// L1->O1, L2->O2, L3->O3) to exploit the just-substituted period-index /
+  /// may_const constants (fold/DCE/loop-unroll), re-specialize the array
+  /// accesses that unrolling turns into constant-index GEPs (second
+  /// StructFieldPass), then a light cleanup fold.
   void runOptimizationPipeline(Module &M, OptimizationLevel level);
+
+  /// Pick the cached function-simplification FPM for an EJIT optimization tier.
+  FunctionPassManager &simplifyFPMForLevel(OptimizationLevel level);
 
   PeriodArrayRegistry &registry_;
 
@@ -69,11 +72,15 @@ private:
   ModuleAnalysisManager MAM_;
 
   // Cached pass managers, built once and reused across compilations:
-  //   mainFPM_    scalar fold/propagate/simplify to a fixed point, then loop
-  //               fold-to-constant (Phases 2-3).
-  //   cleanupFPM_ fold/propagate/simplify after unrolling re-exposes constant
-  //               array accesses and the second StructFieldPass (Phase 4).
-  FunctionPassManager mainFPM_;
+  //   lowerExpectFPM_ lower llvm.expect (not in buildFunctionSimplification
+  //                   Pipeline); runs before the O2 pipeline (Phase 2).
+  //   simplifyO1/2/3_ the real LLVM -O1/-O2/-O3 function-simplification pipeline
+  //                   (Phase 3), one per tier; NO vectorization.
+  //   cleanupFPM_     light fold after the second StructFieldPass (Phase 5).
+  FunctionPassManager lowerExpectFPM_;
+  FunctionPassManager simplifyO1_;
+  FunctionPassManager simplifyO2_;
+  FunctionPassManager simplifyO3_;
   FunctionPassManager cleanupFPM_;
 
   // Grant the unit-test accessor visibility into the private pipeline steps.

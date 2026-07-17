@@ -2147,16 +2147,23 @@ static Function *createDeadCodeFunc(LLVMContext &Ctx, Module &M) {
   BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
   B.SetInsertPoint(BB);
 
-  // Unreachable block
+  // Live block: the false target of the constant branch, so it is always taken.
+  BasicBlock *Live = BasicBlock::Create(Ctx, "live", F);
+  {
+    IRBuilder<> LB(Live);
+    LB.CreateRet(LB.getInt32(42));
+  }
+
+  // Unreachable block: the true target of `br false` (never taken).
   auto *DeadBB = BasicBlock::Create(Ctx, "dead", F);
   {
     IRBuilder<> DB(DeadBB);
     DB.CreateRet(DB.getInt32(999));
   }
 
-  // br on constant false -> unreachable branch should be eliminated
-  B.CreateCondBr(B.getFalse(), DeadBB, DeadBB);
-  B.CreateRet(B.getInt32(42));
+  // br i1 false -> always the false target (live); the true target (dead) is
+  // unreachable and should be eliminated.
+  B.CreateCondBr(B.getFalse(), DeadBB, Live);
 
   return F;
 }
@@ -2314,20 +2321,20 @@ static std::string optimizeLoopFnAt(llvm::ejit::OptimizationLevel lvl) {
   return Out;
 }
 
-TEST(EJitOptimizer, PipelineCollapseLevelEquivalence) {
+TEST(EJitOptimizer, OptimizationFoldsConstantLoopAtAllLevels) {
   std::string L1 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L1);
   std::string L2 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L2);
   std::string L3 = optimizeLoopFnAt(llvm::ejit::OptimizationLevel::L3);
 
-  // Collapse proof: every level runs the identical single pipeline.
-  EXPECT_EQ(L1, L2) << "L1 vs L2 IR differs — the tiers were not collapsed";
-  EXPECT_EQ(L2, L3) << "L2 vs L3 IR differs — the tiers were not collapsed";
-
-  // No-regression proof: the single pipeline still fully optimizes at EVERY
-  // level (loop unrolled + folded to constant 6 — the old L3 outcome). Under the
-  // old tiers, L1 kept the loop and this find() would fail.
+  // No-regression: each tier (L1->O1, L2->O2, L3->O3) unrolls + folds the
+  // constant-bound loop to `ret i32 6`. Tiers are now distinct O1/O2/O3
+  // pipelines; byte-identical IR across tiers is no longer asserted.
   EXPECT_NE(L1.find("ret i32 6"), std::string::npos)
-      << "collapsed pipeline did not fold the loop at L1 (regressed vs old L3)";
+      << "L1 (O1) did not fold the constant loop";
+  EXPECT_NE(L2.find("ret i32 6"), std::string::npos)
+      << "L2 (O2) did not fold the constant loop";
+  EXPECT_NE(L3.find("ret i32 6"), std::string::npos)
+      << "L3 (O3) did not fold the constant loop";
 }
 
 //===----------------------------------------------------------------------===//
@@ -2454,15 +2461,20 @@ static std::string specializeBranchAt(llvm::ejit::OptimizationLevel lvl) {
   return Out;
 }
 
-TEST(EJitEndToEnd, PipelineLevelEquivalenceBranch) {
+TEST(EJitEndToEnd, PipelineFoldsMayConstBranchAtAllLevels) {
   std::string L1 = specializeBranchAt(llvm::ejit::OptimizationLevel::L1);
   std::string L2 = specializeBranchAt(llvm::ejit::OptimizationLevel::L2);
   std::string L3 = specializeBranchAt(llvm::ejit::OptimizationLevel::L3);
 
-  EXPECT_EQ(L1, L2) << "L1 vs L2 IR differs — level changed the pipeline";
-  EXPECT_EQ(L2, L3) << "L2 vs L3 IR differs — level changed the pipeline";
+  // No-regression: each tier (L1->O1, L2->O2, L3->O3) folds the may_const
+  // branch to the constant 100. Tiers are now distinct O1/O2/O3 pipelines;
+  // byte-identical IR across tiers is no longer asserted.
   EXPECT_NE(L1.find("ret i32 100"), std::string::npos)
-      << "pipeline did not fold the may_const branch to the constant 100";
+      << "L1 (O1) did not fold the may_const branch";
+  EXPECT_NE(L2.find("ret i32 100"), std::string::npos)
+      << "L2 (O2) did not fold the may_const branch";
+  EXPECT_NE(L3.find("ret i32 100"), std::string::npos)
+      << "L3 (O3) did not fold the may_const branch";
 }
 
 //===----------------------------------------------------------------------===//

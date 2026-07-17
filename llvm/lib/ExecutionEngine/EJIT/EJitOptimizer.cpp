@@ -7,21 +7,16 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
-#include "llvm/ExecutionEngine/EJIT/EJitPassBuilder.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Debug.h"
-// JIT Inline disabled: AOT pre-optimization already inlines.
-// #include "llvm/Transforms/IPO/AlwaysInliner.h"
+// The post-specialization cleanup is the real LLVM -O2 function-simplification
+// pipeline (PassBuilder::buildFunctionSimplificationPipeline); only the light
+// cleanupFPM_ and the LowerExpect prefix are hand-added below.
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SCCP.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
-#include "llvm/Transforms/Scalar/IndVarSimplify.h"
-#include "llvm/Transforms/Scalar/LoopDeletion.h"
-#include "llvm/Transforms/Scalar/LoopPassManager.h"
-#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
-#include "llvm/Transforms/Utils/LoopSimplify.h"
-#include "llvm/Transforms/Utils/Mem2Reg.h"
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -30,56 +25,39 @@ using namespace llvm::ejit;
 
 EJitOptimizer::EJitOptimizer(PeriodArrayRegistry &reg)
     : registry_(reg) {
-  EJitPassBuilder::registerFunctionAnalyses(FAM_);
-  EJitPassBuilder::registerLoopAnalyses(LAM_);
-  EJitPassBuilder::registerCGSCCAnalyses(CGAM_);
-  EJitPassBuilder::registerModuleAnalyses(MAM_);
-  EJitPassBuilder::crossRegisterProxies(LAM_, FAM_, CGAM_, MAM_);
+  // Use the real llvm::PassBuilder to register the FULL analysis set. The O2
+  // function-simplification pipeline (GVN, CorrelatedValuePropagation, etc.)
+  // needs analyses the minimal EJitPassBuilder does not register (~13 vs ~40).
+  PassBuilder PB;
+  PB.registerFunctionAnalyses(FAM_);
+  PB.registerLoopAnalyses(LAM_);
+  PB.registerCGSCCAnalyses(CGAM_);
+  PB.registerModuleAnalyses(MAM_);
+  PB.crossRegisterProxies(LAM_, FAM_, CGAM_, MAM_);
 
-  // Pre-build the two cached FunctionPassManagers of the optimization pipeline.
+  // Pre-build the cached FunctionPassManagers, reused across compilations.
   //
   // By the time these run, runPipeline has turned the period-index argument and
-  // every may_const field into a compile-time constant. The pipeline's whole job
-  // is to exploit those constants maximally, so it is structured as a fold →
-  // propagate → simplify fixed point followed by loop folding.
+  // every may_const field into a compile-time constant. The post-specialization
+  // cleanup is the real LLVM -O2 function-simplification pipeline (SROA,
+  // InstCombine, SCCP, GVN, CorrelatedValuePropagation, BDCE, DSE, loop-rotate,
+  // LICM, loop-unroll, ... - NO vectorization), which exploits those constants
+  // far more aggressively than the old hand-rolled 8-pass sequence. One cached
+  // FPM per tier; runOptimizationPipeline picks by ctx.optLevel.
   //
-  // mainFPM_ — Phase 2 (scalar) then Phase 3 (loops):
-  //
-  //   Phase 2 drives the substituted constants to a fixed point. The first round
-  //   peephole-folds the constants (InstCombine), propagates them and folds the
-  //   now-constant branches (SCCP), and deletes the unreachable blocks
-  //   (SimplifyCFG). Folding a branch merges blocks and exposes fresh constants
-  //   and dead code, so a second InstCombine + SimplifyCFG round catches that
-  //   cascade; ADCE then removes whatever became dead.
-  //   LowerExpectIntrinsic must run FIRST: the AOT IR carries llvm.expect
-  //   guards (__builtin_expect / LIKELY) on top of may_const conditions. Once
-  //   StructFieldPass (phase 1c) turns those conditions into constants, the
-  //   expect intrinsic is the only thing preventing InstCombine/SCCP from
-  //   folding the branch - without lowering it the constant branches stay,
-  //   their dead blocks/calls survive ADCE, and the specialization does the
-  //   same work as AOT (plus JIT overhead), i.e. a slowdown. Lowering
-  //   expect(x,y) -> x lets the rest of the pipeline fold and DCE.
-  mainFPM_.addPass(LowerExpectIntrinsicPass());
-  mainFPM_.addPass(InstCombinePass());
-  mainFPM_.addPass(SCCPPass());
-  mainFPM_.addPass(SimplifyCFGPass());
-  mainFPM_.addPass(InstCombinePass());
-  mainFPM_.addPass(SimplifyCFGPass());
-  mainFPM_.addPass(ADCEPass());
-  //   Phase 3 folds loops whose bounds became constant (a no-op on loopless
-  //   functions). LoopSimplify canonicalizes; LoopFullUnroll unrolls small
-  //   bounded loops; IndVarSimplify uses SCEV to replace a larger loop's
-  //   accumulator phi with its closed-form exit value; LoopDeletion removes the
-  //   emptied loop; Promote returns any loop-created allocas to SSA.
-  mainFPM_.addPass(LoopSimplifyPass());
-  {
-    LoopPassManager LPM;
-    LPM.addPass(LoopFullUnrollPass());
-    LPM.addPass(IndVarSimplifyPass());
-    LPM.addPass(LoopDeletionPass());
-    mainFPM_.addPass(createFunctionToLoopPassAdaptor(std::move(LPM)));
-  }
-  mainFPM_.addPass(PromotePass());
+  // LowerExpectIntrinsic must run FIRST: it is NOT in
+  // buildFunctionSimplificationPipeline, and the AOT IR carries llvm.expect
+  // guards (__builtin_expect / LIKELY) on top of may_const conditions. Once
+  // StructFieldPass (phase 1c) turns those conditions into constants, lowering
+  // expect(x,y) -> x lets the O2 pipeline fold the branch and DCE its dead half.
+  lowerExpectFPM_.addPass(LowerExpectIntrinsicPass());
+
+  simplifyO1_ = PB.buildFunctionSimplificationPipeline(
+      llvm::OptimizationLevel::O1, ThinOrFullLTOPhase::None);
+  simplifyO2_ = PB.buildFunctionSimplificationPipeline(
+      llvm::OptimizationLevel::O2, ThinOrFullLTOPhase::None);
+  simplifyO3_ = PB.buildFunctionSimplificationPipeline(
+      llvm::OptimizationLevel::O3, ThinOrFullLTOPhase::None);
 
   // cleanupFPM_ — Phase 4, run after the second StructFieldPass. Unrolling turns
   // a loop-variant array access g_arr[k].field into constant-index GEPs
@@ -189,23 +167,42 @@ void EJitOptimizer::runStructFieldPass(Module &M) {
       structField.run(F, FAM_);
 }
 
-void EJitOptimizer::runOptimizationPipeline(Module &M,
-                                            OptimizationLevel level) {
-  // One fixed pipeline; `level` does not affect it.
-  (void)level;
-  EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s",
-                  M.getName().str().c_str());
+FunctionPassManager &
+EJitOptimizer::simplifyFPMForLevel(ejit::OptimizationLevel level) {
+  switch (level) {
+  case ejit::OptimizationLevel::L1:
+    return simplifyO1_;
+  case ejit::OptimizationLevel::L3:
+    return simplifyO3_;
+  case ejit::OptimizationLevel::L2:
+  default:
+    return simplifyO2_;
+  }
+}
 
-  // Phases 2-3: scalar fold/propagate/simplify fixed point, then loop folding.
+void EJitOptimizer::runOptimizationPipeline(Module &M,
+                                            ejit::OptimizationLevel level) {
+  EJIT_DIAG_DEBUG("pipeline stage5: optimization pipeline module=%s opt=%d",
+                  M.getName().str().c_str(), static_cast<int>(level));
+
+  // Phase 2: lower llvm.expect (not in buildFunctionSimplificationPipeline).
+  // Phase 3: the real LLVM -Ox function-simplification pipeline, selected by
+  // level (L1->O1, L2->O2, L3->O3). It folds the substituted constants, DCEs
+  // the dead branches, and unrolls loops whose bounds became constant; this is
+  // the bulk of the post-specialization optimization.
+  FunctionPassManager &simplifyFPM = simplifyFPMForLevel(level);
   for (Function &F : M.functions())
-    if (!F.isDeclaration())
-      mainFPM_.run(F, FAM_);
+    if (!F.isDeclaration()) {
+      lowerExpectFPM_.run(F, FAM_);
+      simplifyFPM.run(F, FAM_);
+    }
 
   // Phase 4: unrolling exposed new constant-index array accesses
-  // (g_arr[k].field → g_arr[0].field, g_arr[1].field, ...). Substitute them,
+  // (g_arr[k].field -> g_arr[0].field, g_arr[1].field, ...). Substitute them,
   // then fold/propagate/simplify the freshly-constant values.
   runStructFieldPass(M);
   for (Function &F : M.functions())
     if (!F.isDeclaration())
       cleanupFPM_.run(F, FAM_);
 }
+
