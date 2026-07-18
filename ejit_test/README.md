@@ -44,6 +44,7 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_nested_struct_test` | 2-level and 3-level nested struct may_const |
 | `ejit_opt_level_test` | L1/L2/L3 optimization level validation |
 | `ejit_perf_bench` | Performance benchmark: JIT compile time, cache hit latency |
+| `ejit_perf_aot_vs_jit_test` | AOT-vs-JIT per-call benchmark (ejit_taskpool_trace_now = SRE_CycleCountGet64 on target): contrasts a GOT-heavy shape (perf_globals) vs an amplified-specialization shape (perf_fold, n=64 foldable loop). Shows when specialization wins. |
 | `ejit_ptr_period_test` | Pointer-type ejit_period_arr and ejit_period (NEW) |
 | `ejit_trace_test` | Runtime trace: JIT dispatch, fallback, lifecycle hooks |
 
