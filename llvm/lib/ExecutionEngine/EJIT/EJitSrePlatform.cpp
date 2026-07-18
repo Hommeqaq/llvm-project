@@ -23,6 +23,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 
+#include <cstdint>
+
 #ifndef EJIT_SRE_CODE_POOL_SIZE
 #define EJIT_SRE_CODE_POOL_SIZE                                                \
   (static_cast<unsigned long long>(2) * 1024 * 1024)
@@ -72,6 +74,71 @@ extern "C" void *SRE_MemDbgAlloc(unsigned int mid, unsigned char ptNo,
                                  unsigned long size, const char *func,
                                  unsigned int line);
 
+namespace {
+/// AArch64 self-modifying-code cache synchronization for [Va, Va + Size).
+///
+/// JIT code is written as data into a RW page, so it lands in the D-cache. The
+/// I-cache does not snoop the D-cache on AArch64, so before the core may
+/// execute the new code it must: clean the D-cache to the Point of Unification
+/// (DC CVAU, so the new instructions reach memory visible to instruction
+/// fetch), invalidate the I-cache lines for that range (IC IVAU, so they are
+/// re-fetched), then context-synchronize (ISB) on this core. This is the
+/// sequence enable_ex does NOT perform - enable_ex only flips the PTE to RX
+/// (RO+X, clears PXN/UXN) and flushes the TLB (OsTlbLocalFlushAll = DSB +
+/// TLBI VMALLE1 + DSB + ISB). Without it the I-cache serves stale lines / the
+/// instruction fetch reads stale memory.
+///
+/// Per-core: every core that executes JIT code calls this in its own
+/// translation context (via the per-core seal). The DC CVAU is redundant on a
+/// peer core (the writer already cleaned to PoU) but harmless; the IC IVAU +
+/// ISB on each executing core is what makes the new code observable to it.
+/// (IC IVAU is inner-shareable, but each PE still needs its own ISB before
+/// execution, which the per-core seal guarantees.)
+///
+/// Implemented with inline asm rather than __builtin___clear_cache (or
+/// llvm::sys::Memory::InvalidateInstructionCache, which calls the same
+/// external __clear_cache symbol): both resolve to compiler-rt/libgcc's
+/// __clear_cache, which the freestanding SRE link does not provide. The line
+/// sizes are read from CTR_EL0 so the per-line loop covers every line on any
+/// implementation.
+void syncCodeCaches(uintptr_t Va, size_t Size) {
+  if (Size == 0)
+    return;
+#ifdef __aarch64__
+  uint64_t Ctr;
+  __asm__ __volatile__("mrs %0, ctr_el0" : "=r"(Ctr));
+  size_t DLine = static_cast<size_t>(4) << ((Ctr >> 16) & 0xF);
+  size_t ILine = static_cast<size_t>(4) << (Ctr & 0xF);
+
+  uintptr_t End = Va + Size;
+  uintptr_t P = Va & ~static_cast<uintptr_t>(DLine - 1);
+  for (; P < End; P += DLine)
+    __asm__ __volatile__("dc cvau, %0" :: "r"(P) : "memory");
+  __asm__ __volatile__("dsb ish" ::: "memory");
+
+  P = Va & ~static_cast<uintptr_t>(ILine - 1);
+  for (; P < End; P += ILine)
+    __asm__ __volatile__("ic ivau, %0" :: "r"(P) : "memory");
+  __asm__ __volatile__("dsb ish" ::: "memory");
+  __asm__ __volatile__("isb" ::: "memory");
+#else
+  // Non-AArch64 (host) fallback: compiler-rt/libgcc is available here, so the
+  // builtin's __clear_cache resolves. The SRE target is always AArch64.
+  __builtin___clear_cache(reinterpret_cast<char *>(Va),
+                          reinterpret_cast<char *>(Va + Size));
+#endif
+}
+
+/// Seal one code range on the calling core: sync caches, then flip the page to
+/// RX via enable_ex. enable_ex only changes PTE permission and flushes the TLB;
+/// syncCodeCaches above is what makes the just-written JIT code executable
+/// without serving stale I-cache lines. Returns enable_ex's rc (0 = success).
+unsigned sealAndSyncCache(uintptr_t Va, size_t Size) {
+  syncCodeCaches(Va, Size);
+  return ejit_sre_enable_ex(1, static_cast<unsigned long long>(Va));
+}
+} // namespace
+
 std::unique_ptr<llvm::ejit::EJitCodePoolManager>
 llvm::ejit::makeSreCodePoolManager() {
   EJitCodePoolManager::Options Opts;
@@ -95,8 +162,14 @@ llvm::ejit::makeSreCodePoolManager() {
   auto Seal = [](void *Va) -> unsigned {
 #ifdef EJIT_SRE_ENABLE_EX
     // In 4K seal mode Va is a single 4KiB page; in legacy mode it is the 2MiB
-    // pool base. enable_ex flips the page containing Va to RX either way.
-    return ejit_sre_enable_ex(1, reinterpret_cast<unsigned long long>(Va));
+    // pool base. sealAndSyncCache syncs the I-cache for the written range then
+    // flips the page containing Va to RX (enable_ex does NOT do the cache sync).
+#ifdef EJIT_CODE_POOL_4K_SEAL
+    return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va), k4KiB);
+#else
+    return sealAndSyncCache(reinterpret_cast<uintptr_t>(Va),
+                            static_cast<size_t>(kSrePoolSize));
+#endif
 #else
     // Code-pool routing without permission flips (bring-up / measurement).
     (void)Va;
@@ -131,7 +204,7 @@ bool llvm::ejit::prepareSreCodeForCurrentCore(const void *FnPtr) {
   }
   const auto Address = reinterpret_cast<uintptr_t>(FnPtr);
   const auto PoolBase = Address & ~(static_cast<uintptr_t>(k2MiB) - 1);
-  unsigned Rc = ejit_sre_enable_ex(1, static_cast<unsigned long long>(PoolBase));
+  unsigned Rc = sealAndSyncCache(PoolBase, static_cast<size_t>(kSrePoolSize));
   if (Rc != 0) {
     EJIT_DIAG("prepareSreCode FAIL: enable_ex poolBase=0x%llx rc=%u",
               static_cast<unsigned long long>(PoolBase), Rc);
@@ -179,9 +252,11 @@ bool llvm::ejit::ejitSreSealPageForCurrentCore(uintptr_t PageVA) {
     return false;
   }
   // Per-core: flips the 4KiB page containing PageVA to RX in the calling core's
-  // translation context. enable_ex performs its own permission/cache sync, so
-  // no __builtin___clear_cache here.
-  unsigned Rc = ejit_sre_enable_ex(1, static_cast<unsigned long long>(PageVA));
+  // translation context AND syncs its I-cache for that page. enable_ex does NOT
+  // do the cache sync, so it is done here (see sealAndSyncCache). Every core
+  // that executes shared JIT code seals its own translation context here before
+  // first execution.
+  unsigned Rc = sealAndSyncCache(PageVA, k4KiB);
   if (Rc != 0) {
     EJIT_DIAG("sealPageForCurrentCore FAIL: enable_ex pageVA=0x%llx rc=%u",
               static_cast<unsigned long long>(PageVA), Rc);

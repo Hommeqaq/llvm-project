@@ -59,7 +59,8 @@ public:
     // be looked up. If any page fails to seal we must not hand back a callable
     // allocation. (Legacy whole-pool seal is driven later, at lookup, by the
     // engine.) We do not invalidate the instruction cache here either \u2014
-    // enable_ex performs that sync on the target.
+    // the SRE seal callback does it (enable_ex + cache sync, see
+    // EJitSrePlatform.cpp's sealAndSyncCache).
     if (Pool->usesPageSeal()) {
       for (const ExecSegRange &R : ExecRanges)
         if (auto Err = Pool->sealCodeRange(reinterpret_cast<void *>(R.Addr),
