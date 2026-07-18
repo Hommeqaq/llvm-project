@@ -35,6 +35,7 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_external_idx_test` | External cellIdx with multi-dim arrays |
 | `ejit_inline_asm_test` | AArch64 inline asm inside an `ejit_entry` function |
 | `ejit_jit_verify_test` | JIT correctness: constant folding, dead branch elimination |
+| `ejit_got_probe_test` | dso_local/GOT verification demo: relocation-overflow check + specialized-asm `:got:` dump + AOT-vs-JIT delta. Verifies the dso_local experiment (commit 33754cfdc82e). |
 | `ejit_lifecycle_test` | ejit_period_lc: deactivate/activate pairing |
 | `ejit_multidim_test` | 2D multi-dim array with external cellIdx |
 | `ejit_multi_tu_test` | Two TUs each with ejit_entry + period globals, linked together (registry no-duplicate-symbol regression) |
