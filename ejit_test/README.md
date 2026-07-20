@@ -34,7 +34,7 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_config_api_test` | Config, stats, cache, compile-mode API validation |
 | `ejit_external_idx_test` | External cellIdx with multi-dim arrays |
 | `ejit_inline_asm_test` | AArch64 inline asm inside an `ejit_entry` function |
-| `ejit_jit_verify_test` | JIT correctness: constant folding, dead branch elimination |
+| `ejit_jit_verify_test` | Multi-core bare-metal JIT correctness (entry `test_ejit_jit_verify`, no main, inputs `g_ci`/`g_ti`/`g_ci2`): compile + cache hit + branch folding + multi-dim + recompile, async-gated by wait_for_compile. Worker core idles; non-worker cores verify. Mirrors testcase.log structure. |
 | `ejit_got_probe_test` | Multi-core bare-metal dso_local/GOT verification (entry `test_ejit_got_probe`, no main, input `g_ci`): relocation-overflow check + specialized-asm `:got:` dump + AOT-vs-JIT measure. Worker core idles; non-worker cores verify. Mirrors testcase.log structure. Verifies the dso_local experiment (commit 33754cfdc82e). |
 | `ejit_lifecycle_test` | ejit_period_lc: deactivate/activate pairing |
 | `ejit_multidim_test` | 2D multi-dim array with external cellIdx |
