@@ -41,23 +41,26 @@
 #include "ejit_bench_helpers.h"
 
 //===-- Input: cell index set by the bare-metal env -----------------------===//
-uint8_t g_ci = 0;
+EJIT_SHARED_SECTION_ATTR uint8_t g_ci = 0;
 
 //===-- 6 externalized non-const globals ----------------------------------===//
 // Non-const global definitions referenced by an ejit_entry are externalized by
 // EJitRegisterBitcode (initializer dropped, ExternalLinkage) and resolved from
 // the host at JIT link time. Under dso_local=false each access becomes a
 // GOT-indirect load (:got:); under dso_local=true each is a direct ADRP+LDR.
-uint32_t g_probeA = 10;
-uint32_t g_probeB = 20;
-uint32_t g_probeC = 30;
-uint32_t g_probeD = 40;
-uint32_t g_probeE = 50;
-uint32_t g_probeF = 60;
+// EJIT_SHARED_SECTION_ATTR: cross-core shared so the compile worker reads the
+// same values init_data wrote (per-core-private would make the worker fold
+// stale BSS-zero values).
+EJIT_SHARED_SECTION_ATTR uint32_t g_probeA = 10;
+EJIT_SHARED_SECTION_ATTR uint32_t g_probeB = 20;
+EJIT_SHARED_SECTION_ATTR uint32_t g_probeC = 30;
+EJIT_SHARED_SECTION_ATTR uint32_t g_probeD = 40;
+EJIT_SHARED_SECTION_ATTR uint32_t g_probeE = 50;
+EJIT_SHARED_SECTION_ATTR uint32_t g_probeF = 60;
 
 // A period array drives specialization (and ensures JIT compilation). Its
 // element is specialized to a constant -> NOT a GOT candidate.
-ejit_period_arr(probe) uint32_t g_probeArr[4];
+EJIT_SHARED_SECTION_ATTR ejit_period_arr(probe) uint32_t g_probeArr[4];
 
 //===-- JIT entry: touches all 6 external globals -------------------------===//
 

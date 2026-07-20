@@ -33,13 +33,15 @@
 #include "ejit_bench_helpers.h"
 
 //===-- Input: cell index set by the bare-metal env -----------------------===//
-uint8_t g_ci = 0;
+EJIT_SHARED_SECTION_ATTR uint8_t g_ci = 0;
 
 //===-- perf_globals: GOT-heavy, low specialization -----------------------===//
 // 8 non-const globals -> externalized -> GOT loads under dso_local=false.
-uint32_t g_pg0 = 1, g_pg1 = 2, g_pg2 = 3, g_pg3 = 4;
-uint32_t g_pg4 = 5, g_pg5 = 6, g_pg6 = 7, g_pg7 = 8;
-ejit_period_arr(pg) uint32_t g_pgPeriod[4];
+// EJIT_SHARED_SECTION_ATTR: cross-core shared so the compile worker reads the
+// same values init_data wrote.
+EJIT_SHARED_SECTION_ATTR uint32_t g_pg0 = 1, g_pg1 = 2, g_pg2 = 3, g_pg3 = 4;
+EJIT_SHARED_SECTION_ATTR uint32_t g_pg4 = 5, g_pg5 = 6, g_pg6 = 7, g_pg7 = 8;
+EJIT_SHARED_SECTION_ATTR ejit_period_arr(pg) uint32_t g_pgPeriod[4];
 
 #define PERF_GLOBALS_BODY(CELL_IDX, SEED)                                      \
   do {                                                                         \
@@ -63,7 +65,7 @@ struct PfCfg {
   ejit_may_const uint32_t mode;
   ejit_may_const uint32_t n;
 };
-ejit_period_arr(pf) struct PfCfg g_pfCfg[4];
+EJIT_SHARED_SECTION_ATTR ejit_period_arr(pf) struct PfCfg g_pfCfg[4];
 
 #define PERF_FOLD_BODY(CELL_IDX, SEED)                                         \
   do {                                                                         \

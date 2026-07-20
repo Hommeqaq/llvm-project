@@ -38,9 +38,11 @@
 #include "ejit_bench_helpers.h"
 
 //===-- Inputs: indices set by the bare-metal env -------------------------===//
-uint8_t g_ci = 0;   // primary cellIdx, 0..15
-uint8_t g_ti = 0;   // trpIdx, 0..7
-uint8_t g_ci2 = 0;  // second cellIdx for the recompile test, 0..15
+// EJIT_SHARED_SECTION_ATTR: cross-core shared so the compile worker (a
+// different core) sees the same indices the verifier core uses.
+EJIT_SHARED_SECTION_ATTR uint8_t g_ci = 0;   // primary cellIdx, 0..15
+EJIT_SHARED_SECTION_ATTR uint8_t g_ti = 0;   // trpIdx, 0..7
+EJIT_SHARED_SECTION_ATTR uint8_t g_ci2 = 0;  // second cellIdx for the recompile test, 0..15
 
 //===-- EJIT-attributed config structs and period arrays ------------------===//
 
@@ -58,8 +60,11 @@ struct TrpCfg {
 #define N_CELL 16
 #define M_TRP 8
 
-ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
-ejit_period_arr(trp) struct TrpCfg g_trpCfg[M_TRP];
+// EJIT_SHARED_SECTION_ATTR: the period arrays must be cross-core shared - the
+// compile worker reads their values for specialization, and it runs on a
+// different core than the verifier that runs init_data.
+EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell) struct CellCfg g_cellCfg[N_CELL];
+EJIT_SHARED_SECTION_ATTR ejit_period_arr(trp) struct TrpCfg g_trpCfg[M_TRP];
 
 //===-- JIT entry functions (verification targets) ------------------------===//
 // The branches depend on ejit_may_const fields -> the JIT specializes them to
@@ -100,6 +105,20 @@ jit_cell_trp_check_ejit(ejit_period_arr_ind(cell) uint8_t cellIdx,
   }                                                                     \
 } while (0)
 
+// DIAG: read back the period-array values + their addresses at key points, to
+// pinpoint when g_cellCfg[g_ci].cellType / g_trpCfg[g_ti].trpType become 0
+// (init_data writes 0xFD / 1). Prints &g_cellCfg so the section can be
+// inferred (per-core-private vs shared) and whether write/read hit the same
+// memory.
+static void dbg_print_period(const char *where) {
+  SRE_printf("[DBG][core=%u] %s: &g_cellCfg=%p g_cellCfg[%u].cellType=%u "
+             "(expect 0xFD=253) &g_trpCfg=%p g_trpCfg[%u].trpType=%u "
+             "(expect 1) g_ci=%u g_ti=%u\n",
+             local_core_id(), where, (void *)g_cellCfg, g_ci,
+             g_cellCfg[g_ci].cellType, (void *)g_trpCfg, g_ti,
+             g_trpCfg[g_ti].trpType, g_ci, g_ti);
+}
+
 static void init_data(void) {
   // Primary cell: cellType=0xFD -> jit_cell_check_ejit returns 1000.
   g_cellCfg[g_ci].cellType = 0xFDu;
@@ -114,6 +133,7 @@ static void init_data(void) {
   g_cellCfg[g_ci2].cellType = 0u;
   g_cellCfg[g_ci2].cellId = 0u;
   g_cellCfg[g_ci2].trafficLoad = 0u;
+  dbg_print_period("init_data after write");
 }
 
 //===-- Entry: called by the RTOS on every core ---------------------------===//
@@ -139,6 +159,7 @@ int test_ejit_jit_verify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   SRE_printf("[BENCH][core=%u] call_init_array_functions begin\n", core);
   call_init_array_functions();
   SRE_printf("[BENCH][core=%u] call_init_array_functions end\n", core);
+  dbg_print_period("after call_init_array");
 
   ejit_config_t config = {
       .compileMode = EJIT_COMPILE_ASYNC,
@@ -154,6 +175,7 @@ int test_ejit_jit_verify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   uint32_t workerCore = ejit_taskpool_get_worker_core();
   SRE_printf("[BENCH][core=%u] ejit_init end rc=%d workerCore=%u\n", core,
              (int)initRc, workerCore);
+  dbg_print_period("after ejit_init");
   if (initRc != EJIT_OK)
     idle_forever(core, "init-failed");
 
@@ -185,6 +207,8 @@ int test_ejit_jit_verify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
              "compiles=%llu\n",
              core, s0.readyEntries, (unsigned long long)s0.cacheHits,
              (unsigned long long)s0.asyncCompiles);
+
+  dbg_print_period("step1 before first call");
 
   SRE_printf("[BENCH][core=%u] first active call: enqueue or join pending "
              "compile\n",

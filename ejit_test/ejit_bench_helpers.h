@@ -25,6 +25,17 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 
+//===-- EJIT_SHARED_SECTION_ATTR -------------------------------------------===//
+// CMake passes -DEJIT_SHARED_SECTION_ATTR=__attribute__((section(".mc_shared")))
+// for the aarch64_be preset (cross-core shared globals). Globals WITHOUT it are
+// per-core-private: the compile worker (a different core) would not see values
+// a verifier core wrote, so specialization folds stale (BSS-zero) values. Mark
+// all test data/inputs shared so the worker reads what init_data wrote. On host
+// (single-core) the macro is empty - no sharing needed.
+#ifndef EJIT_SHARED_SECTION_ATTR
+#define EJIT_SHARED_SECTION_ATTR
+#endif
+
 //===-- SRE bare-metal platform externs ------------------------------------===//
 // The host libc does not provide these; the SRE RTOS does. Declared extern
 // here so the demos compile against the EJIT runtime header without pulling
