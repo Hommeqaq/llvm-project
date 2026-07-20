@@ -143,12 +143,12 @@ int test_ejit_jit_verify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
              trpIdx, ci2);
 
   // call_init_array + ejit_init run on EVERY core. The first core to reach
-  // ejit_init becomes the shared compile worker; others attach. The fork below
-  // splits by current core: the worker core ONLY serves compiles (ejit_init
-  // + idle), the verifier core sets up the data (init_data) and runs the
-  // checks. init_data runs on the verifier only - the data is cross-core
-  // shared (EJIT_SHARED_SECTION_ATTR), so the worker reads what the verifier
-  // wrote.
+  // ejit_init becomes the shared compile worker; others attach. The fork
+  // below splits by current core: the worker core ONLY serves compiles
+  // (ejit_init + idle), the verifier core sets up the data (init_data) and
+  // runs the checks. init_data runs on the verifier only - the data globals
+  // are EJIT_SHARED_SECTION_ATTR (.mc_shared, cross-core shared), so the
+  // worker reads what the verifier wrote.
   SRE_printf("[BENCH][core=%u] call_init_array_functions begin\n", core);
   call_init_array_functions();
   SRE_printf("[BENCH][core=%u] call_init_array_functions end\n", core);
@@ -179,8 +179,8 @@ int test_ejit_jit_verify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
 
   //--- Verifier core: set up the shared period-array data, then verify. ---
   // (The worker core idled above and never reaches here.) The data globals
-  // are EJIT_SHARED_SECTION_ATTR, so the worker reads these values when it
-  // specializes.
+  // are EJIT_SHARED_SECTION_ATTR (.mc_shared), so the worker reads these
+  // values when it specializes.
   init_data();
   SRE_printf("[BENCH][core=%u] data initialized (cellCfg + trpCfg)\n", core);
 

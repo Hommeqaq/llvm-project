@@ -30,10 +30,12 @@
 // for the aarch64_be preset (cross-core shared globals). Globals WITHOUT it are
 // per-core-private: the compile worker (a different core) would not see values
 // a verifier core wrote, so specialization folds stale (BSS-zero) values. Mark
-// all test data/inputs shared so the worker reads what init_data wrote. On host
-// (single-core) the macro is empty - no sharing needed.
+// all test data/inputs shared so the worker reads what init_data wrote.
+// build.sh does NOT pass this -D to the test, so default it to the same
+// .mc_shared section the preset uses (mirrors llvm/CMakePresets.json
+// ejit-minimal-aarch64_be). On host (single-core) a named section is harmless.
 #ifndef EJIT_SHARED_SECTION_ATTR
-#define EJIT_SHARED_SECTION_ATTR
+#define EJIT_SHARED_SECTION_ATTR __attribute__((section(".mc_shared")))
 #endif
 
 //===-- SRE bare-metal platform externs ------------------------------------===//
