@@ -142,8 +142,9 @@ Error EJitCodePoolManager::sealPoolLocked(CodePool &P) {
   ++SealInvocations_;
   EJIT_DIAG("sealPool OK: base=%p (invocations=%zu)",
             static_cast<void *>(P.base), SealInvocations_);
-  // Per platform guidance, enable_ex performs its own permission/cache
-  // synchronization, so we deliberately do NOT call __builtin___clear_cache.
+  // The SRE seal callback (enable_ex + cache sync, see EJitSrePlatform.cpp's
+  // sealAndSyncCache) handles permission/cache synchronization; the code pool
+  // layer does not call __builtin___clear_cache itself.
   return Error::success();
 }
 
@@ -319,8 +320,9 @@ Error EJitCodePoolManager::sealCodeRange(const void *Start, size_t Size) {
   }
   EJIT_DIAG("sealCodeRange OK: start=%p size=%zu (invocations=%zu)", Start, Size,
             SealInvocations_);
-  // Per platform guidance, enable_ex performs its own permission/cache
-  // synchronization, so we deliberately do NOT call __builtin___clear_cache.
+  // The SRE seal callback (enable_ex + cache sync, see EJitSrePlatform.cpp's
+  // sealAndSyncCache) handles permission/cache synchronization; the code pool
+  // layer does not call __builtin___clear_cache itself.
   return Error::success();
 }
 

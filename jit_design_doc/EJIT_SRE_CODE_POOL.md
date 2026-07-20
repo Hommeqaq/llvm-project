@@ -78,8 +78,12 @@ allocate(RW, 来自 2MiB 池)
    -> 返回函数指针（此时指向 RX 内存，可安全执行）
 ```
 
-> 注意：`enable_ex` 内部已完成权限/cache 同步，所以本实现在 SRE 模式下
-> **不调用 `__builtin___clear_cache`**。
+> 注意：`enable_ex` **只做**权限翻转（PTE 置 RO+X、清 PXN/UXN）+ TLB flush
+> （`OsTlbLocalFlushAll` = DSB + TLBI VMALLE1 + DSB + ISB），**不做** `DC CVAU`/
+> `IC IVAU` cache 同步。因此 SRE 模式下由 seal 路径（`EJitSrePlatform.cpp` 的
+> `sealAndSyncCache`）显式做 cache 同步（inline asm：`DC CVAU` + `DSB ISH` +
+> `IC IVAU` + `DSB ISH` + `ISB`，按 `CTR_EL0` 行宽），**不依赖 `enable_ex` 做
+> cache 同步**，也不用 `__clear_cache` 外部符号（freestanding SRE 链接里没有）。
 
 ---
 
@@ -156,8 +160,8 @@ allocate(RW, 来自 2MiB 池)
 - `EJitCodePoolMemoryManager::allocate` 仿照 `InProcessMemoryManager`，用
   `BasicLayout` 计算各 segment 大小，但 slab **来自 `EJitCodePoolManager` 的 2MiB 对齐
   池**（而非 mmap）；**allocate 阶段绝不 `enable_ex`**。
-- `finalize()` **刻意不做任何 mprotect**；也不调用 `InvalidateInstructionCache`（由
-  `enable_ex` 负责）。
+- `finalize()` **刻意不做任何 mprotect**；也不调用 `InvalidateInstructionCache`
+  （由 SRE seal 回调 `sealAndSyncCache` 负责：`enable_ex` + cache 同步，见 §3）。
 - 真正的 RW→RX 封固时机按模式不同：
   - **4K 模式（默认）**：在 `finalize()` 中（所有写入/relocation/fixup 完成后）对该
     allocation 覆盖到的 4K 页逐页 `enable_ex`；任一页失败则 `finalize` 返回 Error，
