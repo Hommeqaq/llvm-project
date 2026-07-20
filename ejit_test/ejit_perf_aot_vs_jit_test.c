@@ -130,11 +130,25 @@ int main(int argc, char **argv) {
   uint64_t pg_aot = bench1(perf_globals, 0); // AOT (before activate)
   uint32_t pg_aot_r = perf_globals(0);
   ejit_activate("pg", 0);
-  uint32_t pg_jit_r = perf_globals(0); // first call compiles
+  (void)perf_globals(0); // trigger compile (AOT fallback in async)
+  uint32_t pg_jit_r;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  ejit_drain_taskpool();
+  {
+    ejit_drain_taskpool();
+    ejit_taskpool_stats_t st;
+    memset(&st, 0, sizeof(st));
+    ejit_taskpool_get_stats(&st);
+    uint64_t hits_before = st.cacheHits;
+    pg_jit_r = perf_globals(0); // JIT cache-hit
+    ejit_taskpool_get_stats(&st);
+    VERIFY(st.cacheHits > hits_before,
+           "perf_globals JIT compiled (compileFailed=%llu)",
+           (unsigned long long)st.compileFailed);
+  }
+#else
+  pg_jit_r = perf_globals(0); // sync: first call already JIT
 #endif
-  uint64_t pg_jit = bench1(perf_globals, 0); // JIT cache-hit
+  uint64_t pg_jit = bench1(perf_globals, 0);
   VERIFY(pg_aot_r == pg_jit_r, "perf_globals AOT=%u JIT=%u", pg_aot_r, pg_jit_r);
   report("perf_globals", pg_aot, pg_jit);
 
@@ -146,11 +160,25 @@ int main(int argc, char **argv) {
   uint64_t pf_aot = bench2(perf_fold, x, 0); // AOT
   uint32_t pf_aot_r = perf_fold(x, 0);
   ejit_activate("pf", 0);
-  uint32_t pf_jit_r = perf_fold(x, 0); // first call compiles
+  (void)perf_fold(x, 0); // trigger compile (AOT fallback in async)
+  uint32_t pf_jit_r;
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  ejit_drain_taskpool();
+  {
+    ejit_drain_taskpool();
+    ejit_taskpool_stats_t st;
+    memset(&st, 0, sizeof(st));
+    ejit_taskpool_get_stats(&st);
+    uint64_t hits_before = st.cacheHits;
+    pf_jit_r = perf_fold(x, 0); // JIT cache-hit
+    ejit_taskpool_get_stats(&st);
+    VERIFY(st.cacheHits > hits_before,
+           "perf_fold JIT compiled (compileFailed=%llu)",
+           (unsigned long long)st.compileFailed);
+  }
+#else
+  pf_jit_r = perf_fold(x, 0); // sync: first call already JIT
 #endif
-  uint64_t pf_jit = bench2(perf_fold, x, 0); // JIT cache-hit
+  uint64_t pf_jit = bench2(perf_fold, x, 0);
   VERIFY(pf_aot_r == pf_jit_r, "perf_fold AOT=%u JIT=%u", pf_aot_r, pf_jit_r);
   report("perf_fold", pf_aot, pf_jit);
 

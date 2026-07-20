@@ -120,15 +120,32 @@ int main(int argc, char **argv) {
   ejit_dump_func("got_probe");
 
   //--- Step 1: activate + first call triggers JIT compile (overflow check) --
+  // Async/shared-taskpool: the first call returns the AOT fallback (compile
+  // happens in the worker). So compile SUCCESS (no relocation overflow) is
+  // verified via the cache-hit delta after drain, not the first call's result.
   ejit_activate("probe", idx);
-  uint32_t r1 = got_probe(idx);
+  (void)got_probe(idx); // trigger compile
+  printf("\n--- Step 1: compile + correctness (relocation overflow check) ---\n");
 #ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_drain_taskpool();
+  ejit_taskpool_stats_t st;
+  memset(&st, 0, sizeof(st));
+  ejit_taskpool_get_stats(&st);
+  uint64_t hits_before = st.cacheHits;
+#else
+  uint64_t hits_before = 0;
+  (void)hits_before;
 #endif
-  printf("\n--- Step 1: compile + correctness (relocation overflow check) ---\n");
+  uint32_t r1 = got_probe(idx); // after drain: JIT cache-hit
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  ejit_taskpool_get_stats(&st);
+  VERIFY(st.cacheHits > hits_before,
+         "JIT compiled & cached (cacheHit after drain; compileFailed=%llu)",
+         (unsigned long long)st.compileFailed);
+#endif
   VERIFY(r1 == expected, "got_probe(%u) JIT = %u (expected %u)", idx, r1,
          expected);
-  printf("  (wrong result / compile FAIL here => dso_local=true caused a "
+  printf("  (no cacheHit / compileFailed>0 => dso_local=true caused a "
          "relocation overflow: slab out of adrp reach)\n");
 
   //--- Step 2: dump the specialized asm for :got: inspection ----------------
