@@ -35,7 +35,7 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_external_idx_test` | External cellIdx with multi-dim arrays |
 | `ejit_inline_asm_test` | AArch64 inline asm inside an `ejit_entry` function |
 | `ejit_jit_verify_test` | JIT correctness: constant folding, dead branch elimination |
-| `ejit_got_probe_test` | dso_local/GOT verification demo: relocation-overflow check + specialized-asm `:got:` dump + AOT-vs-JIT delta. Verifies the dso_local experiment (commit 33754cfdc82e). |
+| `ejit_got_probe_test` | Multi-core bare-metal dso_local/GOT verification (entry `test_ejit_got_probe`, no main, input `g_ci`): relocation-overflow check + specialized-asm `:got:` dump + AOT-vs-JIT measure. Worker core idles; non-worker cores verify. Mirrors testcase.log structure. Verifies the dso_local experiment (commit 33754cfdc82e). |
 | `ejit_lifecycle_test` | ejit_period_lc: deactivate/activate pairing |
 | `ejit_multidim_test` | 2D multi-dim array with external cellIdx |
 | `ejit_multi_tu_test` | Two TUs each with ejit_entry + period globals, linked together (registry no-duplicate-symbol regression) |
@@ -44,7 +44,7 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_nested_struct_test` | 2-level and 3-level nested struct may_const |
 | `ejit_opt_level_test` | L1/L2/L3 optimization level validation |
 | `ejit_perf_bench` | Performance benchmark: JIT compile time, cache hit latency |
-| `ejit_perf_aot_vs_jit_test` | AOT-vs-JIT per-call benchmark (ejit_taskpool_trace_now = SRE_CycleCountGet64 on target): contrasts a GOT-heavy shape (perf_globals) vs an amplified-specialization shape (perf_fold, n=64 foldable loop). Shows when specialization wins. |
+| `ejit_perf_aot_vs_jit_test` | Multi-core bare-metal AOT-vs-JIT benchmark (entry `test_ejit_perf`, no main, input `g_ci`, SRE_CycleCountGet64 timing): contrasts a GOT-heavy shape (perf_globals, 8 external globals) vs an amplified-specialization shape (perf_fold, n=64 foldable loop, no external globals). Worker core idles; non-worker cores measure. Mirrors testcase.log structure. |
 | `ejit_ptr_period_test` | Pointer-type ejit_period_arr and ejit_period (NEW) |
 | `ejit_trace_test` | Runtime trace: JIT dispatch, fallback, lifecycle hooks |
 
