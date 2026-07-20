@@ -167,10 +167,8 @@ int test_ejit_got_probe(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
              "up to 6 GOT loads (dso_local=false) / 0 (dso_local=true)\n",
              core);
 
-  init_data();
-  SRE_printf("[BENCH][core=%u] data initialized (probeA..F + probeArr)\n",
-             core);
-
+  // call_init_array + ejit_init run on every core; the fork below splits by
+  // current core (worker idles, verifier sets up data + verifies).
   SRE_printf("[BENCH][core=%u] call_init_array_functions begin\n", core);
   call_init_array_functions();
   SRE_printf("[BENCH][core=%u] call_init_array_functions end\n", core);
@@ -198,6 +196,12 @@ int test_ejit_got_probe(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
                core);
     idle_forever(core, "worker");
   }
+
+  //--- Verifier core: set up the shared data, then verify. (Worker idled
+  //--- above.) Data is EJIT_SHARED_SECTION_ATTR so the worker reads it.
+  init_data();
+  SRE_printf("[BENCH][core=%u] data initialized (probeA..F + probeArr)\n",
+             core);
 
   //--- Step 2 setup: enable asm capture BEFORE the first compile ---------
   // The dump name must match the ejit_entry function name exactly.

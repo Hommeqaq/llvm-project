@@ -128,11 +128,15 @@ static void init_data(void) {
   // cellType=0xFD on the primary cell).
   g_trpCfg[g_ti].trpType = 1u;
   g_trpCfg[g_ti].activeBeams = 0u;
-  // ci2's cellType is set in step 3 (0xEC for the recompile test); zero it
-  // here so the initial state is deterministic.
-  g_cellCfg[g_ci2].cellType = 0u;
-  g_cellCfg[g_ci2].cellId = 0u;
-  g_cellCfg[g_ci2].trafficLoad = 0u;
+  // ci2's cellType is set in step 3 (0xEC for the recompile test). Only zero
+  // ci2's entry when it is a DIFFERENT cell from g_ci; otherwise (g_ci2 ==
+  // g_ci) this would overwrite the 0xFD just written above -> cellType reads
+  // back 0 and Step1/2 fail. (BSS is already 0, so skipping is harmless.)
+  if (g_ci2 != g_ci) {
+    g_cellCfg[g_ci2].cellType = 0u;
+    g_cellCfg[g_ci2].cellId = 0u;
+    g_cellCfg[g_ci2].trafficLoad = 0u;
+  }
   dbg_print_period("init_data after write");
 }
 
@@ -153,9 +157,13 @@ int test_ejit_jit_verify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   SRE_printf("[BENCH][core=%u] enter cell=%u trp=%u ci2=%u\n", core, cellIdx,
              trpIdx, ci2);
 
-  init_data();
-  SRE_printf("[BENCH][core=%u] data initialized (cellCfg + trpCfg)\n", core);
-
+  // call_init_array + ejit_init run on EVERY core. The first core to reach
+  // ejit_init becomes the shared compile worker; others attach. The fork below
+  // splits by current core: the worker core ONLY serves compiles (ejit_init
+  // + idle), the verifier core sets up the data (init_data) and runs the
+  // checks. init_data runs on the verifier only - the data is cross-core
+  // shared (EJIT_SHARED_SECTION_ATTR), so the worker reads what the verifier
+  // wrote.
   SRE_printf("[BENCH][core=%u] call_init_array_functions begin\n", core);
   call_init_array_functions();
   SRE_printf("[BENCH][core=%u] call_init_array_functions end\n", core);
@@ -185,6 +193,13 @@ int test_ejit_jit_verify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
                core);
     idle_forever(core, "worker");
   }
+
+  //--- Verifier core: set up the shared period-array data, then verify. ---
+  // (The worker core idled above and never reaches here.) The data globals
+  // are EJIT_SHARED_SECTION_ATTR, so the worker reads these values when it
+  // specializes.
+  init_data();
+  SRE_printf("[BENCH][core=%u] data initialized (cellCfg + trpCfg)\n", core);
 
   //--- Step 1: cell cellIdx compile + cache hit ---------------------------
   // cellType=0xFD -> expect 1000. First call returns AOT fallback and

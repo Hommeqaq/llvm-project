@@ -182,11 +182,8 @@ int test_ejit_perf(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   SRE_printf("[BENCH][core=%u] enter cell=%u calls=%u batches=%u\n", core,
              cellIdx, CALLS_PER_BATCH, MEASURE_BATCHES);
 
-  init_data();
-  SRE_printf("[BENCH][core=%u] data initialized (pg globals + pgPeriod + "
-             "pfCfg)\n",
-             core);
-
+  // call_init_array + ejit_init run on every core; the fork below splits by
+  // current core (worker idles, verifier sets up data + measures).
   SRE_printf("[BENCH][core=%u] call_init_array_functions begin\n", core);
   call_init_array_functions();
   SRE_printf("[BENCH][core=%u] call_init_array_functions end\n", core);
@@ -214,6 +211,13 @@ int test_ejit_perf(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
                core);
     idle_forever(core, "worker");
   }
+
+  //--- Verifier core: set up the shared data, then measure. (Worker idled
+  //--- above.) Data is EJIT_SHARED_SECTION_ATTR so the worker reads it.
+  init_data();
+  SRE_printf("[BENCH][core=%u] data initialized (pg globals + pgPeriod + "
+             "pfCfg)\n",
+             core);
 
   //--- perf_globals: GOT-heavy -------------------------------------------
   ejit_status_t pgRc = ejit_activate("pg", cellIdx);
