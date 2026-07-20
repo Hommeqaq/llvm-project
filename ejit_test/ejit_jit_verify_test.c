@@ -282,112 +282,21 @@ int test_ejit_jit_verify(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
          (unsigned long long)s1.asyncCompiles,
          (unsigned long long)s2.asyncCompiles);
 
-  //--- Step 3: recompile with a second cellIdx (different cellType) ------
-  // cellType=0xEC -> expect 999. A different cellIdx with a different
-  // may_const value produces a fresh specialization.
-  SRE_printf("\n[BENCH][core=%u] --- Step 3: cell[%u] recompile "
-             "(cellType=0xEC, expect 999) ---\n",
-             core, ci2);
-
-  g_cellCfg[ci2].cellType = 0xECu;
-  ejit_status_t cell2Rc = ejit_activate("cell", ci2);
-  SRE_printf("[BENCH][core=%u] activate cell[%u] rc=%d active=%u\n", core, ci2,
-             (int)cell2Rc, (unsigned)ejit_is_active("cell", ci2));
-  if (cell2Rc != EJIT_OK)
-    idle_forever(core, "activate-cell2-failed");
-
-  SRE_printf("[BENCH][core=%u] first cell2 call: enqueue or join pending "
-             "compile\n",
-             core);
-  uint32_t r3First = jit_cell_check_ejit(ci2);
-  SRE_printf("[BENCH][core=%u] cell2 first=%u (AOT fallback, expect 999)\n",
-             core, r3First);
-
-  SRE_TaskDelay(WARMUP_COMPILE_DELAY_TICKS);
-  if (!wait_for_compile(core))
-    idle_forever(core, "cell2-compile-timeout");
-
-  uint32_t r3Hit = jit_cell_check_ejit(ci2);
-  SRE_printf("[BENCH][core=%u] cell2 stable hit=%u (JIT, expect 999)\n", core,
-             r3Hit);
-  VERIFY(r3Hit == 999u, "step3 jit_cell_check_ejit(%u)=%u (expected 999)",
-         ci2, r3Hit);
-
-  ejit_taskpool_stats_t s3;
-  ejit_taskpool_get_stats(&s3);
-  SRE_printf("[BENCH][core=%u] step3 stats: ready=%u hits=%llu "
-             "compiles=%llu\n",
-             core, s3.readyEntries, (unsigned long long)s3.cacheHits,
-             (unsigned long long)s3.asyncCompiles);
-  VERIFY(s3.asyncCompiles >= s2.asyncCompiles + 1u,
-         "step3 JIT compiles increased (before=%llu after=%llu)",
-         (unsigned long long)s2.asyncCompiles,
-         (unsigned long long)s3.asyncCompiles);
-
-  //--- Step 4: deactivate/reactivate with changed cellType -> recompile --
-  // Change cellType 0xFD->0xEC on the primary cellIdx, then deactivate and
-  // reactivate. The stale specialization is invalidated and a fresh compile
-  // is dispatched; the stable JIT hit now returns 999.
-  SRE_printf("\n[BENCH][core=%u] --- Step 4: cell[%u] deactivate/reactivate "
-             "(cellType 0xFD->0xEC, expect 999) ---\n",
-             core, cellIdx);
-
-  ejit_status_t deactRc = ejit_deactivate("cell", cellIdx);
-  SRE_printf("[BENCH][core=%u] deactivate cell[%u] rc=%d active=%u\n", core,
-             cellIdx, (int)deactRc,
-             (unsigned)ejit_is_active("cell", cellIdx));
-
-  g_cellCfg[cellIdx].cellType = 0xECu;
-
-  ejit_status_t reactRc = ejit_activate("cell", cellIdx);
-  SRE_printf("[BENCH][core=%u] reactivate cell[%u] rc=%d active=%u\n", core,
-             cellIdx, (int)reactRc,
-             (unsigned)ejit_is_active("cell", cellIdx));
-  if (reactRc != EJIT_OK)
-    idle_forever(core, "reactivate-cell-failed");
-
-  SRE_printf("[BENCH][core=%u] first reactivated call: enqueue or join pending "
-             "compile\n",
-             core);
-  uint32_t r4First = jit_cell_check_ejit(cellIdx);
-  SRE_printf("[BENCH][core=%u] reactivated first=%u (AOT fallback, expect "
-             "999)\n",
-             core, r4First);
-
-  SRE_TaskDelay(WARMUP_COMPILE_DELAY_TICKS);
-  if (!wait_for_compile(core))
-    idle_forever(core, "reactivate-compile-timeout");
-
-  uint32_t r4Hit = jit_cell_check_ejit(cellIdx);
-  SRE_printf("[BENCH][core=%u] reactivated stable hit=%u (JIT, expect 999)\n",
-             core, r4Hit);
-  VERIFY(r4Hit == 999u,
-         "step4 jit_cell_check_ejit(%u) after type change=%u (expected 999)",
-         cellIdx, r4Hit);
-
-  ejit_taskpool_stats_t s4;
-  ejit_taskpool_get_stats(&s4);
-  SRE_printf("[BENCH][core=%u] step4 stats: ready=%u hits=%llu "
-             "compiles=%llu\n",
-             core, s4.readyEntries, (unsigned long long)s4.cacheHits,
-             (unsigned long long)s4.asyncCompiles);
-  VERIFY(s4.asyncCompiles > s3.asyncCompiles,
-         "step4 recompile after deactivate/reactivate (before=%llu after=%llu)",
-         (unsigned long long)s3.asyncCompiles,
-         (unsigned long long)s4.asyncCompiles);
-
   //--- Summary -----------------------------------------------------------
+  // Step 3/4 (modify-then-activate / deactivate-reactivate with changed
+  // cellType) removed: with inline-cache, modifying period values after
+  // activate is ineffective. The JIT compiled at activate is single-version.
   SRE_printf("\n--- EJIT JIT Verify Results ---\n");
   SRE_printf("[BENCH][core=%u] final stats ready=%u hits=%llu compiles=%llu "
              "enqueues=%llu pending=%u alreadyPending=%llu "
              "compileFailed=%llu publishFailed=%llu disabled=%llu\n",
-             core, s4.readyEntries, (unsigned long long)s4.cacheHits,
-             (unsigned long long)s4.asyncCompiles,
-             (unsigned long long)s4.asyncEnqueues, s4.pendingEntries,
-             (unsigned long long)s4.alreadyPending,
-             (unsigned long long)s4.compileFailed,
-             (unsigned long long)s4.publishFailed,
-             (unsigned long long)s4.instanceDisabled);
+             core, s2.readyEntries, (unsigned long long)s2.cacheHits,
+             (unsigned long long)s2.asyncCompiles,
+             (unsigned long long)s2.asyncEnqueues, s2.pendingEntries,
+             (unsigned long long)s2.alreadyPending,
+             (unsigned long long)s2.compileFailed,
+             (unsigned long long)s2.publishFailed,
+             (unsigned long long)s2.instanceDisabled);
 
   if (failures == 0u) {
     SRE_printf("[BENCH][core=%u] PASS: all JIT verify checks passed\n", core);
