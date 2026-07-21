@@ -288,12 +288,18 @@ void ejit_print_dumped(const char *name);
 /// ejit_dump_func). Returns 1 if it matches, 0 otherwise.
 int ejit_is_dump_target(const char *name);
 
-/// Dump raw bytes of post-JITLink code as hex (4 bytes/line), for offline
-/// disassembly. Shows the FINAL machine code in the slab (including JITLink-
-/// inserted stubs: ADRP+LDR+BR for out-of-range BL calls). AArch64
-/// instructions are always little-endian in memory; bytes are printed in
-/// memory order (LE), ready for `aarch64*-objdump -D -b binary -m aarch64`.
-void ejit_dump_code_hex(const void *addr, uint32_t size);
+/// Capture post-JITLink raw bytes (funcPtr, size bytes) into the dump store
+/// under \p name. Called automatically from compileCold when the dump filter
+/// matches. Does NOT print - use ejit_print_dumped_code() later. The stored
+/// bytes are the FINAL machine code in the slab (including JITLink-inserted
+/// stubs: ADRP+LDR+BR for out-of-range BL calls).
+void ejit_capture_code(const char *name, const void *addr, uint32_t size);
+
+/// Print the stored post-link code hex for \p name through the platform log,
+/// 4 bytes/line (LE memory order for AArch64 instructions). Use after compile
+/// + ejit_capture_code. Feed the hex to `aarch64*-objdump -D -b binary -m
+/// aarch64` for offline disassembly. NULL/"" lists available captures.
+void ejit_print_dumped_code(const char *name);
 
 /// Runtime diagnostic log level. Mirrors the EJIT_DIAG* macro thresholds.
 ///   EJIT_LOG_OFF    — no diagnostic output

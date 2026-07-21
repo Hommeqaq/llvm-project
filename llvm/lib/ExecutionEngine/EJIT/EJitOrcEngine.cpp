@@ -273,11 +273,12 @@ bool ejit_is_dump_target_impl(const char *name) {
   return filter == name;
 }
 
-/// Saved IR+ASM for a captured specialization (latest per function name).
+/// Saved IR+ASM+post-link-code for a captured specialization (latest per name).
 struct DumpEntry {
   uint64_t cacheKey = 0;
   std::string IR;
   std::string ASM;
+  std::string Code; // post-JITLink raw bytes (func code + stubs + GOT)
 };
 
 // Process-wide store of captured IR+ASM, filled by the IR transform layer
@@ -287,6 +288,49 @@ struct DumpEntry {
 // running in the same process image (addresses are logged to diagnose this).
 static DumpMutexType gDumpMutex;
 static std::map<std::string, DumpEntry> gDumpStore;
+
+/// Capture post-JITLink raw bytes (funcPtr, size bytes) into the dump store
+/// under \p fnName. Called from compileCold after JITLink finalizes. Stored
+/// alongside the pre-link IR/ASM; printed later via ejit_print_dumped_code().
+void captureCodeDump(const std::string &fnName, const void *funcPtr,
+                     uint32_t size) {
+  if (!funcPtr || size == 0)
+    return;
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  auto it = gDumpStore.find(fnName);
+  if (it == gDumpStore.end())
+    return; // no prior IR/ASM capture -> skip
+  const auto *bytes = static_cast<const char *>(funcPtr);
+  it->second.Code.assign(bytes, size);
+  EJIT_DIAG_DEBUG("captureCodeDump func=%s codeBytes=%u", fnName.c_str(), size);
+}
+
+/// Print the stored post-link code hex for \p name through EJIT_DIAG, one
+/// 4-byte line at a time (LE memory order for AArch64 instructions).
+void printDumpedCode(const char *name) {
+  bool hasName = name && name[0];
+  std::lock_guard<DumpMutexType> lock(gDumpMutex);
+  if (hasName) {
+    auto it = gDumpStore.find(name);
+    if (it == gDumpStore.end() || it->second.Code.empty()) {
+      EJIT_DIAG("print_dumped_code: no code capture for %s", name);
+      return;
+    }
+    const auto &code = it->second.Code;
+    EJIT_DIAG("=== post-link code hex dump name=%s size=%zu ===",
+              name, code.size());
+    for (size_t i = 0; i + 3 < code.size(); i += 4) {
+      auto b = reinterpret_cast<const uint8_t *>(code.data() + i);
+      EJIT_DIAG("  %08x: %02x %02x %02x %02x",
+                static_cast<unsigned>(i), b[0], b[1], b[2], b[3]);
+    }
+    EJIT_DIAG("=== post-link code hex dump end ===");
+    return;
+  }
+  EJIT_DIAG("print_dumped_code: %zu entries", gDumpStore.size());
+  for (auto &kv : gDumpStore)
+    EJIT_DIAG("  %s: code=%zu bytes", kv.first.c_str(), kv.second.Code.size());
+}
 
 static void clearLocalDumpStore() {
   std::lock_guard<DumpMutexType> lock(gDumpMutex);

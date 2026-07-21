@@ -425,6 +425,12 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
   // (the executable segment) + 512 bytes extra to catch nearby stubs/GOT
   // entries in the finalize section. Use `aarch64*-objdump -D -b binary -m
   // aarch64` on the hex bytes to disassemble offline.
+  // If this function matches the dump filter (set by ejit_dump_func), capture
+  // the post-JITLink slab bytes into the dump store (does NOT print). The
+  // stored bytes are the FINAL machine code, including JITLink-inserted stubs
+  // (ADRP+LDR+BR for out-of-range BL calls). Print later via
+  // ejit_print_dumped_code("name"). The dump size is the exact codeSize from
+  // the code pool + 512 bytes extra for nearby stubs/GOT.
   if (ejit_is_dump_target(funcName.c_str())) {
     uint32_t dumpSize = 2048; // fallback
 #ifdef EJIT_SRE_CODE_POOL
@@ -438,7 +444,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
       dumpSize = static_cast<uint32_t>(info.codeSize) + 512;
     }
 #endif
-    ejit_dump_code_hex(funcPtr, dumpSize);
+    ejit_capture_code(funcName.c_str(), funcPtr, dumpSize);
   }
 
   return funcPtr;

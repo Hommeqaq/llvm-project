@@ -1110,26 +1110,29 @@ void ejit_print_dumped(const char *name) {
   printDumped(name);
 }
 
-// Implemented in EJitOrcEngine.cpp (has access to gDumpFuncFilter).
+// Implemented in EJitOrcEngine.cpp (has access to gDumpFuncFilter + gDumpStore).
 extern bool ejit_is_dump_target_impl(const char *name);
+extern void captureCodeDump(const std::string &fnName, const void *funcPtr,
+                           uint32_t size);
+extern void printDumpedCode(const char *name);
 
 int ejit_is_dump_target(const char *name) {
   return ejit_is_dump_target_impl(name) ? 1 : 0;
 }
 
-void ejit_dump_code_hex(const void *addr, uint32_t size) {
-  if (!addr || size == 0)
+/// Capture post-JITLink raw bytes into the dump store (does NOT print).
+/// Called from compileCold after JITLink. Print later via
+/// ejit_print_dumped_code(name).
+void ejit_capture_code(const char *name, const void *addr, uint32_t size) {
+  if (!name || !addr || size == 0)
     return;
-  const uint8_t *p = static_cast<const uint8_t *>(addr);
-  EJIT_DIAG("=== post-link code hex dump addr=%p size=%u ===", addr, size);
-  for (uint32_t i = 0; i + 3 < size; i += 4) {
-    // AArch64 instructions are always little-endian in memory; print bytes
-    // in memory order (LE) for offline objdump disassembly.
-    EJIT_DIAG("  %08x: %02x %02x %02x %02x",
-              static_cast<unsigned>(reinterpret_cast<uintptr_t>(addr) + i),
-              p[i], p[i + 1], p[i + 2], p[i + 3]);
-  }
-  EJIT_DIAG("=== post-link code hex dump end ===");
+  captureCodeDump(std::string(name), addr, size);
+}
+
+/// Print the stored post-link code hex for \p name. Use after compile +
+/// ejit_capture_code. Outputs 4 bytes/line (LE, for offline objdump).
+void ejit_print_dumped_code(const char *name) {
+  printDumpedCode(name);
 }
 
 // Sentinel returned when no owner core is elected (e.g. not initialized or the
