@@ -421,11 +421,25 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
   // If this function matches the dump filter (set by ejit_dump_func), dump
   // the post-JITLink slab as hex. This shows the FINAL machine code,
   // including JITLink-inserted stubs (ADRP+LDR+BR) for out-of-range BL calls
-  // to .text callees. Dump 2048 bytes to cover the function code + nearby
-  // stubs/GOT entries. Use `aarch64*-objdump -D -b binary -m aarch64` on the
-  // hex bytes to disassemble offline.
-  if (ejit_is_dump_target(funcName.c_str()))
-    ejit_dump_code_hex(funcPtr, 2048);
+  // to .text callees. The dump size is the exact codeSize from the code pool
+  // (the executable segment) + 512 bytes extra to catch nearby stubs/GOT
+  // entries in the finalize section. Use `aarch64*-objdump -D -b binary -m
+  // aarch64` on the hex bytes to disassemble offline.
+  if (ejit_is_dump_target(funcName.c_str())) {
+    uint32_t dumpSize = 2048; // fallback
+#ifdef EJIT_SRE_CODE_POOL
+    ejit::EJitCompiledCodeInfo info;
+    if (jitEngine_ && jitEngine_->findCodeRange(funcPtr, info) && info.codeSize > 0) {
+      EJIT_DIAG("dump: codeStart=0x%llx codeSize=%llu poolBase=0x%llx poolSize=%llu",
+                (unsigned long long)info.codeStart,
+                (unsigned long long)info.codeSize,
+                (unsigned long long)info.poolBase,
+                (unsigned long long)info.poolSize);
+      dumpSize = static_cast<uint32_t>(info.codeSize) + 512;
+    }
+#endif
+    ejit_dump_code_hex(funcPtr, dumpSize);
+  }
 
   return funcPtr;
 }
