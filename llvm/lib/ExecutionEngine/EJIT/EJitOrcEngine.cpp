@@ -604,8 +604,15 @@ EJitOrcEngine::Create(const Config &config,
     return JTMBOrErr.takeError();
   }
 
-  // Use Large code model so JITLink can generate 64-bit absolute relocations.
-  JTMBOrErr->setCodeModel(CodeModel::Large);
+  // Use Small code model so data accesses use ADRP+LDR (2 insns/global, ±4GB
+  // PC-relative) instead of movz/movk absolute (5 insns/global). The JIT slab
+  // is ~1.5-2.2GB from .text (within ADRP's ±4GB range), confirmed by
+  // compileFailed=0 with dso_local=true. Function calls are always BL on
+  // AArch64 (unaffected by code model); JITLink auto-stubs out-of-range BL.
+  // With Large, the 3 extra movz/movk instructions per global access eaten
+  // the specialization savings (fewer BBs / folded branches). Small makes
+  // the per-global cost match AOT (ADRP+LDR), so specialization gains show.
+  JTMBOrErr->setCodeModel(CodeModel::Small);
 
   // Build a TargetMachine (same options the JIT compiles with) for the
   // name-filtered ASM diagnostic dump. Failure is non-fatal — the dump is
