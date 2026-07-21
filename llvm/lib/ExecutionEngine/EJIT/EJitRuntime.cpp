@@ -1110,6 +1110,28 @@ void ejit_print_dumped(const char *name) {
   printDumped(name);
 }
 
+// Implemented in EJitOrcEngine.cpp (has access to gDumpFuncFilter).
+extern bool ejit_is_dump_target_impl(const char *name);
+
+int ejit_is_dump_target(const char *name) {
+  return ejit_is_dump_target_impl(name) ? 1 : 0;
+}
+
+void ejit_dump_code_hex(const void *addr, uint32_t size) {
+  if (!addr || size == 0)
+    return;
+  const uint8_t *p = static_cast<const uint8_t *>(addr);
+  EJIT_DIAG("=== post-link code hex dump addr=%p size=%u ===", addr, size);
+  for (uint32_t i = 0; i + 3 < size; i += 4) {
+    // AArch64 instructions are always little-endian in memory; print bytes
+    // in memory order (LE) for offline objdump disassembly.
+    EJIT_DIAG("  %08x: %02x %02x %02x %02x",
+              static_cast<unsigned>(reinterpret_cast<uintptr_t>(addr) + i),
+              p[i], p[i + 1], p[i + 2], p[i + 3]);
+  }
+  EJIT_DIAG("=== post-link code hex dump end ===");
+}
+
 // Sentinel returned when no owner core is elected (e.g. not initialized or the
 // shared taskpool has not bound state). Distinct from any valid core id.
 constexpr uint32_t kEJitInvalidOwnerCore = 0xFFFFFFFFu;

@@ -262,6 +262,17 @@ static bool getActiveDumpFilter(std::string &out) {
   return true;
 }
 
+/// Check whether \p name matches the current dump filter. Used by compileCold
+/// to decide whether to dump the post-link slab hex (showing JITLink stubs).
+bool ejit_is_dump_target_impl(const char *name) {
+  if (!name || !name[0])
+    return false;
+  std::string filter;
+  if (!getActiveDumpFilter(filter))
+    return false;
+  return filter == name;
+}
+
 /// Saved IR+ASM for a captured specialization (latest per function name).
 struct DumpEntry {
   uint64_t cacheKey = 0;

@@ -417,6 +417,16 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
 
   EJIT_DIAG("compile OK key=0x%016lx func=%s → pfn=%p", cacheKey,
             funcName.c_str(), funcPtr);
+
+  // If this function matches the dump filter (set by ejit_dump_func), dump
+  // the post-JITLink slab as hex. This shows the FINAL machine code,
+  // including JITLink-inserted stubs (ADRP+LDR+BR) for out-of-range BL calls
+  // to .text callees. Dump 2048 bytes to cover the function code + nearby
+  // stubs/GOT entries. Use `aarch64*-objdump -D -b binary -m aarch64` on the
+  // hex bytes to disassemble offline.
+  if (ejit_is_dump_target(funcName.c_str()))
+    ejit_dump_code_hex(funcPtr, 2048);
+
   return funcPtr;
 }
 

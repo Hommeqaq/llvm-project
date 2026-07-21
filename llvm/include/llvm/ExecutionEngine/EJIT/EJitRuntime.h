@@ -284,6 +284,17 @@ void ejit_dump_func(const char *name);
 /// NULL or "" only lists captured names; it does not dump all payloads.
 void ejit_print_dumped(const char *name);
 
+/// Check whether \p name matches the current dump filter (set by
+/// ejit_dump_func). Returns 1 if it matches, 0 otherwise.
+int ejit_is_dump_target(const char *name);
+
+/// Dump raw bytes of post-JITLink code as hex (4 bytes/line), for offline
+/// disassembly. Shows the FINAL machine code in the slab (including JITLink-
+/// inserted stubs: ADRP+LDR+BR for out-of-range BL calls). AArch64
+/// instructions are always little-endian in memory; bytes are printed in
+/// memory order (LE), ready for `aarch64*-objdump -D -b binary -m aarch64`.
+void ejit_dump_code_hex(const void *addr, uint32_t size);
+
 /// Runtime diagnostic log level. Mirrors the EJIT_DIAG* macro thresholds.
 ///   EJIT_LOG_OFF    — no diagnostic output
 ///   EJIT_LOG_INFO   — key events (default): init, compile begin/OK/FAIL,
