@@ -121,20 +121,37 @@ constexpr uint32_t kReady = static_cast<uint32_t>(EJitSharedInitState::Ready);
 /// cacheLookupNd block can also reference it.
 constexpr uint64_t kHashMul = 0x9e3779b97f4a7c15ULL;
 
-// Per-function inline-cache table (v2 sticky monomorphic). Process-static
-// storage, zero-filled by the loader (no dynamic init). One global slot per
-// funcIndex; written once (first resolution) and read forever. Indexed by
-// funcIndex only (no per-core dimension) - under EJIT_SRE_SHARED_CODE_POINTERS
-// off only the owner core uses the cache, and with it on all cores share the
-// one slot, so a single global copy suffices. See the header for the safety
-// model.
-EJitAtomicUPtr gEJitICache[EJIT_ICACHE_FUNC_SLOTS];
+// Per-function inline-cache slot-pointer table (v2 sticky monomorphic). Each
+// entry points at the wrapper's per-function @__ejit_icache_fn_<name> global -
+// an EJitAtomicUPtr holding the frozen specialization pointer - registered by
+// name at ejit_auto_register / .ejit_period time via ejit_register_icache_slot
+// (which calls ejitIcacheRegisterSlot). The wrapper reads its OWN global
+// directly (one acquire load + null-check + indirect call) with NO
+// ejit_icache_try call and NO per-call guards: the hit path is just a pointer
+// non-null check. icacheFill writes the specialization pointer THROUGH the
+// registered slot pointer on a successful resolve (one-shot CAS); icacheTry
+// (test/diagnostic only) reads it. Process-static, zero-filled by the loader
+// (entries start null = unregistered = probe misses = taskpool fallback). See
+// the header for the safety model.
+EJitAtomicUPtr *gIcacheFnSlots[EJIT_ICACHE_FUNC_SLOTS];
 
 } // namespace
 
+void llvm::ejit::ejitIcacheRegisterSlot(uint32_t funcIndex, void *slot) {
+  if (funcIndex >= EJIT_ICACHE_FUNC_SLOTS || !slot)
+    return;
+  gIcacheFnSlots[funcIndex] = reinterpret_cast<EJitAtomicUPtr *>(slot);
+}
+
 void llvm::ejit::ejitIcacheClearAll() {
+  // Unregister every slot: nulling the table entries makes all probes miss
+  // (icacheTry/icacheFill see no slot and bail), which is the "empty" state.
+  // We do NOT dereference the slot pointers here: in tests the slots are
+  // stack locals that may already be destroyed by the time a later test clears
+  // (e.g. if an ASSERT returned early and skipped the prior test's end-clear),
+  // so dereferencing would be a use-after-free. Production never calls this.
   for (uint32_t f = 0; f < EJIT_ICACHE_FUNC_SLOTS; ++f)
-    gEJitICache[f].storeRelaxed(0);
+    gIcacheFnSlots[f] = nullptr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -166,13 +183,19 @@ uint32_t EJitSharedTaskPool::instanceVersion(uint32_t dimType,
 //===----------------------------------------------------------------------===//
 // Per-function inline cache (v2 sticky monomorphic).
 //
-// icacheTry: a frozen read - one acquire load + null check. No version / dims /
-// generation re-validation: the slot is written once (first resolution) and
-// never refilled, so the pointer is always the correct (invariant)
+// The production hit path does NOT call icacheTry: the ejit_entry wrapper reads
+// its own @__ejit_icache_fn_<name> global directly (one acquire load + null
+// check + indirect call, no call, no per-call guards). icacheTry is retained
+// for unit tests and diagnostics. icacheFill writes the specialization pointer
+// THROUGH the registered slot pointer (gIcacheFnSlots[funcIndex]) on a
+// successful resolve; it is a frozen, one-shot fill - the slot is written once
+// and never refilled, so the pointer is always the correct (invariant)
 // specialization. Lifetime is safe because JIT code is never freed in
 // production; the safety gate auto-disables the cache if a releaser is wired
 // (v2 does no HP-scan retire). The code-sharing gate retains the cross-core
-// pointer discipline of resolveMatchedSlot.
+// pointer discipline of resolveMatchedSlot (relevant to icacheTry in non-shared
+// test builds; the wrapper's inline probe is only enabled under
+// EJIT_SRE_SHARED_CODE_POINTERS, where the gate is compile-time true).
 //===----------------------------------------------------------------------===//
 bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, void **outFn) {
   if (!outFn)
@@ -184,6 +207,10 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, void **outFn) {
   if (!icacheReclamationSafe_)
     return false;
   if (!state_ || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
+    return false;
+  // Unregistered function (no per-function slot global wired up): miss.
+  EJitAtomicUPtr *slot = gIcacheFnSlots[funcIndex];
+  if (!slot)
     return false;
   // The cache is only meaningful once the pool is Ready.
   if (state_->initState.loadAcquire() != kReady)
@@ -202,7 +229,7 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, void **outFn) {
     return false;
   // Frozen read: the slot is immutable after the one-shot fill, so a single
   // acquire load is correct with no re-validation.
-  uintptr_t p = gEJitICache[funcIndex].loadAcquire();
+  uintptr_t p = slot->loadAcquire();
   if (p == 0)
     return false;
   *outFn = reinterpret_cast<void *>(p);
@@ -214,12 +241,15 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr) {
     return;
   if (!state_ || !fnPtr || funcIndex >= EJIT_ICACHE_FUNC_SLOTS)
     return;
+  EJitAtomicUPtr *slot = gIcacheFnSlots[funcIndex];
+  if (!slot)
+    return; // unregistered function: nowhere to write.
   // One-shot: the first resolver wins. Later resolves carry the same invariant
   // pointer and no-op. compareExchange is acq_rel on success / acquire on
-  // failure, pairing with icacheTry's acquire load.
+  // failure, pairing with the wrapper's / icacheTry's acquire load.
   uintptr_t desired = reinterpret_cast<uintptr_t>(fnPtr);
   uintptr_t expected = 0;
-  (void)gEJitICache[funcIndex].compareExchange(expected, desired);
+  (void)slot->compareExchange(expected, desired);
 }
 
 void EJitSharedTaskPool::forEachCompiled(CompiledFuncCallback cb,

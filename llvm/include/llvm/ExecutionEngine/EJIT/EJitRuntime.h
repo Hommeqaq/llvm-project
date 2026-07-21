@@ -154,6 +154,15 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut);
 // funcIndex global; a capacity failure is recorded so ejit_init can fail.
 void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
+// Register the wrapper's per-function inline-cache slot (@__ejit_icache_fn_<name>
+// global address) by name. The runtime writes the frozen specialization pointer
+// through it on a successful resolve (icacheFill); the wrapper reads it directly
+// on the hit path (one atomic load + null-check + indirect call, no
+// ejit_icache_try call). Keys the slot by the SAME registry funcIndex assigned
+// by ejit_register_funcindex. Called by AOT auto-registration. A null slot or
+// capacity exhaustion is recorded; the slot stays null and the probe misses.
+void ejit_register_icache_slot(const char *funcName, void *slot);
+
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name
 // with multiple arrays is activated as a whole for that instance).

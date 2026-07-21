@@ -17,6 +17,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "gtest/gtest.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -2630,6 +2631,10 @@ TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool); // core 0 owner, Ready, code sharing off (owner-only).
   constexpr uint32_t kFunc = 3;
+  // Register a per-function icache slot (the wrapper's @__ejit_icache_fn_
+  // global, here a test-local stand-in) so icacheFill has somewhere to write.
+  std::atomic<uintptr_t> slot{0};
+  ejitIcacheRegisterSlot(kFunc, &slot);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
 
@@ -2672,6 +2677,8 @@ TEST_F(SharedTaskPoolTest, InlineCacheAutoDisablesWhenReclamationWired) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 3;
+  std::atomic<uintptr_t> slot{0};
+  ejitIcacheRegisterSlot(kFunc, &slot);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
 

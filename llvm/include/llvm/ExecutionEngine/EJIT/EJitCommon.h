@@ -64,6 +64,13 @@ constexpr const char *FN_REGISTER_PERIOD_ARRAY = "ejit_register_period_array";
 constexpr const char *FN_REGISTER_STATIC_VAR = "ejit_register_static_var";
 constexpr const char *FN_REGISTER_LIFECYCLE = "ejit_register_lifecycle";
 constexpr const char *FN_REGISTER_FUNCINDEX = "ejit_register_funcindex";
+// Per-function inline-cache slot registration: the wrapper's per-function
+// @__ejit_icache_fn_<name> global (a frozen, sticky specialization pointer) is
+// registered by name so the runtime can backfill it on a successful resolve
+// (icacheFill). The wrapper reads it directly with an inline atomic load - no
+// ejit_icache_try call - so the hit path is one load + null-check + indirect
+// call. Signature: void ejit_register_icache_slot(const char *name, void *slot).
+constexpr const char *FN_REGISTER_ICACHE_SLOT = "ejit_register_icache_slot";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET =
     "ejit_taskpool_compile_or_get";
 // Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper
@@ -79,11 +86,12 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
     "ejit_taskpool_compile_or_get_4d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
-// Per-function inline-cache probe (v2 sticky monomorphic). Called by the
-// ejit_entry wrapper BEFORE ejit_taskpool_compile_or_get when -ejit-inline-cache
-// is on. On a hit (*outFn set to a frozen specialization) the wrapper calls it
-// directly with NO ejit_taskpool_release_read; on a miss it falls through to
-// compile_or_get. Signature: i32 ejit_icache_try(i32 funcIndex, ptr outFn).
+// Per-function inline-cache probe (v2 sticky monomorphic). Test/diagnostic
+// entry point: the ejit_entry wrapper NO LONGER calls this - with
+// -ejit-inline-cache it reads its per-function @__ejit_icache_fn_<name> slot
+// directly (one atomic load + null-check + indirect call, no call, no per-call
+// guards). ejit_icache_try is retained for unit tests and diagnostics.
+// Signature: i32 ejit_icache_try(i32 funcIndex, ptr outFn).
 constexpr const char *FN_ICACHE_TRY = "ejit_icache_try";
 constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
 constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =

@@ -1,41 +1,48 @@
-; -ejit-inline-cache (ON): emits a jit_icache probe (ejit_icache_try) before
-; the taskpool compile_or_get call; the hit path (jit_icache_dispatch) calls the
-; cached specialization directly with NO ejit_taskpool_release_read. The probe
-; takes only (funcIndex, outFn) - no dims - so a hit pays no dim loads. Default
-; (OFF): the original 4-block wrapper, no icache. Idempotent: running the pass
-; twice does not duplicate the icache blocks. With -ejit-wrapper-timing the
-; icache hit path is instrumented (trace_now + trace_wrapper, sentinel status).
+; -ejit-inline-cache (ON): emits an inline probe DIRECTLY in the ejit_entry
+; wrapper - a load atomic of the per-function @__ejit_icache_fn_<name> slot +
+; null-check; the hit path (jit_icache_dispatch) calls the cached specialization
+; directly with NO ejit_icache_try call and NO ejit_taskpool_release_read. The
+; probe takes no dims, so a hit pays no dim loads. Default (OFF): the original
+; 4-block wrapper, no icache. Idempotent: running the pass twice does not
+; duplicate the probe. With -ejit-wrapper-timing the icache hit path is
+; instrumented (trace_now + trace_wrapper, sentinel status).
 
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -S %s | FileCheck %s --check-prefix=ICACHE
 ; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s --check-prefix=NOICACHE
 ; RUN: opt -passes=ejit-wrapper-gen,ejit-wrapper-gen -ejit-inline-cache -S %s | FileCheck %s --check-prefix=IDEM
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-wrapper-timing -S %s | FileCheck %s --check-prefix=TIMING
 
-; --- 1D entry: icache probe is ejit_icache_try(funcIndex, outFn) -- no dims. ---
+; --- 1D entry: inline probe = load atomic @__ejit_icache_fn + null-check; hit
+; --- calls the cached ptr directly (NO release_read). NO ejit_icache_try call. ---
 ; ICACHE-LABEL: define i32 @one_dim_entry(
-; ICACHE: call i32 @ejit_icache_try(i32 {{.*}}, ptr {{.*}})
+; ICACHE-NOT: ejit_icache_try
+; ICACHE: load atomic ptr, ptr @__ejit_icache_fn_one_dim_entry acquire, align 8
 ; ICACHE-LABEL: jit_icache_dispatch:
 ; ICACHE-NOT: call void @ejit_taskpool_release_read
+; ICACHE: call {{.*}} %ejit_ic_fn
 ; ICACHE: ret
 
-; --- 3D entry: same probe shape (no _Nd variant, no dims in the probe). ---
+; --- 3D entry: same probe shape (load atomic, no dims in the probe). ---
 ; ICACHE-LABEL: define i32 @three_dim_entry(
-; ICACHE: call i32 @ejit_icache_try(i32 {{.*}}, ptr {{.*}})
+; ICACHE-NOT: ejit_icache_try
+; ICACHE: load atomic ptr, ptr @__ejit_icache_fn_three_dim_entry acquire, align 8
 
 ; --- Default (flag OFF): no icache anywhere; original compile_or_get path. ---
 ; NOICACHE-LABEL: define i32 @one_dim_entry(
 ; NOICACHE-NOT: ejit_icache_try
+; NOICACHE-NOT: __ejit_icache_fn
+; NOICACHE-NOT: ejit_register_icache_slot
 ; NOICACHE: call i32 @ejit_taskpool_compile_or_get_1d(i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
 ; NOICACHE-NOT: ejit_icache_try
 
 ; --- Idempotent: two passes emit the probe exactly once. ---
 ; IDEM-LABEL: define i32 @one_dim_entry(
-; IDEM-COUNT-1: call i32 @ejit_icache_try(i32 {{.*}}, ptr {{.*}})
+; IDEM-COUNT-1: load atomic ptr, ptr @__ejit_icache_fn_one_dim_entry acquire, align 8
 
 ; --- Timing: the icache hit path is instrumented (trace_now + trace_wrapper). ---
 ; TIMING-LABEL: define i32 @one_dim_entry(
 ; TIMING: call i64 @ejit_taskpool_trace_now()
-; TIMING: call i32 @ejit_icache_try(i32 {{.*}}, ptr {{.*}})
+; TIMING: load atomic ptr, ptr @__ejit_icache_fn_one_dim_entry acquire, align 8
 ; TIMING: call i64 @ejit_taskpool_trace_now()
 ; TIMING-LABEL: jit_icache_dispatch:
 ; TIMING: call i64 @ejit_taskpool_trace_now()

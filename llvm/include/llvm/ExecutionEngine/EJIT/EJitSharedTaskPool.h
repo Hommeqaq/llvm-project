@@ -108,10 +108,18 @@ enum class EJitWorkerStep : uint32_t {
 #define EJIT_ICACHE_FUNC_SLOTS 64u
 #endif
 
-// Test/diagnostic: clear every icache slot. The table is process-static storage
-// shared across pool instances, so tests clear it between cases to avoid stale
-// cross-test leakage.
+// Test/diagnostic: clear every icache slot. The slot-pointer table is
+// process-static storage shared across pool instances, so tests clear it
+// between cases to avoid stale cross-test leakage.
 void ejitIcacheClearAll();
+
+// Register a per-function icache slot: \p slot is the address of the wrapper's
+// @__ejit_icache_fn_<name> global (an EJitAtomicUPtr). The runtime writes the
+// frozen specialization pointer through it on a successful resolve (icacheFill);
+// the wrapper reads it directly. Called from ejit_register_icache_slot (name->
+// funcIndex resolution) at ejit_auto_register / .ejit_period time. No-op for an
+// out-of-range funcIndex or null slot.
+void ejitIcacheRegisterSlot(uint32_t funcIndex, void *slot);
 
 class EJitSharedTaskPool {
 public:
@@ -386,17 +394,23 @@ public:
   bool isInstanceActive(uint32_t dimType, uint32_t instanceId) const;
 
   //--- per-function inline cache (v2 sticky monomorphic) ---------------------
-  // Probe the global icache. On a hit *outFn is set to a frozen, directly
-  // callable specialization (call it with NO releaseRead) and returns true; on
-  // a miss returns false. A single acquire load + null check on the common
-  // path - no version/dims/generation checks. Returns false when reclamation is
-  // not safe (releaser wired), the pool is not Ready, funcIndex is out of
-  // range, or this core may not read cross-core code (the code-sharing gate).
+  // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
+  // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
+  // directly - one acquire load + null-check + indirect call, NO ejit_icache_try
+  // call, NO per-call guards. icacheTry is retained for unit tests / diagnostics:
+  // on a hit it sets *outFn to the frozen specialization (call with NO
+  // releaseRead) and returns true; on a miss returns false. It keeps the
+  // reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
+  // (the latter matters in non-shared test builds; the wrapper's inline probe is
+  // only enabled under EJIT_SRE_SHARED_CODE_POINTERS, where the gate is
+  // compile-time true).
   bool icacheTry(uint32_t funcIndex, void **outFn);
-  // Fill the global icache slot with a freshly resolved specialization (call on
-  // a taskpool cache hit or a successful compile). One-shot: the first resolver
-  // wins; later resolves (same pointer, invariant) no-op. No-op when
-  // reclamation is not safe, funcIndex is out of range, or fnPtr is null.
+  // Fill the per-function icache slot (the wrapper's @__ejit_icache_fn_<name>
+  // global, reached through the registered slot pointer) with a freshly
+  // resolved specialization (call on a taskpool cache hit or a successful
+  // compile). One-shot: the first resolver wins; later resolves (same pointer,
+  // invariant) no-op. No-op when reclamation is not safe, the function is
+  // unregistered (no slot wired), funcIndex is out of range, or fnPtr is null.
   void icacheFill(uint32_t funcIndex, void *fnPtr);
 
   //--- consumer path (worker / test) -----------------------------------------

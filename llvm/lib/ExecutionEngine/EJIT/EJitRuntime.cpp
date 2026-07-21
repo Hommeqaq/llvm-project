@@ -328,6 +328,43 @@ void ejit_register_funcindex(const char *funcName, uint32_t *slotOut) {
   }
 }
 
+void ejit_register_icache_slot(const char *funcName, void *slot) {
+  // Wire the wrapper's per-function @__ejit_icache_fn_<name> slot into the
+  // runtime slot-pointer table, keyed by the SAME registry funcIndex
+  // ejit_register_funcindex assigns by name. The wrapper reads this slot
+  // directly on the icache hit path; icacheFill writes the frozen specialization
+  // pointer through it on resolve. Idempotent by name (resolveAssign is).
+  // A null slot or unresolvable name is recorded; the slot stays null and the
+  // wrapper's probe cleanly misses -> taskpool fallback.
+  if (!funcName || !slot) {
+    EJIT_DIAG("register_icache_slot reject: name=%p slot=%p",
+              (const void *)funcName, slot);
+    return;
+  }
+  EJIT_DIAG_VERBOSE("register_icache_slot name=%s", funcName);
+#ifdef EJIT_SRE_TASKPOOL
+  if (gEJIT && gEJIT->registrationFrozen()) {
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_INVALID_PARAM, "icache slot registration after init is frozen",
+        funcName);
+    EJIT_DIAG("register_icache_slot reject name=%s: registration frozen",
+              funcName);
+    return;
+  }
+#endif
+  uint32_t idx = EJitFuncRegistry::instance().resolveAssign(funcName);
+  if (idx == kEJitInvalidFuncIndex) {
+    EJitRegistrationStore::instance().recordError(
+        EJIT_ERR_CACHE_FULL, "funcIndex capacity exhausted for icache slot",
+        funcName);
+    EJIT_DIAG("register_icache_slot FAIL name=%s: funcIndex capacity exhausted",
+              funcName);
+    return;
+  }
+  ejitIcacheRegisterSlot(idx, slot);
+  EJIT_DIAG_VERBOSE("register_icache_slot OK name=%s idx=%u", funcName, idx);
+}
+
 ejit_status_t ejit_activate(const char *periodName, uint8_t cellIdx) {
   if (!gEJIT) {
     EJIT_DIAG("activate(%s,%u) failed: not initialized", periodName, cellIdx);
