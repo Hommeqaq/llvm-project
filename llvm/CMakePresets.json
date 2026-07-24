@@ -87,7 +87,8 @@
         "EJIT_DIAG_ENABLE": "ON",
         "EJIT_SRE_DIAG": "ON",
         "EJIT_DUMP_ASM": "ON",
-        "EJIT_STATS_ENABLE": "ON"
+        "EJIT_STATS_ENABLE": "ON",
+        "EJIT_ICACHE_DIM_SIZE": "8"
       }
     },
     {

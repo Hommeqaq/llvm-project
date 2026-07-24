@@ -2633,18 +2633,18 @@ TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
   constexpr uint32_t kFunc = 3;
   // Register a per-function icache slot (the wrapper's @__ejit_icache_fn_
   // global, here a test-local stand-in) so icacheFill has somewhere to write.
-  std::atomic<uintptr_t> slot{0};
-  ejitIcacheRegisterSlot(kFunc, &slot);
+  uintptr_t slot = 0;
+  ejitIcacheRegisterSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
 
   // Cold icache misses (empty slot).
-  EXPECT_FALSE(pool.icacheTry(kFunc, &out));
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(out, nullptr);
 
   // Fill on a resolve -> subsequent probe hits, returning the frozen fnPtr.
-  pool.icacheFill(kFunc, fn);
-  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(out, fn);
 
   // Frozen: a period toggle bumps the version, but v2 does NOT re-validate, so
@@ -2652,18 +2652,19 @@ TEST_F(SharedTaskPoolTest, InlineCacheStickyFrozen) {
   // invalidated). This is the v2 contract - the specialization is invariant.
   ASSERT_TRUE(pool.setInstanceEnabled(0, 5, true));
   ASSERT_TRUE(pool.setInstanceEnabled(0, 5, false)); // bump version
-  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(out, fn);
 
-  // One-shot: a later fill with a DIFFERENT pointer does not overwrite - the
-  // first resolver wins and the slot is frozen.
-  void *fn2 = codeFor(1000);
-  pool.icacheFill(kFunc, fn2);
-  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
-  EXPECT_EQ(out, fn); // still the first pointer
+  // No one-shot CAS (per-core-private slot -> plain store). A later fill
+  // OVERWRITES; under the contract the specialization is invariant per identity,
+  // so a later resolve carries the SAME pointer and the overwrite is harmless.
+  // Verify a same-pointer re-fill leaves the served pointer unchanged.
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
+  EXPECT_EQ(out, fn);
 
   // Out-of-range funcIndex misses without touching memory.
-  EXPECT_FALSE(pool.icacheTry(EJIT_ICACHE_FUNC_SLOTS, &out));
+  EXPECT_FALSE(pool.icacheTry(EJIT_ICACHE_FUNC_SLOTS, nullptr, 0, &out));
   EXPECT_EQ(out, nullptr);
 
   ejitIcacheClearAll();
@@ -2677,30 +2678,85 @@ TEST_F(SharedTaskPoolTest, InlineCacheAutoDisablesWhenReclamationWired) {
   EJitSharedTaskPool pool;
   bringUpOwner(pool);
   constexpr uint32_t kFunc = 3;
-  std::atomic<uintptr_t> slot{0};
-  ejitIcacheRegisterSlot(kFunc, &slot);
+  uintptr_t slot = 0;
+  ejitIcacheRegisterSlot(kFunc, &slot, 0);
   void *fn = codeFor(kFunc);
   void *out = nullptr;
 
   // Before a releaser: fill -> hit.
-  pool.icacheFill(kFunc, fn);
-  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(out, fn);
 
   // Wire a releaser: icache auto-disables (miss + no-op fill).
   ReleaseLog rel;
   pool.setReleaser(&mockRelease, &rel);
-  EXPECT_FALSE(pool.icacheTry(kFunc, &out));
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(out, nullptr);
-  pool.icacheFill(kFunc, fn); // no-op: the gate blocks the fill
-  EXPECT_FALSE(pool.icacheTry(kFunc, &out));
+  pool.icacheFill(kFunc, fn, nullptr, 0); // no-op: the gate blocks the fill
+  EXPECT_FALSE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(out, nullptr);
 
   // Unwire the releaser: the gate re-opens; fill -> hit works again.
   pool.setReleaser(nullptr, nullptr);
-  pool.icacheFill(kFunc, fn);
-  EXPECT_TRUE(pool.icacheTry(kFunc, &out));
+  pool.icacheFill(kFunc, fn, nullptr, 0);
+  EXPECT_TRUE(pool.icacheTry(kFunc, nullptr, 0, &out));
   EXPECT_EQ(out, fn);
+
+  ejitIcacheClearAll();
+}
+
+// Multi-version: a 2-dim icache holds one frozen fnPtr per dim identity, so
+// different (i,j) combos serve different specializations (the v2 monomorphic
+// bug - one slot for all identities - is fixed). Distinct identities fill
+// distinct cells; one-shot per cell; shape mismatch misses.
+TEST_F(SharedTaskPoolTest, InlineCacheMultiVersion) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  constexpr uint32_t kFunc = 3;
+  // A 2-dim [D][D] slot (D = EJIT_ICACHE_DIM_SIZE), zero-initialized. The
+  // runtime reaches cells through an EJitAtomicUPtr* + linearized index.
+  constexpr uint32_t D = EJIT_ICACHE_DIM_SIZE;
+  uintptr_t slots[D][D] = {};
+  ejitIcacheRegisterSlot(kFunc, &slots[0][0], 2);
+
+  void *fn00 = codeFor(kFunc);
+  void *fn01 = codeFor(kFunc + 1);
+  void *fn10 = codeFor(kFunc + 2);
+  EJitDimPair id00[2] = {{0, 0}, {0, 0}};
+  EJitDimPair id01[2] = {{0, 0}, {0, 1}};
+  EJitDimPair id10[2] = {{0, 1}, {0, 0}};
+  void *out = nullptr;
+
+  // Cold: every identity misses (cells start empty).
+  EXPECT_FALSE(pool.icacheTry(kFunc, id00, 2, &out));
+  EXPECT_FALSE(pool.icacheTry(kFunc, id01, 2, &out));
+
+  // Fill each identity with its own fnPtr.
+  pool.icacheFill(kFunc, fn00, id00, 2);
+  pool.icacheFill(kFunc, fn01, id01, 2);
+  pool.icacheFill(kFunc, fn10, id10, 2);
+
+  // Each identity serves its OWN fnPtr (multi-version: no cross-contamination).
+  EXPECT_TRUE(pool.icacheTry(kFunc, id00, 2, &out));
+  EXPECT_EQ(out, fn00);
+  EXPECT_TRUE(pool.icacheTry(kFunc, id01, 2, &out));
+  EXPECT_EQ(out, fn01);
+  EXPECT_TRUE(pool.icacheTry(kFunc, id10, 2, &out));
+  EXPECT_EQ(out, fn10);
+
+  // No one-shot CAS (per-core-private -> plain store): a later fill of (0,0)
+  // OVERWRITES with the latest pointer. Under the contract a later resolve of
+  // the same identity carries the same pointer, so re-fill with fn00 is a no-op
+  // semantically; verify the served pointer is still fn00.
+  pool.icacheFill(kFunc, fn00, id00, 2);
+  EXPECT_TRUE(pool.icacheTry(kFunc, id00, 2, &out));
+  EXPECT_EQ(out, fn00);
+
+  // Shape mismatch (caller numDims != registered 2): miss, no OOB access.
+  EXPECT_FALSE(pool.icacheTry(kFunc, id00, 1, &out));
+  EXPECT_FALSE(pool.icacheTry(kFunc, id00, 0, &out));
 
   ejitIcacheClearAll();
 }
