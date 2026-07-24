@@ -789,6 +789,20 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       auto *MissFallback = BasicBlock::Create(Ctx, "miss_fallback", MissFn);
       auto *MissDispatch = BasicBlock::Create(Ctx, "miss_dispatch", MissFn);
       spliceOriginalBody(MissFallback);
+      // The spliced body referenced F's args; now that it lives in MissFn,
+      // remap each F->getArg(i) to MissFn->getArg(i) so there are no
+      // cross-function arg references (which would crash SelectionDAG).
+      for (unsigned Ai = 0; Ai < F->arg_size(); ++Ai) {
+        Argument *OldArg = F->getArg(Ai);
+        Argument *NewArg = MissFn->getArg(Ai);
+        SmallVector<Use *, 8> Uses;
+        for (Use &U : OldArg->uses())
+          if (auto *I = dyn_cast<Instruction>(U.getUser()))
+            if (I->getParent()->getParent() == MissFn)
+              Uses.push_back(&U);
+        for (Use *U : Uses)
+          U->set(NewArg);
+      }
       if (!MissFallback->getTerminator()) {
         IRBuilder<> B(MissFallback);
         if (F->getReturnType()->isVoidTy())
