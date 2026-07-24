@@ -661,6 +661,28 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
 endif()
 
+#===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
+# EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
+# @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2
+# so the hit path indexes with shifts (no multiply). The same value is applied
+# to the runtime (LLVMEJIT -DEJIT_ICACHE_DIM_SIZE) and to the AOT pass (clang
+# -mllvm -ejit-icache-dim-size) so the AOT array layout and the runtime
+# linearization agree. Default 8; the product overrides it via the preset.
+set(EJIT_ICACHE_DIM_SIZE 8 CACHE STRING
+  "EJIT inline-cache per-dim bound D (must be a power of 2)")
+if(EJIT_ICACHE_DIM_SIZE LESS 1)
+  message(FATAL_ERROR
+    "EJIT_ICACHE_DIM_SIZE must be a positive power of 2, got ${EJIT_ICACHE_DIM_SIZE}")
+endif()
+math(EXPR _ejit_icache_dim_pow2
+  "${EJIT_ICACHE_DIM_SIZE} & (${EJIT_ICACHE_DIM_SIZE} - 1)")
+if(NOT _ejit_icache_dim_pow2 EQUAL 0)
+  message(FATAL_ERROR
+    "EJIT_ICACHE_DIM_SIZE must be a power of 2 (the hit path uses shift indexing, no multiply), got ${EJIT_ICACHE_DIM_SIZE}")
+endif()
+unset(_ejit_icache_dim_pow2)
+message(STATUS "EmbeddedJIT: inline-cache per-dim bound D=${EJIT_ICACHE_DIM_SIZE}")
+
 #===-- EmbeddedJIT SRE taskpool compile scheduler -------------------------===#
 # Route ejit_compile_or_get through a unified taskpool (cache + dedup + queue)
 # instead of calling the synchronous compile driver directly. Sync and async

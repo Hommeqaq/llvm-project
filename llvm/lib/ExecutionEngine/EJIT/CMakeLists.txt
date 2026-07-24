@@ -149,6 +149,15 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_4K_SEAL)
 endif()
 
+# EJIT_ICACHE_DIM_SIZE: per-dim bound D of the multi-version inline cache.
+# Used by icacheFill/icacheTry linearization in EJitSharedTaskPool. Must match
+# the AOT -mllvm -ejit-icache-dim-size value (both from the top-level CMake
+# var). Scoped to LLVMEJIT (the icache runtime lives here); gated on the shared
+# taskpool, which is the only build the icache is compiled under.
+if(EJIT_SRE_SHARED_TASKPOOL)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_ICACHE_DIM_SIZE=${EJIT_ICACHE_DIM_SIZE})
+endif()
+
 # EJIT_FREESTANDING must be visible in LLVMJITLink headers so that
 # std::promise / std::future usage is guarded (bare-metal has no <future>).
 if(EJIT_FREESTANDING)

@@ -21,6 +21,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Casting.h"
@@ -223,6 +224,14 @@ static GlobalVariable *getOrCreateFuncIndexGlobal(Module &M,
       ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), GVName);
 }
 
+// A per-function inline-cache global plus its dimensionality (number of
+// ejit_dim params). The runtime needs NumDims to linearize the [D]^NumDims
+// array on fill, and the hit-path emitter needs it to build the GEP.
+struct IcacheSlotInfo {
+  GlobalVariable *GV = nullptr;
+  unsigned NumDims = 0;
+};
+
 // Per-function pointer-typed global holding the frozen inline-cache slot: the
 // specialization pointer once resolved, null until then. Internal linkage (each
 // module's copy is wired into the runtime slot-pointer table by name at
@@ -230,15 +239,30 @@ static GlobalVariable *getOrCreateFuncIndexGlobal(Module &M,
 // runtime pairs against it are lock-free on aarch64. The wrapper reads it
 // DIRECTLY (load atomic acquire + null-check + indirect call) - no
 // ejit_icache_try call, no per-call guards - so the hit path is one load.
+//
+// Multi-version: the global is a [D]^NumDims array (D = EJIT_ICACHE_DIM_SIZE,
+// power-of-2) indexed by the ejit_dim argument values, so each dim identity
+// gets its own frozen fnPtr cell. NumDims=0 is a scalar ptr (= v2 monomorphic).
 static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
-                                                 StringRef FuncName) {
+                                                 StringRef FuncName,
+                                                 unsigned NumDims) {
   std::string GVName = ("__ejit_icache_fn_" + FuncName).str();
   if (auto *Existing = M.getGlobalVariable(GVName))
     return Existing;
-  auto *PtrTy = PointerType::getUnqual(M.getContext());
-  auto *GV = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
-                                GlobalValue::InternalLinkage,
-                                ConstantPointerNull::get(PtrTy), GVName);
+  LLVMContext &Ctx = M.getContext();
+  auto *PtrTy = PointerType::getUnqual(Ctx);
+  // Build [D]^NumDims (row-major); scalar ptr for NumDims==0.
+  Type *SlotTy = PtrTy;
+  const uint64_t D = EJIT_ICACHE_DIM_SIZE;
+  for (unsigned I = 0; I < NumDims; ++I)
+    SlotTy = ArrayType::get(SlotTy, D);
+  Constant *Init = nullptr;
+  if (NumDims == 0)
+    Init = ConstantPointerNull::get(PtrTy);
+  else
+    Init = ConstantAggregateZero::get(SlotTy);
+  auto *GV = new GlobalVariable(M, SlotTy, /*isConstant=*/false,
+                                GlobalValue::InternalLinkage, Init, GVName);
   GV->setAlignment(Align(8));
   return GV;
 }
@@ -329,7 +353,7 @@ emitFuncIndexRegistration(Module &M,
 // skips if the static section payload already exists.
 static void
 emitIcacheSlotRegistration(Module &M,
-                           const std::map<std::string, GlobalVariable *> &Fns) {
+                           const std::map<std::string, IcacheSlotInfo> &Fns) {
   if (Fns.empty() || M.getGlobalVariable(".ejit.registry.icache"))
     return;
   LLVMContext &Ctx = M.getContext();
@@ -337,10 +361,11 @@ emitIcacheSlotRegistration(Module &M,
   auto *I32Ty = Type::getInt32Ty(Ctx);
   auto *I64Ty = Type::getInt64Ty(Ctx);
 
-  // void ejit_register_icache_slot(const char *name, void *slot)
+  // void ejit_register_icache_slot(const char *name, void *slot, uint32_t numDims)
+  // numDims tells the runtime the [D]^numDims shape so icacheFill can linearize.
   M.getOrInsertFunction(
       FN_REGISTER_ICACHE_SLOT,
-      FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy}, false));
+      FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy, I32Ty}, false));
 
   Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
   bool CreatedAutoReg = false;
@@ -357,14 +382,16 @@ emitIcacheSlotRegistration(Module &M,
   for (auto &KV : Fns) {
     IRBuilder<> Builder(Ret);
     Value *Name = Builder.CreateGlobalString(KV.first);
-    Builder.CreateCall(FnReg, {Name, Builder.CreateBitCast(KV.second, PtrTy)});
+    Builder.CreateCall(FnReg, {Name, Builder.CreateBitCast(KV.second.GV, PtrTy),
+                               ConstantInt::get(I32Ty, KV.second.NumDims)});
   }
 
   if (EnableEJitGlobalCtors && CreatedAutoReg)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
   // Static registry entries for bare-metal / testing fallback (same linker-
-  // concatenated .ejit_period model as funcindex above).
+  // concatenated .ejit_period model as funcindex above). The `size` (i64) field
+  // carries NumDims; the ejit_init walker forwards it to ejitIcacheRegisterSlot.
   StructType *EntryTy = StructType::get(
       Ctx, {I32Ty, PtrTy, PtrTy, PtrTy, I64Ty}, /*isPacked=*/false);
   auto makeStrGV = [&](const std::string &S) -> Constant * {
@@ -379,8 +406,8 @@ emitIcacheSlotRegistration(Module &M,
     Entries.push_back(ConstantStruct::get(
         EntryTy, {ConstantInt::get(I32Ty, 7), // EJIT_REG_ICACHE_SLOT
                   makeStrGV(KV.first), ConstantPointerNull::get(PtrTy),
-                  ConstantExpr::getBitCast(KV.second, PtrTy),
-                  ConstantInt::get(I64Ty, 0)}));
+                  ConstantExpr::getBitCast(KV.second.GV, PtrTy),
+                  ConstantInt::get(I64Ty, KV.second.NumDims)}));
   }
   if (Entries.empty())
     return;
@@ -432,17 +459,23 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   auto isAlreadyWrapped = [](Function &F) -> bool {
     if (!F.getEntryBlock().getName().starts_with("jit_entry"))
       return false;
-    // The wrapper's jit_entry loads a per-function global that uniquely
-    // identifies an already-wrapped function: @__ejit_icache_fn_<name> (when
-    // -ejit-inline-cache hoists the probe to the entry block) or, with the
-    // cache off, @__ejit_funcidx_<name> (the funcIndex load that heads jit_entry
-    // in that layout).
-    for (Instruction &I : F.getEntryBlock())
+    // The wrapper's jit_entry references a per-function global that uniquely
+    // identifies an already-wrapped function: @__ejit_icache_fn_<name> (the
+    // icache probe -- a direct load for 0-dim, or a GEP for numDims>0) or, with
+    // the cache off, @__ejit_funcidx_<name> (the funcIndex load in jit_entry).
+    for (Instruction &I : F.getEntryBlock()) {
+      Value *Ptr = nullptr;
       if (auto *LI = dyn_cast<LoadInst>(&I))
-        if (auto *GV = dyn_cast<GlobalVariable>(LI->getPointerOperand()))
-          if (GV->getName().starts_with("__ejit_funcidx_") ||
-              GV->getName().starts_with("__ejit_icache_fn_"))
-            return true;
+        Ptr = LI->getPointerOperand();
+      else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+        Ptr = GEP->getPointerOperand();
+      if (!Ptr)
+        continue;
+      if (auto *GV = dyn_cast<GlobalVariable>(Ptr))
+        if (GV->getName().starts_with("__ejit_funcidx_") ||
+            GV->getName().starts_with("__ejit_icache_fn_"))
+          return true;
+    }
     return false;
   };
 
@@ -498,11 +531,21 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
   // resolve. Requires the runtime to be built with EJIT_SRE_SHARED_CODE_POINTERS
   // (production preset) - the inline probe has no per-call cross-core gate, so
   // it is only safe when a cached pointer is callable on any core.
-  std::map<std::string, GlobalVariable *> IcacheFnGlobals;
+  std::map<std::string, IcacheSlotInfo> IcacheFnGlobals;
   if (EJitInlineCache) {
-    for (Function *F : EntryFuncs)
-      IcacheFnGlobals.emplace(F->getName().str(),
-                              getOrCreateIcacheFnGlobal(M, F->getName()));
+    for (Function *F : EntryFuncs) {
+      unsigned NumDims = getPeriodArrIndInfo(*F).size();
+      // Skip functions exceeding the cache dimensionality cap from the icache
+      // map. They are still wrapped (taskpool path) but without an icache probe;
+      // the per-function DimCount > EJIT_ICACHE_MAX_DIMS check below emits the
+      // compile error, so this just avoids emitting a wasteful [D]^N global.
+      if (NumDims > EJIT_ICACHE_MAX_DIMS)
+        continue;
+      IcacheSlotInfo Info;
+      Info.GV = getOrCreateIcacheFnGlobal(M, F->getName(), NumDims);
+      Info.NumDims = NumDims;
+      IcacheFnGlobals.emplace(F->getName().str(), Info);
+    }
     emitIcacheSlotRegistration(M, IcacheFnGlobals);
   }
 
@@ -583,297 +626,268 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
     // Save original entry block
     BasicBlock &OrigEntry = F->getEntryBlock();
 
-    // Create the wrapper blocks. jit_entry is the new entry block. With
-    // -ejit-inline-cache ON, jit_entry is the inline probe (load the per-function
-    // cached specialization pointer, null-check, hit -> call it directly + return;
-    // miss -> jit_slow), and jit_slow runs the funcIndex guard -> jit_call (taskpool
-    // request) / jit_fallback (AOT body). With the cache OFF, jit_entry runs the
-    // funcIndex guard directly (no probe, no jit_slow). jit_dispatch runs the
-    // taskpool-resolved specialization.
-    auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F, &OrigEntry);
-    BasicBlock *JitSlow =
-        EJitInlineCache ? BasicBlock::Create(Ctx, "jit_slow", F) : nullptr;
-    auto *JitCall = BasicBlock::Create(Ctx, "jit_call", F);
-    auto *JitFallback = BasicBlock::Create(Ctx, "jit_fallback", F);
-    auto *JitDispatch = BasicBlock::Create(Ctx, "jit_dispatch", F);
+    // Whether this function gets an icache probe: the flag is on AND the
+    // function is in the icache map.
+    auto IcacheIt = IcacheFnGlobals.find(F->getName().str());
+    bool EmitIcacheProbe =
+        EJitInlineCache && IcacheIt != IcacheFnGlobals.end();
 
-    // Update PHI incoming blocks in successors that reference OrigEntry.
-    //
-    // NOTE: replaceAllUsesWith does NOT update PHI incoming blocks — a
-    // PHINode's incoming block is stored inside the PHINode and is NOT part
-    // of the BasicBlock's use list (OrigEntry can be a PHI incoming block
-    // while getNumUses() == 0). Without this explicit rewrite, erasing
-    // OrigEntry leaves dangling PHI incoming block pointers, crashing later
-    // passes. This triggers whenever the ejit_entry function's entry block
-    // is an incoming predecessor of a PHI — e.g. short-circuit && / || inside
-    // __builtin_expect(!!(a && b), 1) produces a PHI in the merge block whose
-    // incoming block is the entry block; lower-expect's handlePhiDef then
-    // dereferences the dangling pointer.
-    //
-    // Must run before splice(): replaceSuccessorsPhiUsesWith walks OrigEntry's
-    // successors via its terminator, which the splice below moves away.
-    OrigEntry.replaceSuccessorsPhiUsesWith(JitFallback);
-
-    // Splice all instructions from OrigEntry to jit_fallback
-    JitFallback->splice(JitFallback->end(), &OrigEntry, OrigEntry.begin(),
-                        OrigEntry.end());
-
-    // Handle any remaining non-PHI uses of OrigEntry (e.g. blockaddress).
-    OrigEntry.replaceAllUsesWith(JitFallback);
-
-    // Delete the now-empty original entry block
-    OrigEntry.eraseFromParent();
-
-    // jit_entry (new entry block): allocas + timing decls live here so they
-    // dominate the taskpool path. With -ejit-inline-cache ON, jit_entry IS the
-    // inline probe (see below); with it OFF, jit_entry runs the funcIndex guard
-    // directly (the original layout).
-    IRBuilder<> Builder(JitEntry);
-    // Emit the fixed-dimension fast-path C API only for 0/1/2-dim entries when
-    // the opt-in flag is set. Rationale (measured on aarch64, -Os): 0D/1D/2D
-    // pass funcIndex + up to 4 dim scalars + 2 out pointers, which still fit in
-    // the 8 integer argument registers (no stack spill) and hit a specialized
-    // cacheLookupNd with the numDims/identity/version loops fully unrolled. A
-    // 3D call needs 9 and a 4D call 11 integer arguments, spilling to the stack
-    // at every call site, which cancels the lookup saving — so 3D/4D keep using
-    // the generic ejit_taskpool_compile_or_get (one dim-array pointer). The
-    // fixed 3D/4D C APIs still exist and are semantically correct for direct
-    // callers; the wrapper just does not select them.
-    bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
     auto *DimPairTy = StructType::get(I32Ty, I32Ty);
     auto *I64Ty = Type::getInt64Ty(Ctx);
-    Value *DimsAlloca = UseFixed
-                            ? nullptr
-                            : Builder.CreateAlloca(ArrayType::get(DimPairTy, 4),
-                                                   nullptr, "ejit_dims");
-    Value *OutFnAlloca =
-        Builder.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
-    Value *OutBucketAlloca =
-        Builder.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
-    Value *OutFnArg = Builder.CreatePointerCast(OutFnAlloca, PtrTy);
-    // Timing callees are shared by the icache hit path and the slow taskpool
-    // path, so declare them once here (idempotent getOrInsertFunction).
+    bool UseFixed = EJitWrapperFixedDimEntry && DimCount <= 2;
+
+    // Timing callees (shared by hit and slow paths).
     FunctionCallee TraceNow{};
     FunctionCallee TraceWrapper{};
     if (EJitWrapperTiming) {
       TraceNow = M.getOrInsertFunction(FN_TASKPOOL_TRACE_NOW,
                                        FunctionType::get(I64Ty, false));
-      SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty,
-                                         I64Ty, I64Ty, I64Ty, I64Ty};
+      SmallVector<Type *, 8> TraceTys = {I32Ty, I32Ty, PtrTy, I32Ty, I64Ty,
+                                         I64Ty, I64Ty, I64Ty};
       TraceWrapper = M.getOrInsertFunction(
           FN_TASKPOOL_TRACE_WRAPPER,
           FunctionType::get(Type::getVoidTy(Ctx), TraceTys, false));
     }
-    // funcIndex is loaded on the miss path (jit_slow / the cache-off guard); the
-    // hit path does not need it. Declared here so jit_call (below) can use it.
-    Value *FuncIdx = nullptr;
 
-    if (EJitInlineCache) {
-      // --- inline probe (the hit path) ---
-      // One atomic acquire load of the per-function cached specialization
-      // pointer (@__ejit_icache_fn_<name>), null-check, hit -> call it directly
-      // + return. NO ejit_icache_try call, NO per-call guards, NO funcIndex /
-      // IdxValid, NO dim loads on the hit path - just "pointer non-null? jump".
-      // The slot is null until the first successful resolve fills it (icacheFill,
-      // on the jit_call path); a null slot falls through to jit_slow. Timing (when
-      // -ejit-wrapper-timing): probe cost (the load) + fn-call cost are logged via
-      // ejit_taskpool_trace_wrapper with the icache-hit sentinel. funcIndex is
-      // loaded here ONLY for trace attribution (diagnostic, off in production) so
-      // the non-timing hit path stays a single load.
-      Value *TBeforeIcache = nullptr;
-      Value *FuncIdxForTiming = nullptr;
-      if (EJitWrapperTiming) {
-        TBeforeIcache = Builder.CreateCall(TraceNow, {}, "ejit_t_before_icache");
-        FuncIdxForTiming = Builder.CreateLoad(
-            I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx_t");
+    // emitSlowPath: emit the funcIndex guard (EntryBB) + compile_or_get
+    // (CallBB) + dispatch (DispatchBB) into Fn, using Fn's args. FallbackBB
+    // already holds the spliced original body (with its own ret). Shared by
+    // icache-off (in F) and icache-on (in MissFn).
+    auto emitSlowPath = [&](Function &Fn, BasicBlock *EntryBB,
+                            BasicBlock *CallBB, BasicBlock *DispatchBB,
+                            BasicBlock *FallbackBB) {
+      IRBuilder<> B(EntryBB);
+      // Allocas live in the entry block so they dominate the call/dispatch
+      // blocks (and match the original layout: allocas precede the funcidx
+      // guard).
+      Value *DimsAlloca = UseFixed ? nullptr
+                                   : B.CreateAlloca(ArrayType::get(DimPairTy, 4),
+                                                    nullptr, "ejit_dims");
+      Value *OutFnAlloca = B.CreateAlloca(PtrTy, nullptr, "ejit_out_fn");
+      Value *OutBucketAlloca = B.CreateAlloca(I32Ty, nullptr, "ejit_out_bucket");
+      Value *OutFnArg = B.CreatePointerCast(OutFnAlloca, PtrTy);
+      Value *OutBucketArg = B.CreatePointerCast(OutBucketAlloca, PtrTy);
+      Value *FuncIdx = B.CreateLoad(
+          I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
+      Value *IdxValid = B.CreateICmpNE(
+          FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
+      B.CreateCondBr(IdxValid, CallBB, FallbackBB);
+
+      B.SetInsertPoint(CallBB);
+      auto emitDimTypeVal = [&](unsigned I) {
+        return B.CreateLoad(I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName],
+                            "ejit_dimtype");
+      };
+      auto emitInstanceVal = [&](unsigned I) -> Value * {
+        Value *ArgVal = Fn.getArg(PeriodInds[I].ArgIndex);
+        unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
+        if (BW > 32) return B.CreateTrunc(ArgVal, I32Ty);
+        if (BW < 32) return B.CreateZExt(ArgVal, I32Ty);
+        return ArgVal;
+      };
+      Value *TBeforeLookup = nullptr, *TAfterLookup = nullptr;
+      if (EJitWrapperTiming)
+        TBeforeLookup = B.CreateCall(TraceNow, {}, "ejit_t_before_lookup");
+      Value *Status = nullptr;
+      if (UseFixed) {
+        static const char *const FixedNames[] = {
+            FN_TASKPOOL_COMPILE_OR_GET_0D, FN_TASKPOOL_COMPILE_OR_GET_1D,
+            FN_TASKPOOL_COMPILE_OR_GET_2D, FN_TASKPOOL_COMPILE_OR_GET_3D,
+            FN_TASKPOOL_COMPILE_OR_GET_4D};
+        SmallVector<Type *, 12> ParamTys;
+        SmallVector<Value *, 12> Args;
+        ParamTys.push_back(I32Ty);
+        Args.push_back(FuncIdx);
+        for (unsigned I = 0; I < DimCount; ++I) {
+          ParamTys.push_back(I32Ty);
+          ParamTys.push_back(I32Ty);
+          Args.push_back(emitDimTypeVal(I));
+          Args.push_back(emitInstanceVal(I));
+        }
+        ParamTys.push_back(PtrTy);
+        ParamTys.push_back(PtrTy);
+        Args.push_back(OutFnArg);
+        Args.push_back(OutBucketArg);
+        FunctionCallee FixedFn = M.getOrInsertFunction(
+            FixedNames[DimCount], FunctionType::get(I32Ty, ParamTys, false));
+        Status = B.CreateCall(FixedFn, Args);
+      } else {
+        for (unsigned I = 0; I < DimCount; ++I) {
+          Value *Idxs[] = {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, I)};
+          Value *PairPtr = B.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
+                                               DimsAlloca, Idxs);
+          B.CreateStore(emitDimTypeVal(I), B.CreateStructGEP(DimPairTy, PairPtr,
+                                                              0, "dim_type_ptr"));
+          B.CreateStore(emitInstanceVal(I),
+                        B.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr"));
+        }
+        Value *DimsPtr = DimCount > 0 ? B.CreatePointerCast(DimsAlloca, PtrTy)
+                                      : ConstantPointerNull::get(PtrTy);
+        Status = B.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
+                              {FuncIdx, DimsPtr,
+                               ConstantInt::get(I32Ty, DimCount), OutFnArg,
+                               OutBucketArg});
       }
-      // The one-shot frozen slot: acquire load pairs with icacheFill's acq_rel
-      // CAS. 8-byte aligned for a lock-free atomic on aarch64.
-      GlobalVariable *IcacheSlot = IcacheFnGlobals[F->getName().str()];
-      LoadInst *ICSlotLoad =
-          Builder.CreateLoad(PtrTy, IcacheSlot, "ejit_ic_fn");
-      ICSlotLoad->setAtomic(AtomicOrdering::Acquire);
+      if (EJitWrapperTiming)
+        TAfterLookup = B.CreateCall(TraceNow, {}, "ejit_t_after_lookup");
+      Value *OutFn = B.CreateLoad(PtrTy, OutFnAlloca, "ejit_fn");
+      Value *HitStatus = B.CreateICmpEQ(Status, ConstantInt::get(I32Ty, 0));
+      B.CreateCondBr(B.CreateAnd(HitStatus, B.CreateIsNotNull(OutFn)),
+                     DispatchBB, FallbackBB);
+
+      B.SetInsertPoint(DispatchBB);
+      SmallVector<Value *, 8> Args;
+      for (auto &A : Fn.args())
+        Args.push_back(&A);
+      auto releaseAndTrace = [&]() {
+        if (EJitWrapperTiming) {
+          Value *TAfterFn = B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
+          Value *Bucket = B.CreateLoad(I32Ty, OutBucketAlloca);
+          B.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
+          Value *TAfterRelease = B.CreateCall(TraceNow, {}, "ejit_t_after_release");
+          B.CreateCall(TraceWrapper, {FuncIdx, Status, OutFn, Bucket,
+                                      TBeforeLookup, TAfterLookup, TAfterFn,
+                                      TAfterRelease});
+        } else {
+          Value *Bucket = B.CreateLoad(I32Ty, OutBucketAlloca);
+          B.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
+        }
+      };
+      if (F->getReturnType()->isVoidTy()) {
+        B.CreateCall(F->getFunctionType(), OutFn, Args);
+        releaseAndTrace();
+        B.CreateRetVoid();
+      } else {
+        Value *RetVal = B.CreateCall(F->getFunctionType(), OutFn, Args);
+        releaseAndTrace();
+        B.CreateRet(RetVal);
+      }
+    };
+
+    // Helper: splice the original body into Dst, fixing PHI/uses, then erase
+    // the now-empty OrigEntry.
+    auto spliceOriginalBody = [&](BasicBlock *Dst) {
+      OrigEntry.replaceSuccessorsPhiUsesWith(Dst);
+      Dst->splice(Dst->end(), &OrigEntry, OrigEntry.begin(), OrigEntry.end());
+      OrigEntry.replaceAllUsesWith(Dst);
+      OrigEntry.eraseFromParent();
+    };
+
+    if (EmitIcacheProbe) {
+      //=== LEVER B: frame-less wrapper (F) + noinline MissFn (slow path) =====
+      // The hit path (F) is just the probe + two tail calls (br spec on hit, br
+      // MissFn on miss) -- no allocas, no calls, no frame. MissFn holds the
+      // funcidx guard + compile_or_get + dispatch + the AOT fallback (original
+      // body), with its own frame. Miss is rare, so the call overhead is fine.
+      Function *MissFn = Function::Create(F->getFunctionType(),
+                                          GlobalValue::InternalLinkage,
+                                          F->getName() + "_miss", &M);
+      MissFn->addFnAttr(Attribute::NoInline);
+      MissFn->setSection(F->getSection());
+      auto *MissEntry = BasicBlock::Create(Ctx, "miss_entry", MissFn);
+      auto *MissCall = BasicBlock::Create(Ctx, "miss_call", MissFn);
+      auto *MissFallback = BasicBlock::Create(Ctx, "miss_fallback", MissFn);
+      auto *MissDispatch = BasicBlock::Create(Ctx, "miss_dispatch", MissFn);
+      spliceOriginalBody(MissFallback);
+      if (!MissFallback->getTerminator()) {
+        IRBuilder<> B(MissFallback);
+        if (F->getReturnType()->isVoidTy())
+          B.CreateRetVoid();
+        else
+          B.CreateRet(PoisonValue::get(F->getReturnType()));
+      }
+      emitSlowPath(*MissFn, MissEntry, MissCall, MissDispatch, MissFallback);
+
+      // Wrapper (F): frame-less probe + tail calls.
+      auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F);
+      auto *JitIcacheDispatch = BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
+      auto *JitMiss = BasicBlock::Create(Ctx, "jit_miss", F);
+      IRBuilder<> B(JitEntry);
+      Value *TBeforeIcache = nullptr, *FuncIdxForTiming = nullptr;
+      if (EJitWrapperTiming) {
+        TBeforeIcache = B.CreateCall(TraceNow, {}, "ejit_t_before_icache");
+        FuncIdxForTiming = B.CreateLoad(I32Ty,
+                                        FuncIndexGlobals[F->getName().str()],
+                                        "ejit_funcidx_t");
+      }
+      GlobalVariable *IcacheSlot = IcacheIt->second.GV;
+      unsigned NumDims = IcacheIt->second.NumDims;
+      Value *SlotPtr = IcacheSlot;
+      if (NumDims > 0) {
+        SmallVector<Value *, 5> Indices;
+        Indices.push_back(ConstantInt::get(I32Ty, 0));
+        for (unsigned I = 0; I < NumDims; ++I) {
+          Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
+          unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
+          Value *Idx = ArgVal;
+          if (BW > 32) Idx = B.CreateTrunc(ArgVal, I32Ty);
+          else if (BW < 32) Idx = B.CreateZExt(ArgVal, I32Ty);
+          Indices.push_back(Idx);
+        }
+        SlotPtr = B.CreateInBoundsGEP(IcacheSlot->getValueType(), IcacheSlot,
+                                      Indices, "ejit_ic_slot");
+      }
+      LoadInst *ICSlotLoad = B.CreateLoad(PtrTy, SlotPtr, "ejit_ic_fn");
       ICSlotLoad->setAlignment(Align(8));
       Value *TAfterIcache = nullptr;
       if (EJitWrapperTiming)
-        TAfterIcache = Builder.CreateCall(TraceNow, {}, "ejit_t_after_icache");
-      Value *IHit = Builder.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
-      // jit_icache_dispatch: call the cached specialization directly. NO
-      // ejit_taskpool_release_read - the inline cache never frees code in
-      // production.
-      auto *JitIcacheDispatch =
-          BasicBlock::Create(Ctx, "jit_icache_dispatch", F);
-      Builder.CreateCondBr(IHit, JitIcacheDispatch, JitSlow);
+        TAfterIcache = B.CreateCall(TraceNow, {}, "ejit_t_after_icache");
+      Value *IHit = B.CreateIsNotNull(ICSlotLoad, "ejit_icache_hit");
+      IHit = B.CreateIntrinsic(Intrinsic::expect, {IHit->getType()},
+                               {IHit, ConstantInt::getTrue(Ctx)});
+      B.CreateCondBr(IHit, JitIcacheDispatch, JitMiss);
 
-      Builder.SetInsertPoint(JitIcacheDispatch);
+      // Hit: tail-call the cached specialization directly (no release_read).
+      B.SetInsertPoint(JitIcacheDispatch);
       SmallVector<Value *, 8> ICArgs;
-      for (auto &Arg : F->args())
-        ICArgs.push_back(&Arg);
-      auto emitIcacheTiming = [&] {
-        Value *TAfterFn = Builder.CreateCall(TraceNow, {}, "ejit_t_after_fn");
-        Builder.CreateCall(TraceWrapper,
-                           {FuncIdxForTiming,
-                            ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
-                            ICSlotLoad, ConstantInt::get(I32Ty, 0),
-                            TBeforeIcache, TAfterIcache, TAfterFn, TAfterFn});
+      for (auto &A : F->args()) ICArgs.push_back(&A);
+      auto emitHitTiming = [&]() {
+        if (!EJitWrapperTiming) return;
+        Value *TAfterFn = B.CreateCall(TraceNow, {}, "ejit_t_after_fn");
+        B.CreateCall(TraceWrapper,
+                     {FuncIdxForTiming,
+                      ConstantInt::get(I32Ty, kEJitIcacheHitTimingStatus),
+                      ICSlotLoad, ConstantInt::get(I32Ty, 0), TBeforeIcache,
+                      TAfterIcache, TAfterFn, TAfterFn});
       };
       if (F->getReturnType()->isVoidTy()) {
-        Builder.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        if (EJitWrapperTiming)
-          emitIcacheTiming();
-        Builder.CreateRetVoid();
+        CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
+        CI->setTailCall(true);
+        emitHitTiming();
+        B.CreateRetVoid();
       } else {
-        Value *RetVal =
-            Builder.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        if (EJitWrapperTiming)
-          emitIcacheTiming();
-        Builder.CreateRet(RetVal);
+        CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
+        CI->setTailCall(true);
+        emitHitTiming();
+        B.CreateRet(CI);
       }
 
-      // --- jit_slow: funcIndex guard (miss path) ---
-      // Load the registration-backfilled dense funcIndex. While it is invalid,
-      // branch straight to the AOT fallback without entering the taskpool;
-      // otherwise enter the taskpool (jit_call), which fills the icache slot on
-      // a successful resolve.
-      Builder.SetInsertPoint(JitSlow);
-      FuncIdx = Builder.CreateLoad(
-          I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
-      Value *IdxValid = Builder.CreateICmpNE(
-          FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
-      Builder.CreateCondBr(IdxValid, JitCall, JitFallback);
+      // Miss: tail-call MissFn (which does compile_or_get + dispatch/fallback).
+      B.SetInsertPoint(JitMiss);
+      SmallVector<Value *, 8> MissArgs;
+      for (auto &A : F->args()) MissArgs.push_back(&A);
+      if (F->getReturnType()->isVoidTy()) {
+        CallInst *CI = B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
+        CI->setTailCall(true);
+        B.CreateRetVoid();
+      } else {
+        CallInst *CI = B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
+        CI->setTailCall(true);
+        B.CreateRet(CI);
+      }
     } else {
-      // icache OFF: jit_entry runs the funcIndex guard directly.
-      FuncIdx = Builder.CreateLoad(
-          I32Ty, FuncIndexGlobals[F->getName().str()], "ejit_funcidx");
-      Value *IdxValid = Builder.CreateICmpNE(
-          FuncIdx, ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), "ejit_idx_ok");
-      Builder.CreateCondBr(IdxValid, JitCall, JitFallback);
-    }
-
-    // jit_call: unified taskpool API. Both Sync and Async modes share the same
-    // AOT wrapper — the runtime compile mode controls whether compilation is
-    // inline or via a background worker.
-    Builder.SetInsertPoint(JitCall);
-
-    // Load each dim's (dimType, instanceId) as i32. Shared by both emitters.
-    auto emitDimTypeVal = [&](unsigned I) {
-      return Builder.CreateLoad(I32Ty, DimTypeGlobals[PeriodInds[I].PeriodName],
-                                "ejit_dimtype");
-    };
-    auto emitInstanceVal = [&](unsigned I) -> Value * {
-      Value *ArgVal = F->getArg(PeriodInds[I].ArgIndex);
-      unsigned BW = cast<IntegerType>(ArgVal->getType())->getBitWidth();
-      if (BW > 32)
-        return Builder.CreateTrunc(ArgVal, I32Ty);
-      if (BW < 32)
-        return Builder.CreateZExt(ArgVal, I32Ty);
-      return ArgVal;
-    };
-
-    Value *OutBucketArg = Builder.CreatePointerCast(OutBucketAlloca, PtrTy);
-    Value *Status = nullptr;
-    Value *TBeforeLookup = nullptr;
-    Value *TAfterLookup = nullptr;
-    if (EJitWrapperTiming) {
-      TBeforeLookup =
-          Builder.CreateCall(TraceNow, {}, "ejit_t_before_lookup");
-    }
-    if (UseFixed) {
-      // ejit_taskpool_compile_or_get_Nd(i32 funcIndex,
-      //     [i32 dimType, i32 instanceId] * N, ptr outFn, ptr outBucket)
-      static const char *const FixedNames[] = {
-          FN_TASKPOOL_COMPILE_OR_GET_0D, FN_TASKPOOL_COMPILE_OR_GET_1D,
-          FN_TASKPOOL_COMPILE_OR_GET_2D, FN_TASKPOOL_COMPILE_OR_GET_3D,
-          FN_TASKPOOL_COMPILE_OR_GET_4D};
-      SmallVector<Type *, 12> ParamTys;
-      SmallVector<Value *, 12> Args;
-      ParamTys.push_back(I32Ty);
-      Args.push_back(FuncIdx);
-      for (unsigned I = 0; I < DimCount; ++I) {
-        Value *DimTypeVal = emitDimTypeVal(I);
-        Value *InstanceId = emitInstanceVal(I);
-        ParamTys.push_back(I32Ty);
-        ParamTys.push_back(I32Ty);
-        Args.push_back(DimTypeVal);
-        Args.push_back(InstanceId);
+      //=== icache OFF: single-function wrapper (funcidx guard -> slow path) ==
+      auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F, &OrigEntry);
+      auto *JitCall = BasicBlock::Create(Ctx, "jit_call", F);
+      auto *JitFallback = BasicBlock::Create(Ctx, "jit_fallback", F);
+      auto *JitDispatch = BasicBlock::Create(Ctx, "jit_dispatch", F);
+      spliceOriginalBody(JitFallback);
+      if (!JitFallback->getTerminator()) {
+        IRBuilder<> B(JitFallback);
+        if (F->getReturnType()->isVoidTy()) B.CreateRetVoid();
+        else B.CreateRet(PoisonValue::get(F->getReturnType()));
       }
-      ParamTys.push_back(PtrTy);
-      ParamTys.push_back(PtrTy);
-      Args.push_back(OutFnArg);
-      Args.push_back(OutBucketArg);
-      FunctionCallee FixedFn = M.getOrInsertFunction(
-          FixedNames[DimCount], FunctionType::get(I32Ty, ParamTys, false));
-      Status = Builder.CreateCall(FixedFn, Args);
-    } else {
-      for (unsigned I = 0; I < DimCount; ++I) {
-        Value *Idxs[] = {ConstantInt::get(I32Ty, 0),
-                         ConstantInt::get(I32Ty, I)};
-        Value *PairPtr = Builder.CreateInBoundsGEP(ArrayType::get(DimPairTy, 4),
-                                                   DimsAlloca, Idxs);
-        Value *DimTypePtr =
-            Builder.CreateStructGEP(DimPairTy, PairPtr, 0, "dim_type_ptr");
-        Value *InstancePtr =
-            Builder.CreateStructGEP(DimPairTy, PairPtr, 1, "instance_ptr");
-        Builder.CreateStore(emitDimTypeVal(I), DimTypePtr);
-        Builder.CreateStore(emitInstanceVal(I), InstancePtr);
-      }
-      Value *DimsPtr = DimCount > 0
-                           ? Builder.CreatePointerCast(DimsAlloca, PtrTy)
-                           : ConstantPointerNull::get(PtrTy);
-      Status = Builder.CreateCall(M.getFunction(FN_TASKPOOL_COMPILE_OR_GET),
-                                  {FuncIdx, DimsPtr,
-                                   ConstantInt::get(I32Ty, DimCount), OutFnArg,
-                                   OutBucketArg});
-    }
-    if (EJitWrapperTiming)
-      TAfterLookup = Builder.CreateCall(TraceNow, {}, "ejit_t_after_lookup");
-    Value *OutFn = Builder.CreateLoad(PtrTy, OutFnAlloca, "ejit_fn");
-    Value *HitStatus =
-        Builder.CreateICmpEQ(Status, ConstantInt::get(I32Ty, 0));
-    Builder.CreateCondBr(
-        Builder.CreateAnd(HitStatus, Builder.CreateIsNotNull(OutFn)),
-        JitDispatch, JitFallback);
-
-    // jit_dispatch: cast function pointer, call, and release the read token.
-    Builder.SetInsertPoint(JitDispatch);
-
-    // Build argument list for indirect call
-    SmallVector<Value *, 8> Args;
-    for (auto &Arg : F->args())
-      Args.push_back(&Arg);
-
-    if (F->getReturnType()->isVoidTy()) {
-      Builder.CreateCall(F->getFunctionType(), OutFn, Args);
-      Value *TAfterFn = nullptr;
-      if (EJitWrapperTiming)
-        TAfterFn = Builder.CreateCall(TraceNow, {}, "ejit_t_after_fn");
-      // Always release the taskpool read token after the JIT call finishes.
-      Value *Bucket = Builder.CreateLoad(I32Ty, OutBucketAlloca);
-      Builder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
-      if (EJitWrapperTiming) {
-        Value *TAfterRelease =
-            Builder.CreateCall(TraceNow, {}, "ejit_t_after_release");
-        Builder.CreateCall(TraceWrapper,
-                           {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
-                            TAfterLookup, TAfterFn, TAfterRelease});
-      }
-      Builder.CreateRetVoid();
-    } else {
-      Value *RetVal = Builder.CreateCall(F->getFunctionType(), OutFn, Args);
-      Value *TAfterFn = nullptr;
-      if (EJitWrapperTiming)
-        TAfterFn = Builder.CreateCall(TraceNow, {}, "ejit_t_after_fn");
-      // Always release the taskpool read token after the JIT call finishes.
-      Value *Bucket = Builder.CreateLoad(I32Ty, OutBucketAlloca);
-      Builder.CreateCall(M.getFunction(FN_TASKPOOL_RELEASE_READ), {Bucket});
-      if (EJitWrapperTiming) {
-        Value *TAfterRelease =
-            Builder.CreateCall(TraceNow, {}, "ejit_t_after_release");
-        Builder.CreateCall(TraceWrapper,
-                           {FuncIdx, Status, OutFn, Bucket, TBeforeLookup,
-                            TAfterLookup, TAfterFn, TAfterRelease});
-      }
-      Builder.CreateRet(RetVal);
+      emitSlowPath(*F, JitEntry, JitCall, JitDispatch, JitFallback);
     }
 
     Changed = true;
