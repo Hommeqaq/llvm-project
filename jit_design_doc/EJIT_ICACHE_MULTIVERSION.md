@@ -128,25 +128,26 @@ define internal noinline void @funcA_miss(args...) {  ; slow path (own frame)
 
 ### Lowered aarch64 (`-Os`, lever B, all dims frame-less)
 ```
-; 0-dim:  adrp x8,@slot; ldr x1,[x8,:lo12:@slot]; cbz x1,.miss; br x1
-; 1-dim:  adrp; add x8,:lo12:; ldr x1,[x8,w0,sxtw#3]; cbz; br
-; 2-dim:  sxtw x8,w0; adrp; add x9,:lo12:; add x8,x9,x8,lsl#6; ldr x2,[x8,w1,sxtw#3]; cbz; br
-; 3-dim:  +sxtw x9,w1; add x8,x10,x8,lsl#9; add x8,x8,x9,lsl#6
-; 4-dim:  +sxtw x10,w2; add x8,x10,x8,lsl#12; add x8,x8,x9,lsl#9; add x8,x8,x10,lsl#6
+; 0-dim:  adrp x8,@slot; ldr x1,[x8,:lo12:@slot]; cbz x1,.miss; br x1     ; 4 instr
+; 1-dim:  adrp x8; add x8,x8,:lo12:; ldr x1,[x8,w0,sxtw#3]; cbz; br        ; 5 instr
+; n-dim:  per non-last dim i: sign-extend the ejit_dim arg + add lsl #(3+3*(numDims-1-i))
+;         (D=8 strides: 2-dim lsl#6; 3-dim lsl#9,#6; 4-dim lsl#12,#9,#6);
+;         the last dim folds its sign-extend into the ldr [.,wN,sxtw#3] addressing.
 ; .miss:  b <name>_miss     ; cold: tail-call MissFn
 ```
 
-| numDims | hit instr (LLVM-verified) |
+| numDims | hit instr (measured, `-Os` aarch64_be) |
 |---|---|
-| 0 | 4 (`adrp; ldr; cbz; br`) |
-| 1 | 5 (`adrp; add; ldr; cbz; br`) |
-| 2 | 7 |
-| 3 | 9 |
-| 4 | 11 |
+| 0 | 4 |
+| 1 | 5 |
+| 2 | 6 |
+| 3 | 8 |
+| 4 | 9 |
 
-Each non-last dim adds 2 instructions (1 `sxtw` + 1 `add lsl#N`); the last dim
-folds its `sxtw` into the `ldr` addressing. No bounds check, no C call, no
-read-token, no `release_read`, no dimType load, no version compare, no frame.
+Indexing is pure shifts (`lsl #N`, no multiply -- D is power-of-2); the last
+dim folds its sign-extend into the `ldr` addressing. No bounds check, no C call,
+no read-token, no `release_read`, no dimType load, no version compare, no frame.
+Counts above are the latest measured hit-path instruction totals (probe + tail-call).
 
 ### numDims > EJIT_ICACHE_MAX_DIMS (default 4) -> compile error
 An `ejit_entry` with more than `EJIT_ICACHE_MAX_DIMS` `ejit_dim` params is
@@ -320,7 +321,7 @@ product picks D + maxDims to fit the per-core BSS budget.
   identity after warmup, with the slow-path count == numIdentities (one miss
   each) per core.
 
-## 11. Performance (LLVM-verified, lever B frame-less)
+## 11. Performance (measured, lever B frame-less)
 
 - **Hit**: GEP shifts + 1 plain `ldr` + `cbz` + `br` (tail call). No frame,
   no arg save/restore, no allocas, no C call, no cross-core RMW, no slot scan,
@@ -329,13 +330,17 @@ product picks D + maxDims to fit the per-core BSS budget.
   `noinline MissFn`, so the wrapper never sets up a frame. An `llvm.expect`
   hint ensures the hit branch is preferred.
 
-| numDims | hit instr | breakdown |
-|---|---|---|
-| 0 | 4 | `adrp; ldr; cbz; br` |
-| 1 | 5 | `adrp; add; ldr; cbz; br` |
-| 2 | 7 | +`sxtw; add lsl#6` |
-| 3 | 9 | +`sxtw; add lsl#9` |
-| 4 | 11 | +`sxtw; add lsl#12` |
+| numDims | hit instr (`-Os` aarch64_be, measured) |
+|---|---|
+| 0 | 4 |
+| 1 | 5 |
+| 2 | 6 |
+| 3 | 8 |
+| 4 | 9 |
+
+Indexing is pure shifts (no multiply, D power-of-2); the last dim folds its
+sign-extend into the `ldr` addressing. Counts are the latest measured totals;
+exact instruction layout varies with regalloc / symbol alignment.
 
 - **Cold**: O(1) per miss (Horner linearize + one `str`). No scan. Miss
   tail-calls `MissFn` (1 `b` instruction).
