@@ -2,6 +2,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/ExecutionEngine/EJIT/EJit.h"
 #include "llvm/ExecutionEngine/EJIT/EJitAtomic.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
@@ -11,6 +12,9 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+// Build-time-generated: EJIT_GIT_COMMIT / EJIT_GIT_BRANCH (git HEAD of the
+// llvm-project source tree). Lives in the LLVMEJIT build directory.
+#include "EJitVersion.h"
 #ifdef EJIT_SRE_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
 #endif
@@ -20,6 +24,11 @@
 #ifndef EJIT_FREESTANDING
 #include <chrono>
 #endif
+// ejit_print_version() falls back to std::printf when not routing through the
+// SRE platform sink. Mirrors the EJIT_DIAG <cstdio> include (non-SRE path).
+#ifndef EJIT_SRE_DIAG
+#include <cstdio>
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -28,6 +37,15 @@ static EJit *gEJIT = nullptr;
 
 #ifdef EJIT_FREESTANDING
 extern "C" uint64_t SRE_CycleCountGet64(void);
+#endif
+
+// ejit_print_version() prints unconditionally (not via EJIT_DIAG), so on SRE
+// builds it calls SRE_printf directly. EJitDiag.h only declares SRE_printf
+// under EJIT_DIAG_ENABLE; declare it here for the SRE-but-diagnostics-off case
+// so the function links. When EJIT_DIAG_ENABLE is also on, EJitDiag.h already
+// provides the identical declaration and this guard skips a redundant one.
+#if defined(EJIT_SRE_DIAG) && !defined(EJIT_DIAG_ENABLE)
+extern "C" int SRE_printf(const char *fmt, ...);
 #endif
 
 #ifndef EJIT_WRAPPER_TIMING_REPORT_EVERY
@@ -1211,6 +1229,24 @@ void ejit_print_active(void) {
     return;
   }
   gEJIT->printActive();
+}
+
+void ejit_print_version(void) {
+  // LLVM release version (major.minor.patch) comes from llvm/Config/llvm-config.h
+  // (LLVM_VERSION_STRING); the git commit + branch come from the build-time
+  // generated EJitVersion.h. Printed unconditionally - not through EJIT_DIAG and
+  // not gated on EJIT_DIAG_ENABLE or gEJitDiagLevel - so the build identity is
+  // always recoverable, even on a build with diagnostics compiled out and before
+  // ejit_init(). Routes through the same platform sink as EJIT_DIAG: SRE_printf
+  // on SRE/bare-metal builds (declared at file scope above / by EJitDiag.h),
+  // std::printf otherwise.
+#ifdef EJIT_SRE_DIAG
+  SRE_printf("[EJIT] LLVM version %s, branch %s, commit %s\n",
+             LLVM_VERSION_STRING, EJIT_GIT_BRANCH, EJIT_GIT_COMMIT);
+#else
+  std::printf("[EJIT] LLVM version %s, branch %s, commit %s\n",
+              LLVM_VERSION_STRING, EJIT_GIT_BRANCH, EJIT_GIT_COMMIT);
+#endif
 }
 
 } // extern "C"

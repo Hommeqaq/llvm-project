@@ -685,6 +685,7 @@ extern void ejit_print_func_meta(const char *funcName);
 extern int ejit_get_code_pool_stats(void *out);
 extern void ejit_print_code_pool_stats(void);
 extern void ejit_print_active(void);
+extern void ejit_print_version(void);
 }
 
 // The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
@@ -2939,4 +2940,13 @@ TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
 
 TEST(EJitDiagnostics, PrintActiveNoCrash) {
   ejit_print_active(); // uninitialized: prints a notice
+}
+
+// ejit_print_version() prints the LLVM release version + source git commit
+// through the platform sink (SRE_printf on SRE builds, std::printf here). It
+// is unconditional - not gated on EJIT_DIAG_ENABLE and needs no initialized
+// runtime - so the build identity is always recoverable. The test only
+// asserts it does not crash; the version/commit are baked in at compile time.
+TEST(EJitDiagnostics, PrintVersionNoCrash) {
+  ejit_print_version();
 }

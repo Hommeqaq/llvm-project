@@ -339,6 +339,16 @@ void ejit_print_code_pool_stats(void);
 /// "why did/didn't this period instance compile".
 void ejit_print_active(void);
 
+/// Print the EJIT runtime's build identity through the platform log: the LLVM
+/// release version (major.minor.patch, from llvm/Config/llvm-config.h) and the
+/// git commit + branch of the llvm-project source tree the runtime was built
+/// from. The commit is captured at build time, so it tracks the source HEAD
+/// even across incremental rebuilds. Needs no initialized runtime and is not
+/// gated on the diagnostic log level, so the build identity is always
+/// recoverable - useful for correlating a field device's behavior with the
+/// exact source it was compiled from.
+void ejit_print_version(void);
+
 // Cache
 void ejit_clear_cache(void);
 void ejit_invalidate(const char *periodName, uint8_t cellIdx);

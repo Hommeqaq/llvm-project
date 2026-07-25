@@ -164,6 +164,33 @@ if(EJIT_FREESTANDING)
   target_compile_definitions(LLVMJITLink PUBLIC EJIT_FREESTANDING)
 endif()
 
+#===-- Build-version header (ejit_print_version) -------------------------===#
+# Generate EJitVersion.h carrying the llvm-project git commit + branch of the
+# source tree the runtime was built from. The LLVM release version itself is
+# read at runtime from llvm/Config/llvm-config.h (LLVM_VERSION_STRING), so it
+# is not duplicated here.
+#
+# The header is regenerated on every build by a custom target, but the
+# generator script writes it with copy_if_different: the file's mtime (and
+# therefore EJitRuntime.cpp, the only includer) only changes when the commit
+# actually changes. This keeps ejit_print_version() fresh across rebuilds
+# (a rebuild after `git commit` picks up the new hash) without forcing a full
+# CMake reconfigure, and without recompiling on every no-op build.
+find_package(Git QUIET)
+set(EJIT_VERSION_HEADER "${CMAKE_CURRENT_BINARY_DIR}/EJitVersion.h")
+add_custom_target(ejit_version_header
+  COMMAND ${CMAKE_COMMAND}
+    -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+    -DSOURCE_DIR=${LLVM_MAIN_SRC_DIR}
+    -DOUT_FILE=${EJIT_VERSION_HEADER}
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/GenerateEJitVersion.cmake"
+  BYPRODUCTS "${EJIT_VERSION_HEADER}"
+  COMMENT "Refreshing EJIT build-version header (git commit/branch)"
+  VERBATIM)
+add_dependencies(LLVMEJIT ejit_version_header)
+# EJitRuntime.cpp #includes "EJitVersion.h"; put the build dir on the path.
+target_include_directories(LLVMEJIT PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
 #===-- Minimal embedded runtime target -----------------------------------===#
 # Builds a single combined static library (libejit_minimal.a) that bundles
 # EJIT + all transitive LLVM dependencies. Designed for ARM embedded targets

@@ -367,6 +367,9 @@ def doit_gc_merge(args):
         "ejit_print_registry", "ejit_print_func_meta",
         "ejit_get_code_pool_stats", "ejit_print_code_pool_stats",
         "ejit_print_active",
+        # Build identity (LLVM version + git commit). Called from user app
+        # code, never from AOT, so it needs a GC root to survive --gc-sections.
+        "ejit_print_version",
     ]
     optional_api = [
         "ejit_register_lifecycle", "ejit_register_funcindex",
