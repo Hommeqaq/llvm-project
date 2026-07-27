@@ -108,18 +108,35 @@ enum class EJitWorkerStep : uint32_t {
 #define EJIT_ICACHE_FUNC_SLOTS 64u
 #endif
 
+// Per-dim bound D of the multi-version inline cache (@__ejit_icache_fn_<name>
+// is a [D]^numDims array). MUST be a power of 2 (the hit path indexes with
+// shifts, no multiply). The CMake EJIT_ICACHE_DIM_SIZE var overrides this
+// default; the AOT pass reads the same value via -mllvm -ejit-icache-dim-size
+// so array layout and runtime linearization agree.
+#ifndef EJIT_ICACHE_DIM_SIZE
+#define EJIT_ICACHE_DIM_SIZE 8u
+#endif
+// Maximum number of ejit_dim params a cached ejit_entry may have. An entry
+// with more is a compile error (the wrapper is not emitted). 4 matches the
+// taskpool DimCount cap.
+#ifndef EJIT_ICACHE_MAX_DIMS
+#define EJIT_ICACHE_MAX_DIMS 4u
+#endif
+
 // Test/diagnostic: clear every icache slot. The slot-pointer table is
 // process-static storage shared across pool instances, so tests clear it
 // between cases to avoid stale cross-test leakage.
 void ejitIcacheClearAll();
 
-// Register a per-function icache slot: \p slot is the address of the wrapper's
-// @__ejit_icache_fn_<name> global (an EJitAtomicUPtr). The runtime writes the
-// frozen specialization pointer through it on a successful resolve (icacheFill);
-// the wrapper reads it directly. Called from ejit_register_icache_slot (name->
-// funcIndex resolution) at ejit_auto_register / .ejit_period time. No-op for an
-// out-of-range funcIndex or null slot.
-void ejitIcacheRegisterSlot(uint32_t funcIndex, void *slot);
+// Register a per-function icache slot: \p base is the address of the wrapper's
+// @__ejit_icache_fn_<name> global (an EJitAtomicUPtr, or a [D]^numDims array of
+// them for a multi-version entry), and \p numDims is its dimensionality. The
+// runtime writes the frozen specialization pointer through the cell at
+// [i0][i1]... (linearized from dims) on a successful resolve (icacheFill); the
+// wrapper reads the cell directly. Called from ejit_register_icache_slot
+// (name->funcIndex resolution) at ejit_auto_register / .ejit_period time.
+// No-op for an out-of-range funcIndex or null base.
+void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
 
 class EJitSharedTaskPool {
 public:
@@ -410,25 +427,30 @@ public:
   /// false for an out-of-range dimType/instanceId (never reads out of bounds).
   bool isInstanceActive(uint32_t dimType, uint32_t instanceId) const;
 
-  //--- per-function inline cache (v2 sticky monomorphic) ---------------------
+  //--- per-function inline cache (multi-version direct-indexed) --------------
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
   // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
-  // directly - one acquire load + null-check + indirect call, NO ejit_icache_try
-  // call, NO per-call guards. icacheTry is retained for unit tests / diagnostics:
-  // on a hit it sets *outFn to the frozen specialization (call with NO
-  // releaseRead) and returns true; on a miss returns false. It keeps the
-  // reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
+  // directly - a GEP into the [D]^numDims array by the ejit_dim arg values, one
+  // acquire load + null-check + indirect call, NO ejit_icache_try call, NO
+  // per-call guards. icacheTry is retained for unit tests / diagnostics: on a
+  // hit it sets *outFn to the frozen specialization for the given dims (call
+  // with NO releaseRead) and returns true; on a miss returns false. It keeps
+  // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
   // (the latter matters in non-shared test builds; the wrapper's inline probe is
   // only enabled under EJIT_SRE_SHARED_CODE_POINTERS, where the gate is
   // compile-time true).
-  bool icacheTry(uint32_t funcIndex, void **outFn);
-  // Fill the per-function icache slot (the wrapper's @__ejit_icache_fn_<name>
-  // global, reached through the registered slot pointer) with a freshly
-  // resolved specialization (call on a taskpool cache hit or a successful
-  // compile). One-shot: the first resolver wins; later resolves (same pointer,
-  // invariant) no-op. No-op when reclamation is not safe, the function is
-  // unregistered (no slot wired), funcIndex is out of range, or fnPtr is null.
-  void icacheFill(uint32_t funcIndex, void *fnPtr);
+  bool icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
+                 uint32_t numDims, void **outFn);
+  // Fill the per-function icache cell at [i0][i1]... (linearized from \p dims,
+  // row-major, dim0 = leftmost ejit_dim param - MUST match the AOT array order)
+  // with a freshly resolved specialization (call on a taskpool cache hit or a
+  // successful compile). One-shot per cell: the first resolver for an identity
+  // wins; later resolves of the same identity (same invariant pointer) no-op;
+  // a different identity fills a different cell. No-op when reclamation is not
+  // safe, the function is unregistered (no base wired) or numDims mismatches,
+  // funcIndex is out of range, or fnPtr is null.
+  void icacheFill(uint32_t funcIndex, void *fnPtr, const EJitDimPair *dims,
+                  uint32_t numDims);
 
   //--- consumer path (worker / test) -----------------------------------------
   bool pollOne();

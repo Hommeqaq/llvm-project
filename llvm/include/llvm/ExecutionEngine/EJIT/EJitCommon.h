@@ -29,6 +29,23 @@
 #include <optional>
 #include <string>
 
+//===----------------------------------------------------------------------===//
+// Multi-version inline-cache sizing. The per-function @__ejit_icache_fn_<name>
+// global is a [D]^numDims array (D = EJIT_ICACHE_DIM_SIZE) indexed by the
+// ejit_dim argument values. D MUST be a power of 2 (the hit path indexes with
+// shifts, no multiply). The CMake EJIT_ICACHE_DIM_SIZE var overrides this
+// default and is applied to BOTH the AOT pass (LLVMEmbeddedJIT, which emits
+// the array type) and the runtime (LLVMEJIT, which linearizes on fill) so the
+// two always agree. EJIT_ICACHE_MAX_DIMS caps the dimensionality; an ejit_entry
+// with more ejit_dim params is a compile error.
+//===----------------------------------------------------------------------===//
+#ifndef EJIT_ICACHE_DIM_SIZE
+#define EJIT_ICACHE_DIM_SIZE 8u
+#endif
+#ifndef EJIT_ICACHE_MAX_DIMS
+#define EJIT_ICACHE_MAX_DIMS 4u
+#endif
+
 namespace llvm {
 namespace ejit {
 

@@ -155,13 +155,16 @@ void ejit_register_lifecycle(const char *lifecycleName, uint32_t *slotOut);
 void ejit_register_funcindex(const char *funcName, uint32_t *slotOut);
 
 // Register the wrapper's per-function inline-cache slot (@__ejit_icache_fn_<name>
-// global address) by name. The runtime writes the frozen specialization pointer
-// through it on a successful resolve (icacheFill); the wrapper reads it directly
-// on the hit path (one atomic load + null-check + indirect call, no
-// ejit_icache_try call). Keys the slot by the SAME registry funcIndex assigned
-// by ejit_register_funcindex. Called by AOT auto-registration. A null slot or
-// capacity exhaustion is recorded; the slot stays null and the probe misses.
-void ejit_register_icache_slot(const char *funcName, void *slot);
+// global address) by name, with its dimensionality (number of ejit_dim params).
+// The runtime writes the frozen specialization pointer through the [D]^numDims
+// cell at [i0][i1]... on a successful resolve (icacheFill); the wrapper reads
+// the cell directly on the hit path (GEP + one atomic load + null-check +
+// indirect call, no ejit_icache_try call). Keys the slot by the SAME registry
+// funcIndex assigned by ejit_register_funcindex. Called by AOT auto-registration.
+// A null slot or capacity exhaustion is recorded; the base stays null and the
+// probe misses.
+void ejit_register_icache_slot(const char *funcName, void *slot,
+                               uint32_t numDims);
 
 // Lifecycle. Activation is keyed by lifecycle/period name + instance index
 // only; there is no array-pointer dimension in the active state (a period name

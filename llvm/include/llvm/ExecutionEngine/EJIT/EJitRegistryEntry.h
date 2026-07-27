@@ -40,8 +40,9 @@ typedef struct {
       *name1; // funcName / periodName / varName / symbolName / lifecycleName
   const char *name2; // varName (period/static), NULL otherwise
   const void *ptr;   // bitcode data / baseAddr / symbol addr / &i32 slot /
-                     //   &ptr icache slot (EJIT_REG_ICACHE_SLOT)
-  uint64_t size;     // bitcode size / array size / 0
+                     //   &ptr icache slot base (EJIT_REG_ICACHE_SLOT)
+  uint64_t size;     // bitcode size / array size / numDims (EJIT_REG_ICACHE_SLOT)
+                     //   / 0
 } ejit_reg_entry_t;
 
 #ifdef __cplusplus
