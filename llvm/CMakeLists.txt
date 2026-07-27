@@ -578,6 +578,21 @@ if(EJIT_STATS_ENABLE)
   add_definitions(-DEJIT_STATS_ENABLE)
 endif()
 
+# Embed cold-path compile-duration timing (Total / Frontend / Backend cycle
+# counts, aggregated per funcIndex, queried/printed on demand via
+# ejit_get_compile_timing() / ejit_print_compile_timing()). The C ABI
+# (accumulate/get/print/reset) is always compiled; this option gates only the
+# auto-instrumentation macros at the compile sites (compileCold + the IR
+# transform lambda). Each cold compile costs a few ejit_taskpool_trace_now()
+# reads (SRE_CycleCountGet64 on freestanding) plus a linear slot lookup; cache
+# hits never reach this path, so the cost is negligible. Default OFF: the
+# bracket macros compile out to nothing and the aggregator stays empty.
+# Enable with -DEJIT_COMPILE_TIMING_ENABLE=ON (or build.sh --compile-timing).
+option(EJIT_COMPILE_TIMING_ENABLE "Embed EJIT compile-duration timing (cold-path cycle-counter cost; default OFF)" OFF)
+if(EJIT_COMPILE_TIMING_ENABLE)
+  add_definitions(-DEJIT_COMPILE_TIMING_ENABLE)
+endif()
+
 option(EJIT_TRIM_LLVM_BACKEND "Trim LLVM backend pieces used by EJIT: disable heavyweight debug info, GlobalISel, and optional AArch64 SME/SVE passes" OFF)
 if(EJIT_TRIM_LLVM_BACKEND)
   add_definitions(-DEJIT_TRIM_LLVM_BACKEND)

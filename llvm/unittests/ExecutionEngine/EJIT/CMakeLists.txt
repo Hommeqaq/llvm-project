@@ -10,6 +10,14 @@ set(LLVM_LINK_COMPONENTS
   Support
   TargetParser
   )
+# EJit.cpp's non-trim path calls InitializeAllAsmParsers(), whose inline
+# expansion references every built target's asm parser lib (e.g. LLVMX86AsmParser
+# on an x86 host). Link each built target's AsmParser so EJITTests links on the
+# host build. The aarch64_be freestanding target build takes EJit.cpp's
+# triple-specific early-return path and is unaffected (and builds no tests).
+foreach(_t ${LLVM_TARGETS_TO_BUILD})
+  list(APPEND LLVM_LINK_COMPONENTS ${_t}AsmParser)
+endforeach()
 
 add_llvm_unittest(EJITTests
   EJitRuntimeTest.cpp

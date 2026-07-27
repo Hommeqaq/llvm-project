@@ -6,6 +6,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCompileTiming.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -98,6 +99,11 @@ struct EJitOrcEngine::Impl {
   PeriodArrayRegistry *periodReg = nullptr;
   EJitRuntimeState *runtimeState = nullptr;
   const SpecializationContext *activeCtx = nullptr;
+#ifdef EJIT_COMPILE_TIMING_ENABLE
+  /// Front-end (runPipeline) cycles of the in-flight compile, captured by the
+  /// IR transform lambda and consumed by compileCold via takeFrontendCycles().
+  uint64_t lastFrontendCycles = 0;
+#endif
   /// Per-specialization JITDylib pointers so each specialization is
   /// independently compiled and symbols from different specializations
   /// never conflict.
@@ -730,7 +736,9 @@ EJitOrcEngine::Create(const Config &config,
               M.print(preOS, nullptr);
           }
 
+          EJIT_COMPILE_TIMING_FE_BEGIN(engine, feT1);
           engine->P->optimizer->runPipeline(M, *ctx);
+          EJIT_COMPILE_TIMING_FE_END(engine, feT1);
 
           // Dump post-optimization IR.
           if (!engine->P->dumpJITDir.empty()) {
@@ -1055,7 +1063,26 @@ Expected<void *> EJitOrcEngine::lookup(uint64_t cacheKey,
 
 void EJitOrcEngine::setActiveContext(const SpecializationContext *ctx) {
   P->activeCtx = ctx;
+#ifdef EJIT_COMPILE_TIMING_ENABLE
+  // Reset the front-end accumulator for this compile; if the transform lambda
+  // never runs (e.g. lookup short-circuits an already-materialized symbol),
+  // takeFrontendCycles() returns 0 and the whole compile reads as backend.
+  if (ctx)
+    P->lastFrontendCycles = 0;
+#endif
 }
+
+#ifdef EJIT_COMPILE_TIMING_ENABLE
+void EJitOrcEngine::setFrontendCycles(uint64_t cycles) {
+  P->lastFrontendCycles = cycles;
+}
+
+uint64_t EJitOrcEngine::takeFrontendCycles() {
+  uint64_t c = P->lastFrontendCycles;
+  P->lastFrontendCycles = 0;
+  return c;
+}
+#endif
 
 const SpecializationContext *EJitOrcEngine::getActiveContext() const {
   return P->activeCtx;

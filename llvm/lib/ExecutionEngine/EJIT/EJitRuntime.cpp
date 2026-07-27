@@ -95,6 +95,73 @@ static void resetTimingSlot(WrapperTimingSlot &S, uint32_t FuncIndex,
 }
 } // namespace
 
+namespace {
+// Cold-path compile-duration aggregator. Per-core BSS, no lock: compilation is
+// single-threaded per pool (LLJIT setNumCompileThreads(0)), mirroring
+// gWrapperTimingSlots. Lookup is LINEAR by funcIndex (compiles are cold and
+// distinct functions few); unlike WrapperTimingSlot, slots are NOT reset on a
+// periodic cadence, so a hash collision would silently mix two functions'
+// stats forever - a linear scan avoids that. Table-full spills into the shared
+// overflow slot (FuncIndex left 0, reported as "(overflow)").
+struct CompileTimingSlot {
+  bool Valid = false;
+  uint32_t FuncIndex = 0;
+  uint64_t Count = 0;
+  uint64_t TotalSum = 0;
+  uint64_t FeSum = 0;
+  uint64_t BeSum = 0;
+  uint64_t MinTotal = ~0ULL;
+  uint64_t MaxTotal = 0;
+};
+
+static constexpr unsigned kCompileTimingSlots = 64;
+static CompileTimingSlot gCompileTimingSlots[kCompileTimingSlots];
+static CompileTimingSlot gCompileTimingOverflow;
+
+static void resetCompileTimingSlot(CompileTimingSlot &S) {
+  S.Valid = false;
+  S.FuncIndex = 0;
+  S.Count = 0;
+  S.TotalSum = 0;
+  S.FeSum = 0;
+  S.BeSum = 0;
+  S.MinTotal = ~0ULL;
+  S.MaxTotal = 0;
+}
+
+static CompileTimingSlot *findCompileTimingSlot(uint32_t funcIndex) {
+  CompileTimingSlot *firstFree = nullptr;
+  for (unsigned i = 0; i < kCompileTimingSlots; ++i) {
+    if (gCompileTimingSlots[i].Valid &&
+        gCompileTimingSlots[i].FuncIndex == funcIndex)
+      return &gCompileTimingSlots[i];
+    if (!gCompileTimingSlots[i].Valid && !firstFree)
+      firstFree = &gCompileTimingSlots[i];
+  }
+  if (firstFree) {
+    firstFree->Valid = true;
+    firstFree->FuncIndex = funcIndex;
+    return firstFree;
+  }
+  gCompileTimingOverflow.Valid = true;
+  return &gCompileTimingOverflow;
+}
+
+// cntfrq_el0 is the system counter frequency (Hz) for cycles->us. Readable
+// from EL1 (and EL0 when CNTKCTL_EL1.EL0VCTEN is set, which the BSP that
+// implements SRE_CycleCountGet64 is expected to have done). Returns 0 off
+// aarch64 or if unreadable; ejit_print_compile_timing then omits [us: ...].
+static uint64_t ejitCycleFreqHz() {
+#if defined(__aarch64__)
+  uint64_t v;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(v));
+  return v;
+#else
+  return 0;
+#endif
+}
+} // namespace
+
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 static void bindDumpSharedStateFromRuntime() {
   if (!gEJIT) {
@@ -975,6 +1042,106 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
 #else
   (void)tAfterRelease;
 #endif
+}
+
+void ejit_accumulate_compile_timing(uint32_t funcIndex, uint64_t totalCycles,
+                                    uint64_t feCycles) {
+  // Backend = total - frontend. Clamp to 0 if feCycles > totalCycles (only
+  // possible across a counter wraparound, or if the front-end stamp ran but the
+  // total stamp was skipped on an early-return path).
+  uint64_t beCycles = totalCycles > feCycles ? totalCycles - feCycles : 0;
+  CompileTimingSlot &S = *findCompileTimingSlot(funcIndex);
+  ++S.Count;
+  S.TotalSum += totalCycles;
+  S.FeSum += feCycles;
+  S.BeSum += beCycles;
+  if (totalCycles < S.MinTotal)
+    S.MinTotal = totalCycles;
+  if (totalCycles > S.MaxTotal)
+    S.MaxTotal = totalCycles;
+}
+
+ejit_status_t ejit_get_compile_timing(uint32_t funcIndex,
+                                      ejit_compile_timing_t *out) {
+  if (!out)
+    return EJIT_ERR_INVALID_PARAM;
+  out->funcIndex = 0;
+  out->count = 0;
+  out->totalSum = 0;
+  out->feSum = 0;
+  out->beSum = 0;
+  out->minTotal = 0;
+  out->maxTotal = 0;
+  for (unsigned i = 0; i < kCompileTimingSlots; ++i) {
+    const CompileTimingSlot &S = gCompileTimingSlots[i];
+    if (S.Valid && S.FuncIndex == funcIndex) {
+      out->funcIndex = S.FuncIndex;
+      out->count = S.Count;
+      out->totalSum = S.TotalSum;
+      out->feSum = S.FeSum;
+      out->beSum = S.BeSum;
+      out->minTotal = S.MinTotal;
+      out->maxTotal = S.MaxTotal;
+      return EJIT_OK;
+    }
+  }
+  return EJIT_ERR_NOT_ACTIVE;
+}
+
+void ejit_reset_compile_timing(void) {
+  for (unsigned i = 0; i < kCompileTimingSlots; ++i)
+    resetCompileTimingSlot(gCompileTimingSlots[i]);
+  resetCompileTimingSlot(gCompileTimingOverflow);
+}
+
+void ejit_print_compile_timing(void) {
+#ifdef EJIT_COMPILE_TIMING_ENABLE
+  EJIT_DIAG("compile_timing: auto_instrument=ON slots=%u",
+            (unsigned)kCompileTimingSlots);
+#else
+  EJIT_DIAG("compile_timing: auto_instrument=OFF (rebuild with "
+            "EJIT_COMPILE_TIMING_ENABLE, or call ejit_accumulate_compile_timing "
+            "manually) slots=%u",
+            (unsigned)kCompileTimingSlots);
+#endif
+  uint64_t freq = ejitCycleFreqHz();
+  unsigned printed = 0;
+  for (unsigned i = 0; i < kCompileTimingSlots; ++i) {
+    const CompileTimingSlot &S = gCompileTimingSlots[i];
+    if (!S.Valid || S.Count == 0)
+      continue;
+    uint64_t meanTotal = S.TotalSum / S.Count;
+    if (freq) {
+      EJIT_DIAG("compile_timing_agg func=%u count=%llu total_sum=%llu "
+                "fe_sum=%llu be_sum=%llu min=%llu max=%llu mean=%llu "
+                "[us: total=%llu fe=%llu be=%llu]",
+                S.FuncIndex, (unsigned long long)S.Count,
+                (unsigned long long)S.TotalSum, (unsigned long long)S.FeSum,
+                (unsigned long long)S.BeSum, (unsigned long long)S.MinTotal,
+                (unsigned long long)S.MaxTotal, (unsigned long long)meanTotal,
+                (unsigned long long)(S.TotalSum * 1000000ULL / freq),
+                (unsigned long long)(S.FeSum * 1000000ULL / freq),
+                (unsigned long long)(S.BeSum * 1000000ULL / freq));
+    } else {
+      EJIT_DIAG("compile_timing_agg func=%u count=%llu total_sum=%llu "
+                "fe_sum=%llu be_sum=%llu min=%llu max=%llu mean=%llu",
+                S.FuncIndex, (unsigned long long)S.Count,
+                (unsigned long long)S.TotalSum, (unsigned long long)S.FeSum,
+                (unsigned long long)S.BeSum, (unsigned long long)S.MinTotal,
+                (unsigned long long)S.MaxTotal, (unsigned long long)meanTotal);
+    }
+    ++printed;
+  }
+  if (gCompileTimingOverflow.Valid && gCompileTimingOverflow.Count > 0) {
+    const CompileTimingSlot &S = gCompileTimingOverflow;
+    EJIT_DIAG("compile_timing_agg func=(overflow) count=%llu total_sum=%llu "
+              "fe_sum=%llu be_sum=%llu",
+              (unsigned long long)S.Count, (unsigned long long)S.TotalSum,
+              (unsigned long long)S.FeSum, (unsigned long long)S.BeSum);
+    ++printed;
+  }
+  if (printed == 0)
+    EJIT_DIAG("compile_timing: (no samples)");
 }
 
 ejit_status_t ejit_taskpool_get_stats(ejit_taskpool_stats_t *out) {

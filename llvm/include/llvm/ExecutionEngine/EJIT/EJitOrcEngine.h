@@ -85,6 +85,17 @@ public:
   void setActiveContext(const SpecializationContext *ctx);
   const SpecializationContext *getActiveContext() const;
 
+#ifdef EJIT_COMPILE_TIMING_ENABLE
+  /// Capture the front-end (runPipeline) cycle delta of the in-flight compile,
+  /// for the compile-duration timing brackets (see EJitCompileTiming.h).
+  /// setFrontendCycles() is called from the IR transform lambda after
+  /// runPipeline; takeFrontendCycles() is called from compileCold after
+  /// lookup() returns and resets the value to 0. Compilation is single-
+  /// threaded per pool, so no synchronization is needed.
+  void setFrontendCycles(uint64_t cycles);
+  uint64_t takeFrontendCycles();
+#endif
+
   /// Register a user-defined external symbol (function or global) that the
   /// JIT can resolve when compiling bitcode modules. Required for bare-metal
   /// environments where dynamic symbol lookup is unavailable.

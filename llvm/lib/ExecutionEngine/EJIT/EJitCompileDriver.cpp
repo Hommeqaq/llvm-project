@@ -11,6 +11,7 @@
 #endif
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "llvm/ExecutionEngine/EJIT/EJitCompileTiming.h"
 #ifdef EJIT_SRE_CODE_POOL
 #include "llvm/ExecutionEngine/EJIT/EJitSrePlatform.h"
 #endif
@@ -292,6 +293,7 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
+  EJIT_COMPILE_TIMING_START(t0);
   uint8_t dims[4] = {
       static_cast<uint8_t>(cacheKey & 0xFF),
       static_cast<uint8_t>((cacheKey >> 8) & 0xFF),
@@ -398,6 +400,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, bool storeLru) {
 
   auto addrOrErr = jitEngine_->lookup(cacheKey, funcName);
   jitEngine_->setActiveContext(nullptr);
+  EJIT_COMPILE_TIMING_RECORD(funcIdx, t0, jitEngine_.get());
 
   if (!addrOrErr) {
     EJIT_DIAG("compile FAIL key=0x%016lx func=%s: lookup after compile failed",

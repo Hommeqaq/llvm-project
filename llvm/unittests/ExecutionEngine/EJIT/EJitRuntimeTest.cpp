@@ -685,6 +685,22 @@ extern void ejit_print_func_meta(const char *funcName);
 extern int ejit_get_code_pool_stats(void *out);
 extern void ejit_print_code_pool_stats(void);
 extern void ejit_print_active(void);
+// Compile-duration timing C ABI (always compiled; EJIT_COMPILE_TIMING_ENABLE
+// gates only the auto-instrumentation in compileCold). Out-struct mirrors
+// ejit_compile_timing_t (same fixed-width field order -> same layout).
+struct EjitCompileTimingOut {
+  uint32_t funcIndex;
+  uint64_t count;
+  uint64_t totalSum;
+  uint64_t feSum;
+  uint64_t beSum;
+  uint64_t minTotal;
+  uint64_t maxTotal;
+};
+extern void ejit_accumulate_compile_timing(uint32_t, uint64_t, uint64_t);
+extern int ejit_get_compile_timing(uint32_t, EjitCompileTimingOut *);
+extern void ejit_print_compile_timing(void);
+extern void ejit_reset_compile_timing(void);
 }
 
 // The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
@@ -2939,4 +2955,65 @@ TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
 
 TEST(EJitDiagnostics, PrintActiveNoCrash) {
   ejit_print_active(); // uninitialized: prints a notice
+}
+
+//====--- Compile-duration timing C API ----===//
+// The aggregator is always compiled (EJIT_COMPILE_TIMING_ENABLE gates only the
+// auto-instrumentation in compileCold); these tests feed samples manually and
+// check per-funcIndex accumulation, min/max, backend derivation, reset, and the
+// null-out / missing-func error paths. No ejit_init needed: slots are global
+// BSS, always available.
+
+TEST(EJitCompileTiming, AccumulateAndGetPerFunc) {
+  ejit_reset_compile_timing();
+  ejit_accumulate_compile_timing(7, 1000, 400);
+  ejit_accumulate_compile_timing(7, 3000, 1000);
+  EjitCompileTimingOut out{};
+  ASSERT_EQ(ejit_get_compile_timing(7, &out), 0); // EJIT_OK
+  EXPECT_EQ(out.funcIndex, 7u);
+  EXPECT_EQ(out.count, 2u);
+  EXPECT_EQ(out.totalSum, 4000u);
+  EXPECT_EQ(out.feSum, 1400u);
+  EXPECT_EQ(out.beSum, 2600u); // (1000-400)+(3000-1000)=600+2000
+  EXPECT_EQ(out.minTotal, 1000u);
+  EXPECT_EQ(out.maxTotal, 3000u);
+}
+
+TEST(EJitCompileTiming, DistinctFuncsUseDistinctSlots) {
+  ejit_reset_compile_timing();
+  ejit_accumulate_compile_timing(11, 500, 100);
+  ejit_accumulate_compile_timing(22, 800, 300);
+  EjitCompileTimingOut a{};
+  EjitCompileTimingOut b{};
+  ASSERT_EQ(ejit_get_compile_timing(11, &a), 0);
+  ASSERT_EQ(ejit_get_compile_timing(22, &b), 0);
+  EXPECT_EQ(a.count, 1u);
+  EXPECT_EQ(a.totalSum, 500u);
+  EXPECT_EQ(b.count, 1u);
+  EXPECT_EQ(b.totalSum, 800u);
+}
+
+TEST(EJitCompileTiming, GetMissingFuncReturnsNotActive) {
+  ejit_reset_compile_timing();
+  EjitCompileTimingOut out{};
+  EXPECT_NE(ejit_get_compile_timing(999, &out), 0); // EJIT_ERR_NOT_ACTIVE
+}
+
+TEST(EJitCompileTiming, NullOutRejected) {
+  EXPECT_NE(ejit_get_compile_timing(7, nullptr), 0); // EJIT_ERR_INVALID_PARAM
+}
+
+TEST(EJitCompileTiming, ResetClearsSlots) {
+  ejit_reset_compile_timing();
+  ejit_accumulate_compile_timing(7, 1000, 400);
+  ejit_reset_compile_timing();
+  EjitCompileTimingOut out{};
+  EXPECT_NE(ejit_get_compile_timing(7, &out), 0); // gone after reset
+}
+
+TEST(EJitCompileTiming, PrintDoesNotCrash) {
+  ejit_reset_compile_timing();
+  ejit_accumulate_compile_timing(7, 1000, 400);
+  ejit_print_compile_timing(); // exercises print path + ejitCycleFreqHz
+  ejit_reset_compile_timing();
 }

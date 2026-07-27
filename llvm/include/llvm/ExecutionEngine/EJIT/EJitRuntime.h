@@ -238,6 +238,41 @@ void ejit_taskpool_trace_wrapper(uint32_t funcIndex, uint32_t status,
                                  uint64_t tAfterFn,
                                  uint64_t tAfterRelease);
 
+// Compile-duration timing (cold path). The aggregator is always compiled;
+// EJIT_COMPILE_TIMING_ENABLE gates only the auto-instrumentation brackets in
+// compileCold / the IR transform lambda. Timestamp unit is platform-defined
+// (SRE_CycleCountGet64 on freestanding, steady_clock ns on host), matching
+// ejit_taskpool_trace_now(). All fixed-width for a stable ABI across the
+// aarch64_be target.
+typedef struct {
+  uint32_t funcIndex;   ///< Function index the slot aggregates.
+  uint64_t count;       ///< Cold compiles recorded for this function.
+  uint64_t totalSum;    ///< Sum of total compile cycles (frontend+backend).
+  uint64_t feSum;       ///< Sum of frontend (runPipeline) cycles.
+  uint64_t beSum;       ///< Sum of backend (codegen+JITLink) cycles.
+  uint64_t minTotal;    ///< Minimum total cycles (UINT64_MAX if none recorded).
+  uint64_t maxTotal;    ///< Maximum total cycles observed.
+} ejit_compile_timing_t;
+
+/// Accumulate one cold compile's durations for \p funcIndex. \p totalCycles is
+/// the whole cold compile (compileCold body); \p feCycles is the frontend
+/// (runPipeline) subset; backend is derived as total - frontend. Safe to call
+/// directly from a debug harness even when EJIT_COMPILE_TIMING_ENABLE is off.
+void ejit_accumulate_compile_timing(uint32_t funcIndex, uint64_t totalCycles,
+                                    uint64_t feCycles);
+
+/// Snapshot one function's aggregated compile timing into \p out. Returns
+/// EJIT_OK on hit, EJIT_ERR_NOT_ACTIVE if no slot matches \p funcIndex.
+ejit_status_t ejit_get_compile_timing(uint32_t funcIndex,
+                                      ejit_compile_timing_t *out);
+
+/// Print every non-empty slot as a `compile_timing_agg` line through EJIT_DIAG,
+/// plus a banner showing the auto-instrumentation build state. Non-destructive.
+void ejit_print_compile_timing(void);
+
+/// Zero every slot (count/sums/min/max). Use to measure over a fresh window.
+void ejit_reset_compile_timing(void);
+
 #ifdef EJIT_SRE_TASKPOOL_TESTING
 unsigned ejit_taskpool_poll_one(void);
 unsigned ejit_taskpool_poll_budget(unsigned maxItems);
