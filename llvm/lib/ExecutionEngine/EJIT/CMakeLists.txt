@@ -72,6 +72,12 @@ set(EJIT_SOURCES
   EJitSrePlatform.cpp
 )
 
+# AArch64 direct-call-stub rewrite plugin (drop GOT load from PLT stubs).
+# Self-contained JITLink pass; only linked in when the option is on.
+if(EJIT_DIRECT_CALL_STUBS)
+  list(APPEND EJIT_SOURCES EJitDirectCallStubs.cpp)
+endif()
+
 # EJitLogger has its own #ifndef EJIT_FREESTANDING no-op stubs, so always include it.
 list(APPEND EJIT_SOURCES
   EJitLogger.cpp

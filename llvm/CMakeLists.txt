@@ -661,6 +661,22 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
 endif()
 
+#===-- EmbeddedJIT direct PLT stubs (drop GOT load) ------------------------===#
+# Rewrite AArch64 JITLink PLT pointer-jump stubs (ADRP x16; LDR x16,[x16]; BR
+# x16, which load the target address from a GOT entry) into direct PC-relative
+# stubs (ADRP x16; ADD x16,x16; BR x16) that address the target directly. This
+# drops the per-call GOT data load. The JIT slab is ~1.5-2.2GB from AOT .text:
+# beyond BL's +-128MB (so a stub is unavoidable) but within ADRP's +-4GB reach.
+# If a target is ever beyond +-4GB (slab base is SRE_MemAlloc'd and uncontrolled)
+# the stub auto-falls back to the original GOT-indirect form - zero regression.
+# AArch64 ELF only; the pass is a no-op on other targets. Default ON (safe via
+# fallback); turn OFF to bisect. See EJitDirectCallStubs.{h,cpp}.
+option(EJIT_DIRECT_CALL_STUBS
+  "EJIT: rewrite AArch64 JITLink PLT stubs to direct ADRP+ADD+BR (drop GOT load); auto-fallback to GOT stub beyond +-4GiB" ON)
+if(EJIT_DIRECT_CALL_STUBS)
+  add_definitions(-DEJIT_DIRECT_CALL_STUBS)
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2

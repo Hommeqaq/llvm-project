@@ -46,6 +46,10 @@ extern "C" uint32_t SRE_TaskDelay(uint32_t tick);
 #ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #endif
+#ifdef EJIT_DIRECT_CALL_STUBS
+#include "llvm/ExecutionEngine/EJIT/EJitDirectCallStubs.h"
+#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
+#endif
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -662,6 +666,17 @@ EJitOrcEngine::Create(const Config &config,
   }
 
   engine->P->J = std::move(*J);
+
+#ifdef EJIT_DIRECT_CALL_STUBS
+  // Install the direct-call-stub rewrite plugin on the ObjectLinkingLayer. It
+  // rewrites AArch64 PLT pointer-jump stubs (ADRP+LDR+BR via GOT) into direct
+  // ADRP+ADD+BR stubs when the target is within ADRP's +-4GiB reach, dropping
+  // the per-call GOT data load. No-op on non-AArch64; auto-falls back to the
+  // GOT-indirect stub beyond +-4GiB. See EJitDirectCallStubs.{h,cpp}.
+  if (auto *OLL = dyn_cast<orc::ObjectLinkingLayer>(
+          &engine->P->J->getObjLinkingLayer()))
+    OLL->addPlugin(EJitDirectCallStubsPlugin::create());
+#endif
 
   // Override the default error reporter (logErrorsToStdErr → errs() →
   // raw_fd_ostream) with a bare-metal-safe version using EJIT_DIAG.  On
