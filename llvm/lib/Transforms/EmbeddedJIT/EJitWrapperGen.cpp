@@ -866,12 +866,12 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       };
       if (F->getReturnType()->isVoidTy()) {
         CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        CI->setTailCall(true);
+        CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         emitHitTiming();
         B.CreateRetVoid();
       } else {
         CallInst *CI = B.CreateCall(F->getFunctionType(), ICSlotLoad, ICArgs);
-        CI->setTailCall(true);
+        CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         emitHitTiming();
         B.CreateRet(CI);
       }
@@ -882,11 +882,11 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       for (auto &A : F->args()) MissArgs.push_back(&A);
       if (F->getReturnType()->isVoidTy()) {
         CallInst *CI = B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
-        CI->setTailCall(true);
+        CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         B.CreateRetVoid();
       } else {
         CallInst *CI = B.CreateCall(MissFn->getFunctionType(), MissFn, MissArgs);
-        CI->setTailCall(true);
+        CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         B.CreateRet(CI);
       }
     } else {
