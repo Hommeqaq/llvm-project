@@ -72,7 +72,7 @@ CLANG="${BUILD_DIR}/bin/clang"
 CXX="${CLANG}++"
 BUILD_INCLUDE="${BUILD_DIR}/include"
 LLVM_INCLUDE="${ROOT_DIR}/llvm/include"
-INCLUDES="-I${LLVM_INCLUDE} -I${BUILD_INCLUDE}"
+INCLUDES="-I${LLVM_INCLUDE} -I${BUILD_INCLUDE} -I${SCRIPT_DIR}"
 
 LD_LLD="${BUILD_DIR}/bin/ld.lld"
 [[ -x "${LD_LLD}" ]] || { echo "ERROR: lld not found at ${LD_LLD}"; exit 1; }
@@ -100,6 +100,8 @@ _set_min_libs() {
     ${_l}/libLLVMSelectionDAG.a ${_l}/libLLVMAsmPrinter.a ${_l}/libLLVMMC.a
     ${_l}/libLLVMObject.a ${_l}/libLLVMProfileData.a ${_l}/libLLVMExecutionEngine.a
     ${_l}/libLLVMOrcJIT.a ${_l}/libLLVMOrcShared.a ${_l}/libLLVMJITLink.a
+    ${_l}/libLLVMPasses.a
+    ${_l}/libLLVMAggressiveInstCombine.a ${_l}/libLLVMCoroutines.a
     ${_l}/libLLVMRemarks.a ${_l}/libLLVMOption.a ${_l}/libLLVMMCDisassembler.a
     ${_l}/libLLVMIRPrinter.a ${_l}/libLLVMCFGuard.a
     ${_l}/libLLVMInstrumentation.a
@@ -177,6 +179,7 @@ ALL_TESTS=(
   ejit_inline_asm_test
   ejit_likely_test
   ejit_cross_inline_test
+  ejit_cross_deep_inline_test
   ejit_lto_inline_test
   ejit_lifecycle_test
   ejit_multidim_test
@@ -204,16 +207,30 @@ COMPILE_FLAGS[ejit_baremetal_link_test]="-mllvm -enable-ejit-global-ctors=false"
 COMPILE_FLAGS[ejit_fixed_dim_test]=""
 COMPILE_FLAGS[ejit_lto_inline_test]="-flto=thin"
 COMPILE_FLAGS[ejit_cross_inline_test]="-fejit-cross-inline"
+# Deep multi-level cross-TU inline chain (4 TUs). Same compile flag on every TU
+# so each embeds its full-module bitcode in .ejit_cross for the link-time merge.
+COMPILE_FLAGS[ejit_cross_deep_inline_test]="-fejit-cross-inline"
 
 # Per-test link flags (e.g. -flto=thin for ThinLTO tests).
 declare -A LINK_FLAGS
 LINK_FLAGS[ejit_lto_inline_test]="-flto=thin"
 LINK_FLAGS[ejit_cross_inline_test]="-fejit-cross-inline"
+# Pass --ejit-cross-inline straight to lld (via -Wl,) rather than through the
+# clang driver's -fejit-cross-inline: the driver's "must use lld" guard keys on
+# GetLinkerPath(&LinkerIsLLD), which does NOT recognise this script's
+# -fuse-ld=/abs/path/ld.lld as lld, so -fejit-cross-inline at link time errors
+# with "only allowed with -fuse-ld=lld". -Wl,--ejit-cross-inline reaches lld
+# directly and is exactly what the driver would have forwarded. --save-temps
+# makes ld.lld write the per-entry bitcode (.ejit-cross.<fn>.bc) so the
+# POST_BUILD_CHECK script can prove the cross-TU chain was inlined.
+LINK_FLAGS[ejit_cross_deep_inline_test]="-Wl,--ejit-cross-inline -Wl,--save-temps"
 
 # Override the primary source file for a test (default: <name>.c). Lets a test
 # reuse existing sources under a different build/link recipe without copying.
 declare -A PRIMARY_SRC
 PRIMARY_SRC[ejit_baremetal_link_test]="ejit_multi_tu_test.c"
+# Deep cross-TU inline scenario lives in its own subdirectory.
+PRIMARY_SRC[ejit_cross_deep_inline_test]="ejit_cross_deep_inline/ejit_cross_deep_inline_test.c"
 
 # Custom linker script (-Wl,-T) for a test, relative to this dir.
 # Both ctors-disabled tests need it: the static registry tables live in the
@@ -234,6 +251,8 @@ EXTRA_SRCS[ejit_multi_tu_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_baremetal_link_test]="ejit_multi_tu_test_b.c"
 EXTRA_SRCS[ejit_lto_inline_test]="ejit_lto_inline_test_b.c"
 EXTRA_SRCS[ejit_cross_inline_test]="ejit_lto_inline_test_b.c"
+# 3 stage TUs, each in its own module, form the deep cross-TU call chain.
+EXTRA_SRCS[ejit_cross_deep_inline_test]="ejit_cross_deep_inline/ejit_cross_deep_stage1.c ejit_cross_deep_inline/ejit_cross_deep_stage2.c ejit_cross_deep_inline/ejit_cross_deep_stage3.c"
 
 declare -A TEST_ARGS
 TEST_ARGS[ejit_complex_test]="0 1 2 3"
@@ -245,6 +264,7 @@ TEST_ARGS[ejit_inline_asm_test]=""
 TEST_ARGS[ejit_likely_test]="0 1 7"
 TEST_ARGS[ejit_lto_inline_test]="0"
 TEST_ARGS[ejit_cross_inline_test]="0"
+TEST_ARGS[ejit_cross_deep_inline_test]="0"
 TEST_ARGS[ejit_external_idx_test]="3 1"
 TEST_ARGS[ejit_lifecycle_test]="3 7 2"
 TEST_ARGS[ejit_multidim_test]="0"
@@ -260,6 +280,13 @@ TEST_ARGS[ejit_baremetal_link_test]="0 3"
 TEST_ARGS[ejit_sync_mode_test]="0"
 TEST_ARGS[ejit_new_attr_test]="0"
 TEST_ARGS[ejit_fixed_dim_test]="0 1"
+
+# Optional post-build check script (relative to this dir) run after a successful
+# link. Used by tests that need to inspect a build artifact (e.g. the
+# --save-temps per-entry bitcode) to prove something the binary's own output
+# cannot. The script receives the build dir and out dir as $1 / $2.
+declare -A POST_BUILD_CHECK
+POST_BUILD_CHECK[ejit_cross_deep_inline_test]="ejit_cross_deep_inline/ejit_cross_deep_inline_check.sh"
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
   SELECTED=("${ALL_TESTS[@]}")
@@ -326,6 +353,21 @@ build_one() {
   fi
 
   echo -e "  ${GREEN}OK${NC}: ${bin}"
+
+  # Optional post-build artifact check (e.g. IR inlining proof via the
+  # --save-temps per-entry bitcode). A failure fails the build for this test.
+  local pbc="${POST_BUILD_CHECK[${name}]:-}"
+  if [[ -n "${pbc}" ]]; then
+    if [[ ! -f "${SCRIPT_DIR}/${pbc}" ]]; then
+      echo -e "${RED}  SKIP: post-build check ${SCRIPT_DIR}/${pbc} not found${NC}"
+      return 1
+    fi
+    echo "  Post-build check: ${pbc}"
+    if ! bash "${SCRIPT_DIR}/${pbc}" "${BUILD_DIR}" "${OUTDIR}"; then
+      echo -e "${RED}  FAIL: post-build check ${pbc}${NC}"
+      return 1
+    fi
+  fi
 
   # Show dependency summary on request
   if ${ANALYZE_DEPS}; then
