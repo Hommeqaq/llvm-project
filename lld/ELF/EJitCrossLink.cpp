@@ -28,9 +28,16 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
+#include "llvm/Analysis/InlineAdvisor.h"
 #include "llvm/Analysis/InlineCost.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
+#include "llvm/Analysis/ProfileSummaryInfo.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -38,6 +45,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalIFunc.h"
@@ -46,12 +54,14 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/ProfDataUtils.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -62,6 +72,7 @@
 #include "llvm/Transforms/IPO/Inliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
@@ -75,6 +86,45 @@ namespace {
 /// The ELF section that -fejit-cross-inline compiles emit, holding one TU's
 /// full module bitcode (see EJitRegisterBitcode.cpp::embedBitcodeInSection).
 constexpr StringRef kCrossSection = ".ejit_cross";
+
+//===-- EJIT inline policy options -----------------------------------------===//
+//
+// These run the link-time inliner in runRealInliner (ld.lld, -mllvm). They are
+// link-time only (the compile-time PASS1 cross-inline mode is unaffected).
+// ld.lld parses -mllvm args (via parseClangOption -> cl::ParseCommandLineOptions)
+// before runEJitCrossLink runs, so they are live when the advisor is built.
+//
+//   clang -fejit-cross-inline -Wl,-mllvm,-ejit-inline-hot-threshold=4000 ...
+//   ld.lld --ejit-cross-inline -mllvm -ejit-inline-diag ...
+enum class EJitInlinePolicy { Off, On };
+cl::opt<EJitInlinePolicy> EJitInlinePolicyOpt(
+    "ejit-inline-policy", cl::init(EJitInlinePolicy::On), cl::Hidden,
+    cl::desc("EJIT link-time inline policy for the ejit_entry subtree:"),
+    cl::values(clEnumValN(EJitInlinePolicy::Off, "off",
+                          "current behavior (AlwaysInliner + default inliner)"),
+               clEnumValN(EJitInlinePolicy::On, "on",
+                          "EJIT hot/cold advisor with configurable thresholds")));
+cl::opt<int> EJitInlineThreshold(
+    "ejit-inline-threshold", cl::init(225), cl::Hidden,
+    cl::desc("EJIT inline threshold for WARM call sites"));
+cl::opt<int> EJitInlineHotThreshold(
+    "ejit-inline-hot-threshold", cl::init(3000), cl::Hidden,
+    cl::desc("EJIT inline threshold for HOT call sites"));
+// Cold call sites are never inlined (a cold branch is kept as a call); the
+// cold threshold is intentionally not an option. always_inline still forces
+// inlining (it is decided before zone classification).
+cl::opt<unsigned> EJitInlineColdCutoff(
+    "ejit-inline-cold-cutoff", cl::init(1), cl::Hidden,
+    cl::desc("Branch-weight cutoff: a call site reached via an edge with weight "
+             "<= this is classified COLD"));
+cl::opt<unsigned> EJitInlineHotCutoff(
+    "ejit-inline-hot-cutoff", cl::init(2000), cl::Hidden,
+    cl::desc("Branch-weight cutoff: a call site reached via an edge with weight "
+             ">= this (and greater than its sibling) is classified HOT"));
+cl::opt<bool> EJitInlineDiag(
+    "ejit-inline-diag", cl::init(false), cl::Hidden,
+    cl::desc("Print the raw reason each call site was NOT inlined, plus a "
+             "summary"));
 
 /// Build a contextual error. Every cross-inline failure carries the input
 /// file, the failing stage and the underlying diagnostic so the link error is
@@ -306,11 +356,335 @@ static void reAnnotateMayConst(Module &M) {
   }
 }
 
-/// Real, cost-model-driven inliner (Area 2): mandatory always-inline first,
-/// then the production module inliner (the same CGSCC inliner + inline cost
-/// model buildPerModuleDefaultPipeline uses), then a light cleanup. Ordinary
-/// (non always_inline) helpers are inlined when the cost model allows; large
-/// functions are not force-inlined.
+//===-- EJIT hot/cold inline policy ---------------------------------------===//
+//
+// A custom InlineAdvisor injected via PluginInlineAdvisorAnalysis. The CGSCC
+// InlinerPass does the actual inlining (and iterates to a fixpoint, so the
+// policy is transitive: children of children are covered). The advisor only
+// decides per call site and records the reason. always_inline is handled by
+// AlwaysInlinerPass (not the advisor), so it never appears in diagnostics.
+
+enum class Zone { Hot, Warm, Cold };
+
+static StringRef zoneStr(Zone Z) {
+  switch (Z) {
+  case Zone::Hot: return "hot";
+  case Zone::Warm: return "warm";
+  case Zone::Cold: return "cold";
+  }
+  return "warm";
+}
+
+static std::string formatCallLoc(const CallBase &CB) {
+  const DebugLoc &DL = CB.getDebugLoc();
+  if (!DL)
+    return {};
+  DILocation *Loc = DL.get();
+  if (!Loc)
+    return {};
+  StringRef File = Loc->getFilename();
+  if (File.empty())
+    return Twine(Loc->getLine()).str();
+  return (File + ":" + Twine(Loc->getLine())).str();
+}
+
+/// One inline decision, captured for diagnostics. Reason is populated for
+/// not-inlined call sites (the raw LLVM reason for legality failures, or the
+/// cost/threshold numbers for cost-based misses).
+struct EJitInlineDecision {
+  std::string CallerName;
+  std::string CalleeName;
+  std::string Loc;
+  Zone Z = Zone::Warm;
+  int Cost = 0;
+  int Threshold = 0;
+  std::string Reason;
+};
+
+/// Collects inline decisions and prints the not-inlined ones (with their raw
+/// reason) plus a summary, when -mllvm -ejit-inline-diag is on. A file-scope
+/// instance is used because the PluginInlineAdvisorAnalysis factory is a plain
+/// function pointer and cannot capture state; runRealInliner clears/flushes it
+/// around the single link-time run.
+class EJitInlineDiagRecorder {
+public:
+  void clear() {
+    Considered = Inlined = NotInlined = 0;
+    Missed.clear();
+  }
+  void recordInlined(const EJitInlineDecision &) {
+    ++Considered;
+    ++Inlined;
+  }
+  void recordMissed(const EJitInlineDecision &D) {
+    ++Considered;
+    ++NotInlined;
+    Missed.push_back(D);
+  }
+  void flush(raw_ostream &OS) const {
+    if (!EJitInlineDiag)
+      return;
+    for (const auto &D : Missed) {
+      OS << "[ejit-inline] " << D.CallerName << " -> " << D.CalleeName;
+      if (!D.Loc.empty())
+        OS << " at " << D.Loc;
+      OS << ": not inlined (" << D.Reason << ")\n";
+    }
+    OS << "[ejit-inline] summary: considered=" << Considered
+       << " inlined=" << Inlined << " not_inlined=" << NotInlined << "\n";
+  }
+
+private:
+  unsigned Considered = 0, Inlined = 0, NotInlined = 0;
+  SmallVector<EJitInlineDecision, 16> Missed;
+};
+
+static EJitInlineDiagRecorder gDiag;
+
+/// Result of classifying a call site: the zone plus the IR evidence that put it
+/// there (used verbatim in the diagnostic reason).
+struct ZoneResult {
+  Zone Z = Zone::Warm;
+  std::string Evidence;
+};
+
+/// Classify a call site's zone from IR signals (no PGO required). The standard
+/// inliner without a profile summary ignores the `hot` attribute and only gives
+/// `!prof`-hot edges the local 525 threshold; this classifier is what lets the
+/// hot threshold (default 3000) apply, and what marks cold flow as never-inline.
+static ZoneResult classifyZone(CallBase &CB, Function &Callee, DominatorTree &DT,
+                               BlockFrequencyInfo *BFI) {
+  ZoneResult R;
+  Function &Caller = *CB.getCaller();
+  BasicBlock *BB = CB.getParent();
+
+  // 1. cold attribute on callee or caller.
+  if (Callee.hasFnAttribute(Attribute::Cold)) {
+    R.Z = Zone::Cold;
+    R.Evidence = "cold function attribute (callee)";
+    return R;
+  }
+  if (Caller.hasFnAttribute(Attribute::Cold)) {
+    R.Z = Zone::Cold;
+    R.Evidence = "cold function attribute (caller)";
+    return R;
+  }
+
+  // 2. unreachable / noreturn cold path (mirrors InlineCost allowSizeGrowth).
+  if (isa<UnreachableInst>(BB->getTerminator())) {
+    R.Z = Zone::Cold;
+    R.Evidence = "unreachable path";
+    return R;
+  }
+  if (auto *II = dyn_cast<InvokeInst>(&CB))
+    if (isa<UnreachableInst>(II->getNormalDest()->getTerminator())) {
+      R.Z = Zone::Cold;
+      R.Evidence = "unreachable normal destination";
+      return R;
+    }
+
+  // 3. !prof on dominating conditional branches. Walk the dominator tree up
+  // from the call's block; at each conditional branch with branch weights, the
+  // successor that dominates the call's block is the edge taken toward it.
+  unsigned ColdCut = EJitInlineColdCutoff;
+  unsigned HotCut = EJitInlineHotCutoff;
+  bool SeenHot = false;
+  std::string HotEvidence;
+  for (DomTreeNode *N = DT.getNode(BB); N; N = N->getIDom()) {
+    BasicBlock *DomBB = N->getBlock();
+    if (!DomBB || DomBB == BB)
+      continue; // BB's own terminator does not guard the call.
+    auto *BI = dyn_cast<BranchInst>(DomBB->getTerminator());
+    if (!BI || !BI->isConditional())
+      continue;
+    uint64_t T = 0, F = 0;
+    if (!extractBranchWeights(*BI, T, F))
+      continue;
+    BasicBlock *SuccT = BI->getSuccessor(0);
+    BasicBlock *SuccF = BI->getSuccessor(1);
+    bool TDom = DT.dominates(SuccT, BB);
+    bool FDom = DT.dominates(SuccF, BB);
+    uint64_t EdgeW, OtherW;
+    if (TDom && !FDom) {
+      EdgeW = T;
+      OtherW = F;
+    } else if (FDom && !TDom) {
+      EdgeW = F;
+      OtherW = T;
+    } else {
+      continue; // both/neither reach BB: this branch does not exclusively guard it
+    }
+    if (EdgeW <= ColdCut) {
+      R.Z = Zone::Cold;
+      R.Evidence =
+          ("cold branch (edge weight " + Twine(EdgeW) + " <= cutoff " +
+           Twine(ColdCut) + ")")
+              .str();
+      return R;
+    }
+    if (EdgeW >= HotCut && OtherW < EdgeW) {
+      SeenHot = true;
+      HotEvidence =
+          ("hot branch (edge weight " + Twine(EdgeW) + " >= cutoff " +
+           Twine(HotCut) + ")")
+              .str();
+    }
+  }
+
+  // 4. hot attribute / inlinehint on callee (standard inliner ignores hot w/o
+  // PGO; inlinehint only gets 325 there).
+  if (Callee.hasFnAttribute(Attribute::Hot)) {
+    R.Z = Zone::Hot;
+    R.Evidence = "hot function attribute";
+    return R;
+  }
+  if (Callee.hasFnAttribute(Attribute::InlineHint)) {
+    R.Z = Zone::Hot;
+    R.Evidence = "inline hint (C inline keyword)";
+    return R;
+  }
+  if (SeenHot) {
+    R.Z = Zone::Hot;
+    R.Evidence = HotEvidence;
+    return R;
+  }
+
+  // 5. must-execute: the call's block is reached on every function entry (or
+  // more, if loop-amplified) -- block freq >= entry freq. This is the
+  // unannotated "must-run" case. A __builtin_expect likely branch sits at
+  // ~0.9995 of entry (< entry) but is already Hot via the !prof hot-edge check
+  // above, so the two paths do not conflict.
+  if (BFI && BFI->getBlockFreq(BB) >= BFI->getEntryFreq()) {
+    R.Z = Zone::Hot;
+    R.Evidence = "must-execute (block freq >= entry freq)";
+    return R;
+  }
+
+  R.Z = Zone::Warm;
+  return R;
+}
+
+class EJitInlineAdvice : public InlineAdvice {
+public:
+  EJitInlineAdvice(InlineAdvisor *A, CallBase &CB,
+                   OptimizationRemarkEmitter &ORE, bool Recommend,
+                   EJitInlineDiagRecorder &Sink, EJitInlineDecision Dec)
+      : InlineAdvice(A, CB, ORE, Recommend), Sink(Sink), Dec(std::move(Dec)) {}
+
+private:
+  void recordInliningImpl() override { Sink.recordInlined(Dec); }
+  void recordInliningWithCalleeDeletedImpl() override { Sink.recordInlined(Dec); }
+  void recordUnattemptedInliningImpl() override { Sink.recordMissed(Dec); }
+  void recordUnsuccessfulInliningImpl(const InlineResult &Result) override {
+    Dec.Reason = Result.getFailureReason();
+    Sink.recordMissed(Dec);
+  }
+  EJitInlineDiagRecorder &Sink;
+  EJitInlineDecision Dec;
+};
+
+class EJitInlineAdvisor : public InlineAdvisor {
+public:
+  EJitInlineAdvisor(Module &M, FunctionAnalysisManager &FAM, InlineParams P,
+                    InlineContext IC, EJitInlineDiagRecorder &Sink)
+      : InlineAdvisor(M, FAM, IC), Params(std::move(P)), Sink(Sink) {}
+
+private:
+  std::unique_ptr<InlineAdvice> getAdviceImpl(CallBase &CB) override {
+    Function &Caller = *CB.getCaller();
+    Function *Callee = CB.getCalledFunction();
+    auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(Caller);
+
+    EJitInlineDecision Dec;
+    Dec.CallerName = Caller.getName().str();
+    Dec.CalleeName = Callee ? Callee->getName().str() : "<indirect>";
+    Dec.Loc = formatCallLoc(CB);
+
+    // Indirect call: cannot inline.
+    if (!Callee) {
+      Dec.Reason = "indirect call";
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE, false, Sink, Dec);
+    }
+    // No definition: cannot inline.
+    if (Callee->isDeclaration()) {
+      Dec.Reason = "unavailable definition";
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE, false, Sink, Dec);
+    }
+
+    // Fetch analyses (mirror DefaultInlineAdvisor::getDefaultInlineAdvice).
+    ProfileSummaryInfo *PSI =
+        FAM.getResult<ModuleAnalysisManagerFunctionProxy>(Caller)
+            .getCachedResult<ProfileSummaryAnalysis>(M);
+    auto &CalleeTTI = FAM.getResult<TargetIRAnalysis>(*Callee);
+    auto GetAssumptionCache = [&](Function &F) -> AssumptionCache & {
+      return FAM.getResult<AssumptionAnalysis>(F);
+    };
+    auto GetTLI = [&](Function &F) -> const TargetLibraryInfo & {
+      return FAM.getResult<TargetLibraryAnalysis>(F);
+    };
+    auto GetBFI = [&](Function &F) -> BlockFrequencyInfo & {
+      return FAM.getResult<BlockFrequencyAnalysis>(F);
+    };
+
+    // ComputeFullInlineCost so we get a real cost (not a Never) when over
+    // threshold; the zone threshold comparison is ours. ORE=nullptr: we capture
+    // reasons ourselves and do not want inliner optimization remarks.
+    InlineCost IC = getInlineCost(CB, Params, CalleeTTI, GetAssumptionCache,
+                                  GetTLI, GetBFI, PSI, /*ORE=*/nullptr);
+
+    if (IC.isAlways()) {
+      // always_inline (mandatory). AlwaysInlinerPass normally handled these
+      // already; counted as inlined, no missed reason.
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE, true, Sink, Dec);
+    }
+    if (IC.isNever()) {
+      Dec.Reason = IC.getReason();
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE, false, Sink, Dec);
+    }
+
+    // Variable cost: classify zone, apply the policy.
+    DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(Caller);
+    BlockFrequencyInfo &BFI = FAM.getResult<BlockFrequencyAnalysis>(Caller);
+    ZoneResult ZR = classifyZone(CB, *Callee, DT, &BFI);
+    Dec.Z = ZR.Z;
+    Dec.Cost = IC.getCost();
+
+    // Cold flow: never inline. always_inline was already handled above
+    // (isAlways); noinline/legality returned isNever. Report the cold evidence.
+    if (ZR.Z == Zone::Cold) {
+      Dec.Threshold = 0;
+      Dec.Reason = "cold flow (" + ZR.Evidence + ")";
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE,
+                                                /*Recommend=*/false, Sink, Dec);
+    }
+
+    int Threshold = (ZR.Z == Zone::Hot) ? (int)EJitInlineHotThreshold
+                                        : (int)EJitInlineThreshold;
+    Dec.Threshold = Threshold;
+    bool Recommend = IC.getCost() <= Threshold;
+    if (!Recommend) {
+      std::string Ev = ZR.Evidence.empty() ? std::string() : ("; " + ZR.Evidence);
+      Dec.Reason = ("cost=" + Twine(IC.getCost()) + " exceeds threshold=" +
+                    Twine(Threshold) + " (zone=" + zoneStr(ZR.Z) + ")" + Ev)
+                       .str();
+    }
+    return std::make_unique<EJitInlineAdvice>(this, CB, ORE, Recommend, Sink, Dec);
+  }
+
+  InlineParams Params;
+  EJitInlineDiagRecorder &Sink;
+};
+
+static InlineAdvisor *ejitAdvisorFactory(Module &M,
+                                         FunctionAnalysisManager &FAM,
+                                         InlineParams Params,
+                                         InlineContext IC) {
+  return new EJitInlineAdvisor(M, FAM, Params, IC, gDiag);
+}
+
+/// Real, cost-model-driven inliner. With -ejit-inline-policy=on (default) it
+/// injects the EJIT hot/cold advisor; with =off it keeps the original
+/// AlwaysInliner + default ModuleInliner behavior.
 static void runRealInliner(Module &M) {
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
@@ -324,14 +698,48 @@ static void runRealInliner(Module &M) {
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   ModulePassManager MPM;
-  MPM.addPass(AlwaysInlinerPass());
-  MPM.addPass(ModuleInlinerWrapperPass());
+
+  bool PolicyOn = (EJitInlinePolicyOpt == EJitInlinePolicy::On);
+  if (PolicyOn) {
+    // Materialize @llvm.expect -> !prof so branch-weight classification works.
+    FunctionPassManager EarlyFPM;
+    EarlyFPM.addPass(LowerExpectIntrinsicPass());
+    MPM.addPass(createModuleToFunctionPassAdaptor(std::move(EarlyFPM)));
+    // always_inline first (does not consult the advisor; not in diagnostics).
+    MPM.addPass(AlwaysInlinerPass());
+
+    // InlineParams aligned with the EJIT zones; ComputeFullInlineCost so the
+    // advisor gets a real cost even when over threshold. Cold is set to 0 for
+    // the cost model's bonus logic, but the advisor never inlines cold flow
+    // regardless of cost (see classifyZone / getAdviceImpl).
+    InlineParams P;
+    P.DefaultThreshold = EJitInlineThreshold;
+    P.HotCallSiteThreshold = EJitInlineHotThreshold;
+    P.LocallyHotCallSiteThreshold = EJitInlineHotThreshold;
+    P.ColdCallSiteThreshold = 0;
+    P.ColdThreshold = 0;
+    P.HintThreshold = EJitInlineHotThreshold; // C `inline` -> hot
+    P.ComputeFullInlineCost = true;
+    P.EnableDeferral = false;
+
+    gDiag.clear();
+    MAM.registerPass(
+        [&] { return PluginInlineAdvisorAnalysis(ejitAdvisorFactory); });
+    MPM.addPass(ModuleInlinerWrapperPass(P));
+  } else {
+    MPM.addPass(AlwaysInlinerPass());
+    MPM.addPass(ModuleInlinerWrapperPass());
+  }
+
   FunctionPassManager FPM;
   FPM.addPass(PromotePass());
   FPM.addPass(InstCombinePass());
   FPM.addPass(SimplifyCFGPass());
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
   MPM.run(M, MAM);
+
+  if (PolicyOn)
+    gDiag.flush(errs());
 }
 
 static GlobalVariable *embedBitcode(Module &M, StringRef Bitcode,
