@@ -125,6 +125,16 @@ cl::opt<bool> EJitInlineDiag(
     "ejit-inline-diag", cl::init(false), cl::Hidden,
     cl::desc("Print the raw reason each call site was NOT inlined, plus a "
              "summary"));
+cl::opt<int> EJitInlineFastRejectMargin(
+    "ejit-inline-fast-reject-margin", cl::init(2), cl::Hidden,
+    cl::desc("Skip the heavyweight CallAnalyzer for callees whose instruction "
+             "count exceeds the zone threshold times this margin (0 = disable). "
+             "Conservative; a heavily-foldable callee could in rare cases be "
+             "over-rejected"));
+cl::opt<bool> EJitInlineVerify(
+    "ejit-inline-verify", cl::init(false), cl::Hidden,
+    cl::desc("verifyModule each per-entry bitcode (default off for link speed; "
+             "the registry module is always verified)"));
 
 /// Build a contextual error. Every cross-inline failure carries the input
 /// file, the failing stage and the underlying diagnostic so the link error is
@@ -622,7 +632,59 @@ private:
       return std::make_unique<EJitInlineAdvice>(this, CB, ORE, false, Sink, Dec);
     }
 
-    // Fetch analyses (mirror DefaultInlineAdvisor::getDefaultInlineAdvice).
+    // Cheap attribute short-circuits before the expensive CallAnalyzer (same
+    // reason strings and precedence getInlineCost would produce: callee noinline
+    // is checked before call-site noinline).
+    if (Callee->hasFnAttribute(Attribute::NoInline)) {
+      Dec.Reason = "noinline function attribute";
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE, false, Sink, Dec);
+    }
+    if (CB.isNoInline()) {
+      Dec.Reason = "noinline call site attribute";
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE, false, Sink, Dec);
+    }
+    if (Callee->hasFnAttribute(Attribute::AlwaysInline)) {
+      // Mandatory. AlwaysInlinerPass normally handled these already.
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE, true, Sink, Dec);
+    }
+
+    // Classify zone (cheap: DT + BFI). Cold flow is never inlined, so skip the
+    // expensive getInlineCost for it.
+    DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(Caller);
+    BlockFrequencyInfo &BFI = FAM.getResult<BlockFrequencyAnalysis>(Caller);
+    ZoneResult ZR = classifyZone(CB, *Callee, DT, &BFI);
+    Dec.Z = ZR.Z;
+
+    if (ZR.Z == Zone::Cold) {
+      Dec.Threshold = 0;
+      Dec.Reason = "cold flow (" + ZR.Evidence + ")";
+      return std::make_unique<EJitInlineAdvice>(this, CB, ORE,
+                                                /*Recommend=*/false, Sink, Dec);
+    }
+
+    int Threshold = (ZR.Z == Zone::Hot) ? (int)EJitInlineHotThreshold
+                                        : (int)EJitInlineThreshold;
+
+    // Fast-reject: a callee with far more instructions than the zone threshold
+    // can't fit (inline cost is roughly proportional to instruction count), so
+    // skip the heavyweight CallAnalyzer. Margin 0 disables.
+    if (EJitInlineFastRejectMargin > 0) {
+      unsigned Instrs = Callee->getInstructionCount();
+      unsigned Limit =
+          (unsigned)((long)Threshold * (long)EJitInlineFastRejectMargin);
+      if (Instrs > Limit) {
+        Dec.Threshold = Threshold;
+        Dec.Reason = ("too large (" + Twine(Instrs) + " instrs > " +
+                      Twine(Limit) + ", zone=" + zoneStr(ZR.Z) + ")")
+                         .str();
+        return std::make_unique<EJitInlineAdvice>(this, CB, ORE,
+                                                  /*Recommend=*/false, Sink, Dec);
+      }
+    }
+
+    // Expensive: full inline cost. ComputeFullInlineCost so we get a real cost
+    // (not a Never) when over threshold; the zone-threshold comparison is ours.
+    // ORE=nullptr: we capture reasons ourselves.
     ProfileSummaryInfo *PSI =
         FAM.getResult<ModuleAnalysisManagerFunctionProxy>(Caller)
             .getCachedResult<ProfileSummaryAnalysis>(M);
@@ -636,16 +698,11 @@ private:
     auto GetBFI = [&](Function &F) -> BlockFrequencyInfo & {
       return FAM.getResult<BlockFrequencyAnalysis>(F);
     };
-
-    // ComputeFullInlineCost so we get a real cost (not a Never) when over
-    // threshold; the zone threshold comparison is ours. ORE=nullptr: we capture
-    // reasons ourselves and do not want inliner optimization remarks.
     InlineCost IC = getInlineCost(CB, Params, CalleeTTI, GetAssumptionCache,
                                   GetTLI, GetBFI, PSI, /*ORE=*/nullptr);
 
     if (IC.isAlways()) {
-      // always_inline (mandatory). AlwaysInlinerPass normally handled these
-      // already; counted as inlined, no missed reason.
+      // Defensive; the attr check above already caught always_inline.
       return std::make_unique<EJitInlineAdvice>(this, CB, ORE, true, Sink, Dec);
     }
     if (IC.isNever()) {
@@ -653,24 +710,7 @@ private:
       return std::make_unique<EJitInlineAdvice>(this, CB, ORE, false, Sink, Dec);
     }
 
-    // Variable cost: classify zone, apply the policy.
-    DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(Caller);
-    BlockFrequencyInfo &BFI = FAM.getResult<BlockFrequencyAnalysis>(Caller);
-    ZoneResult ZR = classifyZone(CB, *Callee, DT, &BFI);
-    Dec.Z = ZR.Z;
     Dec.Cost = IC.getCost();
-
-    // Cold flow: never inline. always_inline was already handled above
-    // (isAlways); noinline/legality returned isNever. Report the cold evidence.
-    if (ZR.Z == Zone::Cold) {
-      Dec.Threshold = 0;
-      Dec.Reason = "cold flow (" + ZR.Evidence + ")";
-      return std::make_unique<EJitInlineAdvice>(this, CB, ORE,
-                                                /*Recommend=*/false, Sink, Dec);
-    }
-
-    int Threshold = (ZR.Z == Zone::Hot) ? (int)EJitInlineHotThreshold
-                                        : (int)EJitInlineThreshold;
     Dec.Threshold = Threshold;
     bool Recommend = IC.getCost() <= Threshold;
     if (!Recommend) {
@@ -1137,7 +1177,7 @@ runEJitCrossLink(ArrayRef<MemoryBufferRef> SelectedObjects,
 
       {
         TimeTraceScope verifyScope("EJitCross:PerEntryVerify", F->getName());
-        if (verifyModule(*PerFunc, &errs()))
+        if (EJitInlineVerify && verifyModule(*PerFunc, &errs()))
           return crossError("verify per-entry module", F->getName(),
                             "cloned/trimmed module failed verification");
       }

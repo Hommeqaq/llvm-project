@@ -142,8 +142,21 @@ cross-inline 模式 PASS1 嵌入**完整 module** bitcode，`!prof`/函数属性
 | `ejit-inline-cold-cutoff` | int | 1 | 通向 call 的分支边权重 ≤ 此值 -> COLD（永不内联） |
 | `ejit-inline-hot-cutoff` | int | 2000 | 该边权重 ≥ 此值（相对兄弟边） -> HOT |
 | `ejit-inline-diag` | bool | false | 开=打印每个未内联 call site 原始原因 + 汇总；关=静默 |
+| `ejit-inline-fast-reject-margin` | int | 2 | 快速早退：Hot/Warm callee 指令数 > 区阈值×此值 时跳过 CallAnalyzer 直接判不内联（0=关闭）。保守，极少数高折叠函数可能被误拒 |
+| `ejit-inline-verify` | bool | false | 逐 entry `verifyModule`（默认关以提速；registry 模块始终校验） |
 
 COLD 不是阈值选项：冷流（cold 属性 / `!prof` 冷边 / unreachable）一律不内联，除 `always_inline`。
+
+### 4.1 链接速度
+
+advisor 决策顺序刻意把廉价检查排在昂贵的 `getInlineCost`（CallAnalyzer 全量遍历 callee）之前：
+1. 间接/无定义、`noinline`/`always_inline` 属性 -> 直接判定，不跑 CallAnalyzer。
+2. `classifyZone`（DT + BFI，廉价）-> 冷流直接不内联，不跑 CallAnalyzer。
+3. `ejit-inline-fast-reject-margin` 早退超大 callee，不跑 CallAnalyzer。
+4. 仅 Hot/Warm 且未早退的 callee 才跑 `getInlineCost`（`ComputeFullInlineCost=true`）。
+
+加上 `ejit-inline-verify` 默认关（逐 entry 校验挪到按需），多 entry / 大合成模块时链接明显更快。
+用 `--time-trace` 可看 `EJitCross:Inliner` / `PerEntryExtraction` 各阶段耗时定位下一步。
 
 ---
 
