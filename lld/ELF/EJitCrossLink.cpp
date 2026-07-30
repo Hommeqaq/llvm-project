@@ -57,7 +57,6 @@
 #include "llvm/IR/ProfDataUtils.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Linker/Linker.h"
-#include "llvm/Object/Archive.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -65,6 +64,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -200,6 +200,7 @@ static void collectEntryFunctions(Module &M,
 static void collectFromConstant(const Constant *C,
                                 SmallVectorImpl<Function *> &FuncWL,
                                 SetVector<GlobalVariable *> &Globals,
+                                SetVector<GlobalValue *> &Indirect,
                                 SmallPtrSetImpl<const Constant *> &Visited) {
   if (!C || !Visited.insert(C).second)
     return;
@@ -212,37 +213,47 @@ static void collectFromConstant(const Constant *C,
     return;
   }
   if (auto *GA = dyn_cast<GlobalAlias>(C)) {
-    collectFromConstant(GA->getAliasee(), FuncWL, Globals, Visited);
+    // Record the alias itself (so the closure-only clone keeps its definition)
+    // and follow the aliasee (so the target stays alive too).
+    Indirect.insert(const_cast<GlobalAlias *>(GA));
+    collectFromConstant(GA->getAliasee(), FuncWL, Globals, Indirect, Visited);
     return;
   }
   if (auto *GI = dyn_cast<GlobalIFunc>(C)) {
-    collectFromConstant(GI->getResolver(), FuncWL, Globals, Visited);
+    Indirect.insert(const_cast<GlobalIFunc *>(GI));
+    collectFromConstant(GI->getResolver(), FuncWL, Globals, Indirect, Visited);
     return;
   }
   // ConstantExpr (bitcast/gep/...), ConstantAggregate (array/struct/vector):
   // recurse through operands to reach any embedded function/global.
   for (const Use &U : C->operands())
     if (auto *OpC = dyn_cast<Constant>(U.get()))
-      collectFromConstant(OpC, FuncWL, Globals, Visited);
+      collectFromConstant(OpC, FuncWL, Globals, Indirect, Visited);
 }
 
 static void collectReferences(Function &F, SmallVectorImpl<Function *> &FuncWL,
                               SetVector<GlobalVariable *> &Globals,
+                              SetVector<GlobalValue *> &Indirect,
                               SmallPtrSetImpl<const Constant *> &Visited) {
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
       for (Value *Op : I.operands())
         if (auto *C = dyn_cast<Constant>(Op))
-          collectFromConstant(C, FuncWL, Globals, Visited);
+          collectFromConstant(C, FuncWL, Globals, Indirect, Visited);
 }
 
 /// Compute the transitive closure of functions and globals reachable from the
 /// entry set. Global initializers are scanned so function-pointer tables keep
-/// their targets alive.
+/// their targets alive. Referenced aliases and ifuncs are recorded in
+/// \p ClosureIndirect so the closure-only clone keeps exactly those definitions
+/// (GlobalDCE would otherwise retain any *externally visible* alias/ifunc even
+/// when the entry never references it, leaking dead symbols into the per-entry
+/// bitcode).
 static void
 computeTransitiveClosure(ArrayRef<Function *> EntryFuncs,
                          SetVector<Function *> &ClosureFuncs,
-                         SetVector<GlobalVariable *> &ClosureGlobals) {
+                         SetVector<GlobalVariable *> &ClosureGlobals,
+                         SetVector<GlobalValue *> &ClosureIndirect) {
   SmallPtrSet<const Constant *, 32> Visited;
   SmallVector<Function *, 16> FuncWL(EntryFuncs.begin(), EntryFuncs.end());
   SetVector<GlobalVariable *> PendingGlobals;
@@ -255,7 +266,7 @@ computeTransitiveClosure(ArrayRef<Function *> EntryFuncs,
         continue;
       if (GV->hasInitializer())
         collectFromConstant(GV->getInitializer(), FuncWL, PendingGlobals,
-                            Visited);
+                            ClosureIndirect, Visited);
     }
   };
 
@@ -265,7 +276,7 @@ computeTransitiveClosure(ArrayRef<Function *> EntryFuncs,
       continue;
     if (F->isDeclaration())
       continue; // declarations are handled by the symbol registry
-    collectReferences(*F, FuncWL, PendingGlobals, Visited);
+    collectReferences(*F, FuncWL, PendingGlobals, ClosureIndirect, Visited);
     drainGlobals();
   }
   drainGlobals();
@@ -897,82 +908,28 @@ collectExternalSymbols(const SetVector<Function *> &ClosureFuncs,
 namespace lld {
 namespace elf {
 
-Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
-                                               StringRef TargetTriple,
-                                               StringRef SaveTempsPrefix) {
-  // ---- Phase 1: detect .ejit_cross. Distinguish "no section" (normal skip)
-  // from "corrupt input" (Area 5). Non-object inputs (scripts, shared libs)
-  // are skipped; archive members with .ejit_cross are collected for Phase 2.
-  bool HasCross = false;
-  StringSet<> CrossArchives; // archive paths whose members carry .ejit_cross
-  for (StringRef F : InputFiles) {
-    auto Buf = MemoryBuffer::getFile(F);
-    if (!Buf)
-      continue; // not a readable regular file (e.g. -l resolved elsewhere)
-    file_magic Magic = identify_magic(Buf->get()->getBuffer());
-    if (Magic == file_magic::archive) {
-      auto ArOrErr = object::Archive::create(Buf->get()->getMemBufferRef());
-      if (!ArOrErr)
-        return crossError("read archive", F, ArOrErr.takeError());
-      Error Err = Error::success();
-      for (const auto &Child : (*ArOrErr)->children(Err)) {
-        auto ChildBuf = Child.getMemoryBufferRef();
-        if (!ChildBuf)
-          return crossError("read archive member", F, ChildBuf.takeError());
-        auto Obj = object::ObjectFile::createObjectFile(*ChildBuf);
-        if (!Obj) {
-          consumeError(Obj.takeError());
-          continue;
-        }
-        for (const object::SectionRef &Sec : (*Obj)->sections()) {
-          Expected<StringRef> N = Sec.getName();
-          if (N && *N == kCrossSection) {
-            HasCross = true;
-            CrossArchives.insert(F);
-            break;
-          }
-          if (!N)
-            consumeError(N.takeError());
-        }
-        if (HasCross)
-          break;
-      }
-      if (Err)
-        return crossError("iterate archive", F, std::move(Err));
-      continue;
-    }
-    auto Obj =
-        object::ObjectFile::createObjectFile(Buf->get()->getMemBufferRef());
-    if (!Obj) {
-      consumeError(Obj.takeError());
-      continue; // not a relocatable object we understand; skip
-    }
-    for (const object::SectionRef &Sec : (*Obj)->sections()) {
-      Expected<StringRef> N = Sec.getName();
-      if (!N) {
-        consumeError(N.takeError());
-        continue;
-      }
-      if (*N == kCrossSection) {
-        HasCross = true;
-        break;
-      }
-    }
-  }
-  if (!HasCross)
-    return EJitCrossLinkResult{}; // nothing to do: normal AOT path is preserved
+Expected<EJitCrossLinkResult>
+runEJitCrossLink(ArrayRef<MemoryBufferRef> SelectedObjects,
+                 StringRef TargetTriple, StringRef SaveTempsPrefix) {
+  // When time tracing is disabled, each TimeTraceScope below adds only the
+  // standard TimeTraceScope inactive-profiler branch and emits no
+  // records/output; the profiler is initialised by Driver.cpp solely for
+  // --time-trace.
+  TimeTraceScope crossScope("EJitCrossLink");
 
-  // ---- Phase 2: parse and merge every .ejit_cross module into a composite.
-  // From here on, any failure aborts the link (a .ejit_cross was promised).
+  // The composite that every .ejit_cross module is merged into.
   auto Ctx = std::make_unique<LLVMContext>();
   std::unique_ptr<Module> Composite;
   StringSet<> ConsumedFileSet;
   SmallVector<std::string, 4> ConsumedFiles;
 
-  // Helper to process a single bitcode buffer into the composite.
-  auto mergeBitcodeIntoComposite =
-      [&](MemoryBufferRef BCBuf, StringRef DisplayName) -> Error {
-    auto M = parseBitcodeFile(BCBuf, *Ctx);
+  // Helper to parse and merge a single bitcode buffer into the composite.
+  auto mergeBitcodeIntoComposite = [&](MemoryBufferRef BCBuf,
+                                       StringRef DisplayName) -> Error {
+    auto M = [&] {
+      TimeTraceScope parseScope("EJitCross:ParseBitcode");
+      return parseBitcodeFile(BCBuf, *Ctx);
+    }();
     if (!M)
       return crossError("parse bitcode", DisplayName, M.takeError());
     if (ConsumedFileSet.insert(DisplayName).second)
@@ -981,6 +938,7 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
       Composite = std::move(*M);
       return Error::success();
     }
+    TimeTraceScope mergeScope("EJitCross:MergeModule");
     if (Linker(*Composite).linkInModule(std::move(*M), Linker::Flags::None))
       return crossError("merge module", DisplayName,
                         "Linker::linkInModule reported a conflict while "
@@ -988,70 +946,54 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
     return Error::success();
   };
 
-  for (StringRef F : InputFiles) {
-    auto Buf = MemoryBuffer::getFile(F);
-    if (!Buf)
-      return crossError("read input", F, errorCodeToError(Buf.getError()));
-    file_magic Magic = identify_magic(Buf->get()->getBuffer());
-
-    if (Magic == file_magic::archive && CrossArchives.contains(F)) {
-      auto ArOrErr = object::Archive::create(Buf->get()->getMemBufferRef());
-      if (!ArOrErr)
-        return crossError("read archive", F, ArOrErr.takeError());
-      Error Err = Error::success();
-      for (const auto &Child : (*ArOrErr)->children(Err)) {
-        auto ChildBuf = Child.getMemoryBufferRef();
-        if (!ChildBuf)
-          return crossError("read archive member", F, ChildBuf.takeError());
-        auto Obj = object::ObjectFile::createObjectFile(*ChildBuf);
-        if (!Obj) {
-          consumeError(Obj.takeError());
+  // ---- Phase 1+2: scan the *selected* object files (ctx.objectFiles, taken
+  // after lld finished symbol resolution) for a .ejit_cross section and merge
+  // each into the composite. Because lld has already decided which archive
+  // members, -l inputs and linker-script inputs are part of the link, iterating
+  // that set processes exactly the members that make up the AOT image: no ELF
+  // member-selection is re-implemented here and an unselected member is never
+  // merged or registered. Each buffer identifier is the canonical
+  // ObjFile::getName(), so ConsumedFiles matches lld's discard key for dropping
+  // the consumed .ejit_cross sections from the output. Any failure after a
+  // .ejit_cross section is observed aborts the link (never a silent AOT
+  // fallback).
+  bool HasCross = false;
+  {
+    TimeTraceScope detectScope("EJitCross:DetectScan");
+    for (MemoryBufferRef Obj : SelectedObjects) {
+      file_magic Magic = identify_magic(Obj.getBuffer());
+      if (Magic != file_magic::elf_relocatable &&
+          Magic != file_magic::elf_shared_object &&
+          Magic != file_magic::elf_executable)
+        continue;
+      auto ObjOrErr = object::ObjectFile::createObjectFile(Obj);
+      if (!ObjOrErr) {
+        consumeError(ObjOrErr.takeError());
+        continue; // not a relocatable object we understand; skip
+      }
+      for (const object::SectionRef &Sec : (*ObjOrErr)->sections()) {
+        Expected<StringRef> N = Sec.getName();
+        if (!N) {
+          consumeError(N.takeError());
           continue;
         }
-        for (const object::SectionRef &Sec : (*Obj)->sections()) {
-          Expected<StringRef> N = Sec.getName();
-          if (!N)
-            return crossError("read section name", F, N.takeError());
-          if (*N != kCrossSection)
-            continue;
-          Expected<StringRef> C = Sec.getContents();
-          if (!C)
-            return crossError("read section", F, C.takeError());
-          // ChildBuf.getBufferIdentifier() returns the canonical
-          // "archive_path(member_name)" string that lld's InputFiles
-          // uses for ObjFile::getName(), so ConsumedFiles will match.
-          StringRef DisplayName = ChildBuf->getBufferIdentifier();
-          if (Error E = mergeBitcodeIntoComposite(
-                  MemoryBufferRef(*C, DisplayName), DisplayName))
-            return E;
-        }
+        if (*N != kCrossSection)
+          continue;
+        Expected<StringRef> C = Sec.getContents();
+        if (!C)
+          return crossError("read section", Obj.getBufferIdentifier(),
+                            C.takeError());
+        HasCross = true;
+        StringRef DisplayName = Obj.getBufferIdentifier();
+        if (Error E = mergeBitcodeIntoComposite(
+                MemoryBufferRef(*C, DisplayName), DisplayName))
+          return E;
+        break; // at most one .ejit_cross section per object
       }
-      if (Err)
-        return crossError("iterate archive", F, std::move(Err));
-      continue;
-    }
-
-    if (Magic != file_magic::elf_relocatable &&
-        Magic != file_magic::elf_shared_object &&
-        Magic != file_magic::elf_executable)
-      continue;
-    auto Obj =
-        object::ObjectFile::createObjectFile(Buf->get()->getMemBufferRef());
-    if (!Obj)
-      return crossError("parse object", F, Obj.takeError());
-    for (const object::SectionRef &Sec : (*Obj)->sections()) {
-      Expected<StringRef> N = Sec.getName();
-      if (!N)
-        return crossError("read section name", F, N.takeError());
-      if (*N != kCrossSection)
-        continue;
-      Expected<StringRef> C = Sec.getContents();
-      if (!C)
-        return crossError("read section", F, C.takeError());
-      if (Error E = mergeBitcodeIntoComposite(MemoryBufferRef(*C, F), F))
-        return E;
     }
   }
+  if (!HasCross)
+    return EJitCrossLinkResult{}; // nothing to do: normal AOT path preserved
   if (!Composite)
     return crossError("merge", "<inputs>",
                       "a .ejit_cross section was detected but no module could "
@@ -1059,7 +1001,10 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
 
   // ---- Phase 3: entry discovery.
   SmallVector<Function *, 4> EntryFuncs;
-  collectEntryFunctions(*Composite, EntryFuncs);
+  {
+    TimeTraceScope entryScope("EJitCross:EntryScan");
+    collectEntryFunctions(*Composite, EntryFuncs);
+  }
   if (EntryFuncs.empty())
     return crossError("entry scan", "<composite>",
                       "merged .ejit_cross modules contain no ejit_entry "
@@ -1067,9 +1012,12 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
 
   // ---- Phase 4: union closure + trim, then real inlining, then re-annotate.
   {
+    TimeTraceScope unionScope("EJitCross:UnionClosure");
     SetVector<Function *> ClosureFuncs;
     SetVector<GlobalVariable *> ClosureGlobals;
-    computeTransitiveClosure(EntryFuncs, ClosureFuncs, ClosureGlobals);
+    SetVector<GlobalValue *> ClosureIndirect;
+    computeTransitiveClosure(EntryFuncs, ClosureFuncs, ClosureGlobals,
+                             ClosureIndirect);
     trimToClosure(*Composite, ClosureFuncs, ClosureGlobals);
   }
   // The composite exists only to produce JIT bitcode; it is not the native AOT
@@ -1080,7 +1028,10 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
   for (Function &F : *Composite)
     if (!F.isDeclaration())
       F.setDSOLocal(true);
-  runRealInliner(*Composite);
+  {
+    TimeTraceScope inlinerScope("EJitCross:Inliner");
+    runRealInliner(*Composite);
+  }
   reAnnotateMayConst(*Composite);
 
   // ---- Phase 5: per-entry bitcode + one registry, all owned by TmpM.
@@ -1095,56 +1046,129 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
   SetVector<Function *> ExternalFuncs;
   SetVector<GlobalVariable *> ExternalGlobals;
 
-  for (Function *F : EntryFuncs) {
-    auto PerFunc = CloneModule(*Composite);
-    Function *ClonedF = PerFunc->getFunction(F->getName());
-    if (!ClonedF)
-      return crossError("clone", F->getName(),
-                        "entry function vanished after cloning the composite");
-
-    SetVector<Function *> PerFuncs;
-    SetVector<GlobalVariable *> PerGlobals;
-    SmallVector<Function *, 1> Single{ClonedF};
-    computeTransitiveClosure(Single, PerFuncs, PerGlobals);
-    trimToClosure(*PerFunc, PerFuncs, PerGlobals);
-
-    // Externalise non-const global definitions so JITLink resolves them from
-    // the host image, mirroring the single-TU extractor.
-    for (GlobalVariable &GV : PerFunc->globals())
-      if (!GV.isDeclaration() && !GV.isConstant()) {
-        GV.setInitializer(nullptr);
-        GV.setLinkage(GlobalValue::ExternalLinkage);
+  {
+    TimeTraceScope perEntryScope("EJitCross:PerEntryExtraction");
+    for (Function *F : EntryFuncs) {
+      // Compute the entry's transitive closure directly on the composite. The
+      // previous implementation cloned the *entire* composite for every entry
+      // and then deleted ~everything outside the closure, making per-entry work
+      // scale with (entry count x composite size). Computing the closure first
+      // lets the clone below copy only the definitions this entry needs.
+      SetVector<Function *> SrcFuncs;
+      SetVector<GlobalVariable *> SrcGlobals;
+      SetVector<GlobalValue *> SrcIndirect;
+      {
+        TimeTraceScope closureScope("EJitCross:PerEntryClosure", F->getName());
+        SmallVector<Function *, 1> Single{F};
+        computeTransitiveClosure(Single, SrcFuncs, SrcGlobals, SrcIndirect);
       }
 
-    if (Error E = collectExternalSymbols(PerFuncs, PerGlobals, *TmpM,
-                                         ExternalFuncs, ExternalGlobals))
-      return crossError("collect external symbols", F->getName(), std::move(E));
+      // Selective clone: only closure functions/globals/aliases/ifuncs are
+      // cloned as definitions; everything else becomes a declaration (no body /
+      // no initializer), which is cheap and lets GlobalDCE drop it. Aliases and
+      // ifuncs are matched via the closure's Indirect set rather than an
+      // unconditional "true": GlobalDCE retains an *externally visible* dead
+      // alias/ifunc, so cloning all of them would leak unreferenced symbols
+      // into every per-entry module.
+      ValueToValueMapTy VMap;
+      std::unique_ptr<Module> PerFunc;
+      {
+        TimeTraceScope cloneScope("EJitCross:PerEntryClone", F->getName());
+        PerFunc = CloneModule(*Composite, VMap, [&](const GlobalValue *GV) {
+          if (auto *Fn = dyn_cast<Function>(GV))
+            return SrcFuncs.contains(const_cast<Function *>(Fn));
+          if (auto *G = dyn_cast<GlobalVariable>(GV))
+            return SrcGlobals.contains(const_cast<GlobalVariable *>(G));
+          // GlobalAlias / GlobalIFunc: keep only if the closure references it.
+          return SrcIndirect.contains(const_cast<GlobalValue *>(GV));
+        });
+      }
 
-    if (verifyModule(*PerFunc, &errs()))
-      return crossError("verify per-entry module", F->getName(),
-                        "cloned/trimmed module failed verification");
+      if (!isa_and_nonnull<Function>(VMap.lookup(F)))
+        return crossError(
+            "clone", F->getName(),
+            "entry function vanished after cloning the composite");
 
-    if (!SaveTempsPrefix.empty()) {
-      std::string Path = saveTempEntryPath(SaveTempsPrefix, F->getName());
-      if (Error E = writeModuleBitcode(*PerFunc, Path))
-        return crossError("save per-entry bitcode", Path, std::move(E));
+      // CloneModule always materialises every GlobalIFunc as a definition -- it
+      // does not consult the ShouldCloneDefinition callback for ifuncs -- and
+      // points each at its resolver. When an entry does not reference an ifunc,
+      // its resolver is only cloned as a declaration, which is an invalid ifunc
+      // ("resolver must be a definition"). Erase the ifuncs this entry's
+      // closure does not reference so only valid, referenced ifuncs remain.
+      {
+        SmallPtrSet<const GlobalValue *, 8> KeepIFuncs;
+        for (GlobalValue *GV : SrcIndirect)
+          if (isa<GlobalIFunc>(GV))
+            KeepIFuncs.insert(cast<GlobalValue>(VMap.lookup(GV)));
+        for (GlobalIFunc &GI : llvm::make_early_inc_range(PerFunc->ifuncs()))
+          if (!KeepIFuncs.contains(&GI)) {
+            GI.replaceAllUsesWith(UndefValue::get(GI.getType()));
+            GI.eraseFromParent();
+          }
+      }
+
+      // Translate the composite-side closure into the cloned module (every
+      // global has a VMap entry) so trimming and registry collection operate on
+      // the clone, matching the previous behaviour.
+      SetVector<Function *> PerFuncs;
+      SetVector<GlobalVariable *> PerGlobals;
+      for (Function *SF : SrcFuncs)
+        PerFuncs.insert(cast<Function>(VMap.lookup(SF)));
+      for (GlobalVariable *SG : SrcGlobals)
+        PerGlobals.insert(cast<GlobalVariable>(VMap.lookup(SG)));
+
+      {
+        TimeTraceScope trimScope("EJitCross:PerEntryTrim", F->getName());
+        trimToClosure(*PerFunc, PerFuncs, PerGlobals);
+      }
+
+      // Externalise non-const global definitions so JITLink resolves them from
+      // the host image, mirroring the single-TU extractor.
+      for (GlobalVariable &GV : PerFunc->globals())
+        if (!GV.isDeclaration() && !GV.isConstant()) {
+          GV.setInitializer(nullptr);
+          GV.setLinkage(GlobalValue::ExternalLinkage);
+        }
+
+      if (Error E = collectExternalSymbols(PerFuncs, PerGlobals, *TmpM,
+                                           ExternalFuncs, ExternalGlobals))
+        return crossError("collect external symbols", F->getName(),
+                          std::move(E));
+
+      {
+        TimeTraceScope verifyScope("EJitCross:PerEntryVerify", F->getName());
+        if (verifyModule(*PerFunc, &errs()))
+          return crossError("verify per-entry module", F->getName(),
+                            "cloned/trimmed module failed verification");
+      }
+
+      TimeTraceScope serializeScope("EJitCross:PerEntrySerialize",
+                                    F->getName());
+      if (!SaveTempsPrefix.empty()) {
+        std::string Path = saveTempEntryPath(SaveTempsPrefix, F->getName());
+        if (Error E = writeModuleBitcode(*PerFunc, Path))
+          return crossError("save per-entry bitcode", Path, std::move(E));
+      }
+
+      std::string BC;
+      raw_string_ostream OS(BC);
+      WriteBitcodeToFile(*PerFunc, OS);
+      OS.flush();
+      BitcodeGVs.push_back(embedBitcode(*TmpM, BC, F->getName()));
+      ValidEntryFuncs.push_back(F);
     }
-
-    std::string BC;
-    raw_string_ostream OS(BC);
-    WriteBitcodeToFile(*PerFunc, OS);
-    OS.flush();
-    BitcodeGVs.push_back(embedBitcode(*TmpM, BC, F->getName()));
-    ValidEntryFuncs.push_back(F);
   }
 
-  generateRegistryTable(*TmpM, ValidEntryFuncs, BitcodeGVs, ExternalFuncs,
-                        ExternalGlobals);
+  {
+    TimeTraceScope registryScope("EJitCross:RegistryGen");
+    generateRegistryTable(*TmpM, ValidEntryFuncs, BitcodeGVs, ExternalFuncs,
+                          ExternalGlobals);
 
-  // ---- Phase 6: verify the registry module before writing anything.
-  if (verifyModule(*TmpM, &errs()))
-    return crossError("verify registry module", "<ejit_cross_link>",
-                      "generated registry module failed verification");
+    // ---- Phase 6: verify the registry module before writing anything.
+    if (verifyModule(*TmpM, &errs()))
+      return crossError("verify registry module", "<ejit_cross_link>",
+                        "generated registry module failed verification");
+  }
 
   // ---- Phase 7: write the merged bitcode to a temp file. Cleanup of the
   // temp file is owned by the caller (Driver.cpp), which unlinks it once the
@@ -1171,6 +1195,11 @@ Expected<EJitCrossLinkResult> runEJitCrossLink(ArrayRef<std::string> InputFiles,
   EJitCrossLinkResult Result;
   Result.tempPath = std::string(TmpPath.str());
   Result.consumedFiles = std::move(ConsumedFiles);
+  Result.requiredSymbols.reserve(ExternalFuncs.size() + ExternalGlobals.size());
+  for (Function *F : ExternalFuncs)
+    Result.requiredSymbols.push_back(F->getName().str());
+  for (GlobalVariable *GV : ExternalGlobals)
+    Result.requiredSymbols.push_back(GV->getName().str());
   return Result;
 }
 

@@ -3147,41 +3147,7 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
   for (StringRef name : ctx.arg.undefined)
     ctx.symtab->addUnusedUndefined(name)->referenced = true;
 
-  // EJIT cross-TU inlining. ld.lld is the single owner of this processing and
-  // runs it at most once per link, only when --ejit-cross-inline is present
-  // (clang emits that flag for -fejit-cross-inline links that use ld.lld). On
-  // any failure after a .ejit_cross section is observed the link fails rather
-  // than silently dropping back to the per-TU AOT bitcode.
-  SmallVector<std::string, 1> ejitCrossTemps;
-  if (ctx.arg.ejitCrossInline) {
-    std::vector<std::string> InputPaths;
-    for (auto *arg : args.filtered(OPT_INPUT))
-      InputPaths.push_back(arg->getValue());
-    StringRef SaveTempsPrefix =
-        args.hasArg(OPT_save_temps) ? ctx.arg.outputFile : StringRef();
-    Expected<EJitCrossLinkResult> CrossResult =
-        runEJitCrossLink(InputPaths, /*TargetTriple=*/"", SaveTempsPrefix);
-    if (!CrossResult) {
-      ErrAlways(ctx) << toString(CrossResult.takeError());
-      return;
-    }
-    for (const std::string &path : CrossResult->consumedFiles)
-      ctx.ejitCrossConsumedFiles.insert(path);
-    if (!CrossResult->tempPath.empty()) {
-      llvm::sys::RemoveFileOnSignal(CrossResult->tempPath);
-      ejitCrossTemps.push_back(CrossResult->tempPath);
-      addFile(ctx.saver.save(CrossResult->tempPath), /*withLOption=*/false);
-    }
-  }
-
   parseFiles(ctx, files);
-
-  // The cross-inline temp bitcode is now resident in memory (parseFiles read
-  // it into an owned buffer), so reclaim the on-disk temp file immediately.
-  for (const std::string &p : ejitCrossTemps) {
-    llvm::sys::fs::remove(p);
-    llvm::sys::DontRemoveFileOnSignal(p);
-  }
 
   auto rejectUnprocessedEJitCross = [&]() {
     if (!ctx.arg.ejitCrossInline)
@@ -3193,9 +3159,8 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
           ErrAlways(ctx) << "ejit-cross-inline: selected input '"
                          << file->getName()
                          << "' contains an unprocessed .ejit_cross section "
-                            "(archive members, -l inputs, and linker-script "
-                            "inputs are not yet supported; link the object "
-                            "file directly)";
+                            "after archive dependency selection reached a "
+                            "fixed point";
           return true;
         }
       }
@@ -3263,6 +3228,75 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
 
   // Archive members defining __wrap symbols may be extracted.
   std::vector<WrappedSymbol> wrapped = addWrappedSymbols(ctx, args);
+
+  // EJIT cross-TU inlining. ld.lld is the single owner of this processing and
+  // runs it at most once per link, only when --ejit-cross-inline is present
+  // (clang emits that flag for -fejit-cross-inline links that use ld.lld).
+  //
+  // It runs here after ordinary symbol resolution, so ctx.objectFiles starts as
+  // exactly the set of object files
+  // (including the archive members, -l inputs and linker-script inputs that
+  // were actually pulled into the link) that make up the AOT image. Feeding
+  // that set to runEJitCrossLink is what gives correct archive-member selection
+  // without re-implementing ELF symbol resolution: an unselected member is
+  // never merged or registered. On any failure after a .ejit_cross section is
+  // observed the link fails rather than silently dropping to per-TU AOT.
+  //
+  // A generated registry can itself reference an external symbol whose archive
+  // member was not needed by the optimized AOT object. Since .ejit_cross holds
+  // the pre-optimization module, that dependency difference is legitimate.
+  // Iterate to a fixed point: let lld extract lazy definitions required by each
+  // provisional registry, then rebuild from the expanded selected-object set.
+  // Only the final registry is added to the link.
+  if (ctx.arg.ejitCrossInline) {
+    StringRef saveTempsPrefix =
+        args.hasArg(OPT_save_temps) ? ctx.arg.outputFile : StringRef();
+    std::optional<EJitCrossLinkResult> finalResult;
+    while (true) {
+      SmallVector<MemoryBufferRef, 0> selectedObjects;
+      selectedObjects.reserve(ctx.objectFiles.size());
+      for (ELFFileBase *file : ctx.objectFiles)
+        selectedObjects.push_back(file->mb);
+
+      Expected<EJitCrossLinkResult> crossResult = runEJitCrossLink(
+          selectedObjects, /*TargetTriple=*/"", saveTempsPrefix);
+      if (!crossResult) {
+        ErrAlways(ctx) << toString(crossResult.takeError());
+        return;
+      }
+      if (!crossResult->tempPath.empty())
+        llvm::sys::RemoveFileOnSignal(crossResult->tempPath);
+
+      size_t objectCount = ctx.objectFiles.size();
+      for (const std::string &name : crossResult->requiredSymbols)
+        if (Symbol *sym = ctx.symtab->find(name))
+          handleUndefined(ctx, sym, "--ejit-cross-inline");
+
+      if (ctx.objectFiles.size() == objectCount) {
+        finalResult = std::move(*crossResult);
+        break;
+      }
+
+      // A provisional registry is never added to lld. Remove its temporary
+      // file before rebuilding from the newly selected archive members.
+      if (!crossResult->tempPath.empty()) {
+        llvm::sys::fs::remove(crossResult->tempPath);
+        llvm::sys::DontRemoveFileOnSignal(crossResult->tempPath);
+      }
+    }
+
+    for (const std::string &path : finalResult->consumedFiles)
+      ctx.ejitCrossConsumedFiles.insert(path);
+    if (!finalResult->tempPath.empty()) {
+      size_t firstNew = files.size();
+      addFile(ctx.saver.save(finalResult->tempPath), /*withLOption=*/false);
+      for (size_t i = firstNew; i < files.size(); ++i)
+        parseFile(ctx, files[i].get());
+      // The temp bitcode is now resident in memory; reclaim the on-disk file.
+      llvm::sys::fs::remove(finalResult->tempPath);
+      llvm::sys::DontRemoveFileOnSignal(finalResult->tempPath);
+    }
+  }
 
   // No more lazy bitcode can be extracted at this point. Do post parse work
   // like checking duplicate symbols.

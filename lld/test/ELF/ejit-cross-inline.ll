@@ -78,22 +78,25 @@
 # RUN:   %t/bad.o -o /dev/null 2>&1 | FileCheck %s --check-prefix=BADERR
 # BADERR: ejit-cross-inline: parse bitcode failed for {{.*}}bad.o
 
-## A literal archive with .ejit_cross members is processed inline (archive
-## support). The registry materialises and the consumed sections disappear.
+## A literal archive with .ejit_cross members is processed inline, but only for
+## the members lld actually selects. entry.o is pulled in via -u; helper.o is a
+## direct object. The registry materialises and the consumed sections disappear.
 # RUN: llvm-ar crs %t/libcross.a %t/entry.o
 # RUN: ld.lld --ejit-cross-inline -shared --unresolved-symbols=ignore-all \
-# RUN:   %t/libcross.a %t/helper.o -o %t/archive.so
+# RUN:   -u ejit_entry_fn %t/libcross.a %t/helper.o -o %t/archive.so
 # RUN: llvm-readelf -S %t/archive.so | FileCheck %s --check-prefix=ARCHIVE
 # ARCHIVE:     .ejit_bitcode
 # ARCHIVE-NOT: .ejit_cross
 
-## An archive selected through -l is not yet discovered by the cross-link scan
-## (it is resolved inside addLibrary and is not in OPT_INPUT). The member is
-## selected by lld but the .ejit_cross section passes through unconsumed,
-## producing a hard error. This is a documented limitation, not a silent drop.
-# RUN: not ld.lld --ejit-cross-inline -shared -u ejit_entry_fn -L%t -lcross \
-# RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=ARCHIVE-L
-# ARCHIVE-L: contains an unprocessed .ejit_cross section
+## An archive selected through -l is handled the same way: because cross-link
+## processing now runs after symbol resolution over ctx.objectFiles, the member
+## lld selects (here via -u) is discovered and its .ejit_cross is consumed. This
+## previously produced a hard "unprocessed .ejit_cross" error.
+# RUN: ld.lld --ejit-cross-inline -shared --unresolved-symbols=ignore-all \
+# RUN:   -u ejit_entry_fn -L%t -lcross -o %t/archive-l.so
+# RUN: llvm-readelf -S %t/archive-l.so | FileCheck %s --check-prefix=ARCHIVE-L
+# ARCHIVE-L:     .ejit_bitcode
+# ARCHIVE-L-NOT: .ejit_cross
 
 #--- entry.ll
 target datalayout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
