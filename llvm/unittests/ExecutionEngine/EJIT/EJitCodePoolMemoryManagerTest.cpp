@@ -38,6 +38,9 @@ struct MockSre {
   std::vector<void *> Raws;
   size_t SealCalls = 0;
   unsigned SealRc = 0;
+  std::vector<uintptr_t> RwEnabledPages;
+  size_t RwEnableCalls = 0;
+  unsigned RwEnableRc = 0;
 
   ~MockSre() {
     for (void *P : Raws)
@@ -52,6 +55,13 @@ struct MockSre {
   unsigned seal(void *) {
     ++SealCalls;
     return SealRc;
+  }
+  unsigned enableRw(void *Va) {
+    ++RwEnableCalls;
+    if (RwEnableRc != 0)
+      return RwEnableRc;
+    RwEnabledPages.push_back(reinterpret_cast<uintptr_t>(Va));
+    return 0;
   }
 };
 
@@ -448,5 +458,50 @@ TEST(EJitCodePoolMemMgr4K, SealsAndRecordsOnlyExecutableSegment) {
   EXPECT_EQ(Info.fnPtr, TextAddr);
   EXPECT_FALSE(Pool.findRange(DataAddr, Info));
 
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// Code-segment placement (needsEnableRw): allocate must enable_rw the slab's
+// pages (RX -> RW) BEFORE memset/JITLink writes, so the RX code-segment pages
+// are writable. enable_rw happens at allocate; enable_ex (seal) only later at
+// finalize/lookup - confirming the RW-then-RX toggle order.
+TEST(EJitCodePoolMemMgr, AllocateEnablesRwBeforeWrite) {
+  MockSre M;
+  auto O = poolOpts(256 * 1024);
+  O.needsEnableRw = true;
+  EJitCodePoolManager Pool(
+      O, [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *B) { return M.seal(B); }, nullptr, // no split (legacy mode)
+      [&M](void *V) { return M.enableRw(V); });
+  EJitCodePoolMemoryManager MM(Pool, 4096);
+
+  auto G = makeCodeGraph(64, 0x1000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+
+  // allocate enable_rw'd the slab's pages before the write; seal not yet.
+  EXPECT_GT(M.RwEnableCalls, 0u);
+  EXPECT_EQ(M.SealCalls, 0u);
+
+  auto FA = cantFail(IFA->finalize());
+  // finalize in legacy mode does not seal either (seal is at lookup).
+  EXPECT_EQ(M.SealCalls, 0u);
+  cantFail(MM.deallocate(std::move(FA)));
+}
+
+// needsEnableRw=false (data-region placement): allocate must NOT call
+// enable_rw (the region is already RW). Regression guard for the no-op path.
+TEST(EJitCodePoolMemMgr, NoEnableRwWhenNotNeeded) {
+  MockSre M;
+  EJitCodePoolManager Pool(
+      poolOpts(256 * 1024), [&M](size_t N) { return M.rawAlloc(N); },
+      [&M](void *B) { return M.seal(B); }, nullptr,
+      [&M](void *V) { return M.enableRw(V); });
+  EJitCodePoolMemoryManager MM(Pool, 4096);
+
+  auto G = makeCodeGraph(64, 0x1000);
+  auto IFA = cantFail(MM.allocate(nullptr, *G));
+  EXPECT_EQ(M.RwEnableCalls, 0u); // data-region: no enable_rw
+
+  auto FA = cantFail(IFA->finalize());
   cantFail(MM.deallocate(std::move(FA)));
 }

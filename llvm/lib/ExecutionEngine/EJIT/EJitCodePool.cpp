@@ -21,6 +21,10 @@ inline uintptr_t alignDownAddr(uintptr_t V, size_t A) {
   return V & ~(static_cast<uintptr_t>(A) - 1);
 }
 
+inline uintptr_t alignUpAddr(uintptr_t V, size_t A) {
+  return (V + (static_cast<uintptr_t>(A) - 1)) & ~(static_cast<uintptr_t>(A) - 1);
+}
+
 inline uintptr_t addr(const void *P) {
   return reinterpret_cast<uintptr_t>(P);
 }
@@ -28,9 +32,10 @@ inline uintptr_t addr(const void *P) {
 } // namespace
 
 EJitCodePoolManager::EJitCodePoolManager(Options Opts, RawAllocFn Alloc,
-                                         SealFn Seal, SplitFn Split)
+                                         SealFn Seal, SplitFn Split,
+                                         EnableRwFn EnableRw)
     : Opts_(Opts), Alloc_(std::move(Alloc)), Seal_(std::move(Seal)),
-      Split_(std::move(Split)) {
+      Split_(std::move(Split)), EnableRw_(std::move(EnableRw)) {
   // minCodeAlign and poolAlign must be powers of two for the masking math.
   if (Opts_.minCodeAlign == 0 || !isPowerOf2_64(Opts_.minCodeAlign))
     Opts_.minCodeAlign = 64;
@@ -64,41 +69,77 @@ bool EJitCodePoolManager::poolHasRoomLocked(const CodePool &P, size_t Size,
 }
 
 Error EJitCodePoolManager::newActivePoolLocked() {
-  // Reserve alignment slack so the base can be rounded up to poolAlign while
-  // still leaving poolSize usable bytes. In 4K seal mode the platform contract
-  // wants a full large-page (poolAlign) of slack; legacy mode needs only
-  // poolAlign - 1.
-  size_t RawSize = Opts_.fourKSeal ? (Opts_.poolSize + Opts_.poolAlign)
-                                   : (Opts_.poolSize + Opts_.poolAlign - 1);
-  EJIT_DIAG("newActivePool: poolSize=%zu fourKSeal=%u rawSize=%zu",
-            Opts_.poolSize, static_cast<unsigned>(Opts_.fourKSeal), RawSize);
-  void *Raw = Alloc_ ? Alloc_(RawSize) : nullptr;
-  if (!Raw) {
-    EJIT_DIAG("newActivePool FAIL: raw alloc %zu bytes returned null (hasAlloc=%u)",
-              RawSize, static_cast<unsigned>(static_cast<bool>(Alloc_)));
-    return make_error<StringError>(
-        "EJitCodePool: raw allocation of " + Twine(RawSize) + " bytes failed",
-        inconvertibleErrorCode());
-  }
-  EJIT_DIAG("newActivePool: rawAlloc=%p size=%zu", Raw, RawSize);
+  uint8_t *RawBytes = nullptr;
+  uint8_t *Base = nullptr;
 
-  auto *RawBytes = static_cast<uint8_t *>(Raw);
-  auto *Base = reinterpret_cast<uint8_t *>(
-      alignUp(addr(RawBytes), Opts_.poolAlign));
-  EJIT_DIAG("newActivePool: alignedBase=%p", static_cast<void *>(Base));
-
-  if (Opts_.fourKSeal) {
-    // The 2MiB-aligned usable window must stay inside the raw allocation.
-    if (addr(Base) + Opts_.poolSize > addr(RawBytes) + RawSize) {
-      EJIT_DIAG("newActivePool FAIL: aligned window base=%p +%zu > raw %p +%zu",
-                static_cast<void *>(Base), Opts_.poolSize,
-                static_cast<void *>(RawBytes), RawSize);
+  if (Opts_.fixedSize > 0) {
+    // Fixed-region mode: carve the next poolAlign-aligned pool from the
+    // pre-reserved region [fixedBase, fixedBase + fixedSize) (e.g. a
+    // linker-script .data.ejit bounded by __data_jit_start/__data_jit_end).
+    // No Alloc_ call - the region is owned by the image. Split_/Seal_ still
+    // apply because the region is RW until sealed. Exhaustion is a clean Error:
+    // there is intentionally NO fallback to RawAllocFn, which would break the
+    // fixed-address guarantee (the specialization falls back to AOT instead).
+    uintptr_t RegionEnd = Opts_.fixedBase + Opts_.fixedSize;
+    uintptr_t Next =
+        alignUpAddr(Opts_.fixedBase + FixedUsed_, Opts_.poolAlign);
+    if (Next + Opts_.poolSize > RegionEnd) {
+      EJIT_DIAG("newActivePool FAIL: fixed region exhausted next=0x%llx +%zu > "
+                "end=0x%llx (used=%zu of %zu)",
+                static_cast<unsigned long long>(Next), Opts_.poolSize,
+                static_cast<unsigned long long>(RegionEnd), FixedUsed_,
+                Opts_.fixedSize);
       return make_error<StringError>(
-          "EJitCodePool: aligned pool window exceeds raw allocation",
+          "EJitCodePool: fixed code-pool region exhausted (used " +
+              Twine(FixedUsed_) + " of " + Twine(Opts_.fixedSize) +
+              " bytes; no fallback to dynamic allocation)",
           inconvertibleErrorCode());
     }
+    RawBytes = reinterpret_cast<uint8_t *>(Next);
+    Base = RawBytes; // already poolAlign-aligned by the carve
+    FixedUsed_ = (Next + Opts_.poolSize) - Opts_.fixedBase;
+    EJIT_DIAG("newActivePool: fixed region base=%p size=%zu used=%zu/%zu",
+              static_cast<void *>(Base), Opts_.poolSize, FixedUsed_,
+              Opts_.fixedSize);
+  } else {
+    // Dynamic mode: reserve alignment slack so the base can be rounded up to
+    // poolAlign while still leaving poolSize usable bytes. In 4K seal mode the
+    // platform contract wants a full large-page (poolAlign) of slack; legacy
+    // mode needs only poolAlign - 1.
+    size_t RawSize = Opts_.fourKSeal ? (Opts_.poolSize + Opts_.poolAlign)
+                                     : (Opts_.poolSize + Opts_.poolAlign - 1);
+    EJIT_DIAG("newActivePool: poolSize=%zu fourKSeal=%u rawSize=%zu",
+              Opts_.poolSize, static_cast<unsigned>(Opts_.fourKSeal), RawSize);
+    void *Raw = Alloc_ ? Alloc_(RawSize) : nullptr;
+    if (!Raw) {
+      EJIT_DIAG("newActivePool FAIL: raw alloc %zu bytes returned null (hasAlloc=%u)",
+                RawSize, static_cast<unsigned>(static_cast<bool>(Alloc_)));
+      return make_error<StringError>(
+          "EJitCodePool: raw allocation of " + Twine(RawSize) + " bytes failed",
+          inconvertibleErrorCode());
+    }
+    EJIT_DIAG("newActivePool: rawAlloc=%p size=%zu", Raw, RawSize);
+    RawBytes = static_cast<uint8_t *>(Raw);
+    Base = reinterpret_cast<uint8_t *>(
+        alignUp(addr(RawBytes), Opts_.poolAlign));
+    EJIT_DIAG("newActivePool: alignedBase=%p", static_cast<void *>(Base));
+    if (Opts_.fourKSeal) {
+      // The 2MiB-aligned usable window must stay inside the raw allocation.
+      if (addr(Base) + Opts_.poolSize > addr(RawBytes) + RawSize) {
+        EJIT_DIAG("newActivePool FAIL: aligned window base=%p +%zu > raw %p +%zu",
+                  static_cast<void *>(Base), Opts_.poolSize,
+                  static_cast<void *>(RawBytes), RawSize);
+        return make_error<StringError>(
+            "EJitCodePool: aligned pool window exceeds raw allocation",
+            inconvertibleErrorCode());
+      }
+    }
+  }
+
+  if (Opts_.fourKSeal) {
     // Split the 2MiB-aligned region into 4K mappings before any enable_ex. One
-    // split per pool; per-page enable_ex happens later at seal time.
+    // split per pool; per-page enable_ex happens later at seal time. Applies in
+    // both modes (fixed region is RW until sealed too).
     unsigned Rc = Split_ ? Split_(Base, Opts_.poolSize) : 1;
     if (Rc != 0) {
       EJIT_DIAG("newActivePool FAIL: split_2m_to_4k base=%p size=%zu rc=%u",
@@ -326,6 +367,48 @@ Error EJitCodePoolManager::sealCodeRange(const void *Start, size_t Size) {
   return Error::success();
 }
 
+Error EJitCodePoolManager::enableRwRange(const void *Start, size_t Size) {
+  // No-op in data-region placement (region is already RW at load). Only the
+  // code-segment placement (needsEnableRw) must flip pages RX -> RW before any
+  // write. Also a clean no-op for a zero-size range.
+  if (!Opts_.needsEnableRw || Size == 0)
+    return Error::success();
+#ifndef EJIT_FREESTANDING
+  std::lock_guard<std::mutex> Lock(Mutex_);
+#endif
+  CodePool *P = findPoolLocked(Start);
+  if (!P) {
+    EJIT_DIAG("enableRwRange FAIL: start=%p size=%zu not owned by any pool",
+              Start, Size);
+    return make_error<StringError>(
+        "EJitCodePool: address " + Twine(addr(Start)) +
+            " is not owned by any code pool",
+        inconvertibleErrorCode());
+  }
+  // Make every 4KiB page the slab overlaps writable, mirroring sealCodeRange.
+  size_t Page = Opts_.sealPageSize;
+  uintptr_t PageStart = alignDownAddr(addr(Start), Page);
+  uintptr_t PageEnd = alignUp(addr(Start) + Size, Page);
+  EJIT_DIAG("enableRwRange: start=%p size=%zu pageStart=0x%llx pageEnd=0x%llx",
+            Start, Size, static_cast<unsigned long long>(PageStart),
+            static_cast<unsigned long long>(PageEnd));
+  for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page) {
+    unsigned Rc = EnableRw_ ? EnableRw_(reinterpret_cast<void *>(VA)) : 1;
+    if (Rc != 0) {
+      EJIT_DIAG("enableRwRange FAIL: enable_rw page=0x%llx rc=%u",
+                static_cast<unsigned long long>(VA), Rc);
+      return make_error<StringError>(
+          "EJitCodePool: enable_rw failed (rc=" + Twine(Rc) + ") for page " +
+              Twine(VA),
+          inconvertibleErrorCode());
+    }
+    ++RwEnableInvocations_;
+  }
+  EJIT_DIAG("enableRwRange OK: start=%p size=%zu (invocations=%zu)", Start, Size,
+            RwEnableInvocations_);
+  return Error::success();
+}
+
 bool EJitCodePoolManager::contains(const void *Ptr) const {
 #ifndef EJIT_FREESTANDING
   std::lock_guard<std::mutex> Lock(Mutex_);
@@ -428,6 +511,7 @@ EJitCodePoolManager::Stats EJitCodePoolManager::getStats() const {
   S.poolCount = Pools_.size();
   S.sealInvocations = SealInvocations_;
   S.splitInvocations = SplitInvocations_;
+  S.rwEnableInvocations = RwEnableInvocations_;
   S.finalizedRangeCount = FinalizedRanges_.size();
   for (auto &P : Pools_) {
     S.reservedBytes += P->size;

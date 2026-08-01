@@ -661,6 +661,37 @@ if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_4K_SEAL)
   message(STATUS "EmbeddedJIT: SRE code pool uses 4K-granular page sealing")
 endif()
 
+# Pin the JIT code pool to a fixed, linker-script-defined region
+# [__data_jit_start, __data_jit_end) (e.g. a .data.ejit output section) instead
+# of dynamic SRE_MemDbgAlloc. A fixed region gives a stable JIT address range
+# and, when placed within +-128MiB of .text, lets codegen use direct bl/adrp
+# with no GOT/stubs. When the linker script does NOT define the symbols, the
+# runtime falls back to SRE_MemDbgAlloc, so this is backward-compatible.
+# Default OFF: existing dynamic-allocation behavior is unchanged.
+option(EJIT_FIXED_CODE_POOL
+  "Back the JIT code pool with a fixed linker-script region [__data_jit_start,__data_jit_end) instead of dynamic SRE_MemDbgAlloc" OFF)
+set(EJIT_FIXED_CODE_POOL_SIZE "16777216" CACHE STRING
+  "Size hint (bytes) for the fixed .data.ejit code-pool region (default 16MiB). The authoritative size is __data_jit_end - __data_jit_start from the linker script; this only documents the intended reservation.")
+if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
+  message(STATUS "EmbeddedJIT: fixed code-pool region enabled "
+                 "(hint size=${EJIT_FIXED_CODE_POOL_SIZE}; linker script MUST define .data.ejit)")
+endif()
+
+# Place the fixed code pool in the executable CODE segment (near .text, for
+# direct bl/adrp reach to AOT code) instead of writable data RAM. The code
+# segment is RX by default, so the runtime toggles each slab writable
+# (enable_rw, RX->RW) before writing and seals it back (enable_ex, RW->RX) at
+# finalize. Requires the platform to supply an enable_rw primitive (symmetric
+# to enable_ex); a missing enable_rw is a hard link error. Default OFF: the
+# fixed pool uses data-region placement (RW, no enable_rw) unless this is on.
+# Effective only when EJIT_SRE_CODE_POOL and EJIT_FIXED_CODE_POOL are both on.
+option(EJIT_FIXED_CODE_POOL_IN_CODESEG
+  "Place the fixed code pool in the RX code segment (enable_rw toggle) instead of RW data RAM" OFF)
+if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL AND EJIT_FIXED_CODE_POOL_IN_CODESEG)
+  message(STATUS "EmbeddedJIT: fixed code pool placed in CODE segment "
+                 "(requires platform enable_rw; RX->RW write, RW->RX seal)")
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2
