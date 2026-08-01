@@ -782,6 +782,15 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       Function *MissFn = Function::Create(F->getFunctionType(),
                                           GlobalValue::InternalLinkage,
                                           F->getName() + "_miss", &M);
+      // Function::Create only inherits module-default uwtable/frame-pointer from
+      // the context, NOT F's target-cpu/target-features/tune-cpu. Without those,
+      // TTI::areInlineCompatible(Caller=MissFn, Callee=helper) fails the subtarget
+      // feature-bit superset check, so InlinerPass rejects every cost-based
+      // inlining into MissFn with "conflicting attributes" (always_inline still
+      // inlines via the InlineCost.cpp AlwaysInline short-circuit). The AOT
+      // fallback body then loses ~all helper inlining vs the original function.
+      // Copy F's attributes so MissFn matches F's subtarget; re-affirm NoInline.
+      MissFn->setAttributes(F->getAttributes());
       MissFn->addFnAttr(Attribute::NoInline);
       MissFn->setSection(F->getSection());
 
