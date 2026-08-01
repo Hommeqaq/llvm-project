@@ -8,6 +8,7 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitLinkOptimizationPlugin.h"
 
+#include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/JITLink/aarch64.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/TargetParser/Triple.h"
@@ -96,23 +97,60 @@ Error llvm::ejit::relaxAArch64BranchStubs(LinkGraph &G) {
   if (TT.getArch() != Triple::aarch64 && TT.getArch() != Triple::aarch64_be)
     return Error::success();
 
+  // Diagnostic counters (INFO): categorize why each stubbed Branch26PCRel was
+  // or was not relaxed, so the "stubbed (0 exceed +-128MB)" audit line can be
+  // reconciled with what this pass actually did.
+  unsigned total = 0, stubbed = 0, chainMismatch = 0, external = 0,
+           outOfRange = 0, relaxed = 0;
+
   for (Section &Sec : G.sections()) {
     for (Block *B : Sec.blocks()) {
       for (Edge &E : B->edges()) {
         if (E.getKind() != aarch64::Branch26PCRel)
           continue;
+        ++total;
 
-        Symbol *Destination = getPointerJumpStubDestination(E.getTarget());
-        if (!Destination || Destination->isExternal())
+        Symbol &Tgt = E.getTarget();
+        // Loose stub check (matches EJitLinkDiagPlugin's isStubSymbol): a
+        // defined symbol whose block is in $__STUBS. This is the population the
+        // diag plugin counts as "stubbed"; the sub-counters below then pin why
+        // each was or was not relaxed.
+        if (!Tgt.isDefined() ||
+            Tgt.getBlock().getSection().getName() != "$__STUBS")
+          continue; // direct target, not a stub
+        ++stubbed;
+
+        Symbol *Destination = getPointerJumpStubDestination(Tgt);
+        if (!Destination) {
+          // Stub is non-standard: strict isStubSymbol (size/offset) or the
+          // Page21/PageOffset12/Pointer64 chain (addends, GOT size) did not
+          // match. The diag plugin's loose followStubToRealTarget may still
+          // resolve these, so they appear as "stubbed (within +-128MB)" in the
+          // audit without being relaxable.
+          ++chainMismatch;
           continue;
+        }
+        if (Destination->isExternal()) {
+          ++external;
+          continue;
+        }
 
         uint64_t FixupAddr = B->getFixupAddress(E).getValue();
         uint64_t TargetAddr = Destination->getAddress().getValue();
-        if (isDirectBranchReachable(FixupAddr, TargetAddr, E.getAddend()))
-          E.setTarget(*Destination);
+        if (!isDirectBranchReachable(FixupAddr, TargetAddr, E.getAddend())) {
+          ++outOfRange;
+          continue;
+        }
+        E.setTarget(*Destination);
+        ++relaxed;
       }
     }
   }
+  EJIT_DIAG("relaxAArch64BranchStubs: graph=%s Branch26PCRel: %u total, "
+            "%u stubbed (chain-mismatch=%u external=%u out-of-range=%u), "
+            "%u relaxed",
+            G.getName().c_str(), total, stubbed, chainMismatch, external,
+            outOfRange, relaxed);
   return Error::success();
 }
 

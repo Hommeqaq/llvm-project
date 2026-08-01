@@ -140,7 +140,7 @@ static Error reportLinkGraph(LinkGraph &G) {
           bool exceeds = Real && absVal(DirectDist) > AArch64DirectBranchLimit;
           if (exceeds)
             ++outOfRange;
-          EJIT_DIAG_VERBOSE(
+          EJIT_DIAG(
               "  [STUBBED] %s @0x%llx -> stub@0x%llx "
               "(ADRP x16; LDR x16,[x16]; BR x16) -> $__GOT -> %s @0x%llx"
               " | direct dist=%lld (%s +-128MB)",
