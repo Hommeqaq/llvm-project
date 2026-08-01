@@ -100,7 +100,7 @@ Error llvm::ejit::relaxAArch64BranchStubs(LinkGraph &G) {
   // Diagnostic counters (INFO): categorize why each stubbed Branch26PCRel was
   // or was not relaxed, so the "stubbed (0 exceed +-128MB)" audit line can be
   // reconciled with what this pass actually did.
-  unsigned total = 0, stubbed = 0, chainMismatch = 0, external = 0,
+  unsigned total = 0, stubbed = 0, chainMismatch = 0, unresolved = 0,
            outOfRange = 0, relaxed = 0;
 
   for (Section &Sec : G.sections()) {
@@ -130,13 +130,18 @@ Error llvm::ejit::relaxAArch64BranchStubs(LinkGraph &G) {
           ++chainMismatch;
           continue;
         }
-        if (Destination->isExternal()) {
-          ++external;
-          continue;
-        }
-
         uint64_t FixupAddr = B->getFixupAddress(E).getValue();
         uint64_t TargetAddr = Destination->getAddress().getValue();
+        if (TargetAddr == 0) {
+          // Genuinely unresolved (e.g. a weakly-referenced external whose
+          // lookup found no definition). NOTE: JITLink's applyLookupResult
+          // resolves non-weak externals before PreFixup but leaves
+          // isExternal() true (it sets the address without converting to
+          // isAbsolute), so we must gate on the address, NOT isExternal() -
+          // otherwise every resolved external stub is wrongly skipped.
+          ++unresolved;
+          continue;
+        }
         if (!isDirectBranchReachable(FixupAddr, TargetAddr, E.getAddend())) {
           ++outOfRange;
           continue;
@@ -147,9 +152,9 @@ Error llvm::ejit::relaxAArch64BranchStubs(LinkGraph &G) {
     }
   }
   EJIT_DIAG("relaxAArch64BranchStubs: graph=%s Branch26PCRel: %u total, "
-            "%u stubbed (chain-mismatch=%u external=%u out-of-range=%u), "
+            "%u stubbed (chain-mismatch=%u unresolved=%u out-of-range=%u), "
             "%u relaxed",
-            G.getName().c_str(), total, stubbed, chainMismatch, external,
+            G.getName().c_str(), total, stubbed, chainMismatch, unresolved,
             outOfRange, relaxed);
   return Error::success();
 }
