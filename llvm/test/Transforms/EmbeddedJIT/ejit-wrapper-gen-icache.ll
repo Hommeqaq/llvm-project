@@ -23,8 +23,10 @@
 ; ICACHE-DAG: @__ejit_icache_fn_one_dim_entry = internal global [16 x ptr] zeroinitializer, align 8
 ; ICACHE-DAG: @__ejit_icache_fn_two_dim_entry = internal global [16 x [16 x ptr]] zeroinitializer, align 8
 
-; --- 0D entry: scalar slot, direct plain load (NO GEP). ---
+; --- 0D entry: scalar slot, direct plain load (NO GEP).  Section clusters the
+;     frame-less dispatcher with other dispatchers for spatial locality. ---
 ; ICACHE-LABEL: define i32 @zero_dim_entry(
+; ICACHE-SAME: section ".text.ejit_dispatch"
 ; ICACHE-NOT: ejit_icache_try
 ; ICACHE-NOT: getelementptr
 ; ICACHE: load ptr, ptr @__ejit_icache_fn_zero_dim_entry, align 8
@@ -35,6 +37,7 @@
 
 ; --- 1D entry: [16 x ptr] slot, GEP by the single dim arg + plain load. ---
 ; ICACHE-LABEL: define i32 @one_dim_entry(
+; ICACHE-SAME: section ".text.ejit_dispatch"
 ; ICACHE-NOT: ejit_icache_try
 ; ICACHE: getelementptr {{.*}} ptr @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
 ; ICACHE: load ptr, ptr {{.*}}, align 8
@@ -45,6 +48,7 @@
 
 ; --- 2D entry: [16 x [16 x ptr]] slot, 2-subscript GEP. ---
 ; ICACHE-LABEL: define i32 @two_dim_entry(
+; ICACHE-SAME: section ".text.ejit_dispatch"
 ; ICACHE: getelementptr {{.*}} ptr @__ejit_icache_fn_two_dim_entry, i32 0, i32 {{.*}}, i32 {{.*}}
 
 ; --- registration carries numDims (3rd arg): 0 / 1 / 2 (DAG: order-independent). ---
@@ -61,6 +65,14 @@
 ; --- Idempotent: two passes emit each probe exactly once. ---
 ; IDEM-LABEL: define i32 @one_dim_entry(
 ; IDEM-COUNT-1: getelementptr {{.*}} @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
+
+; --- MissFn stays in default text section (NOT .text.ejit_dispatch) ---
+; ICACHE-LABEL: define internal i32 @zero_dim_entry_miss(
+; ICACHE-NOT: section
+; ICACHE-LABEL: define internal i32 @one_dim_entry_miss(
+; ICACHE-NOT: section
+; ICACHE-LABEL: define internal i32 @two_dim_entry_miss(
+; ICACHE-NOT: section
 
 ; --- timing hit path: plain call (NOT musttail) + trace + ret. The miss path
 ;     stays musttail (no trailing calls), so we only forbid musttail within the

@@ -106,6 +106,16 @@ SECTIONS
    * AOT code. REQUIRES the platform to supply enable_rw (symmetric to
    * enable_ex); a missing enable_rw is a hard link error.
    */
+  /* --- EmbeddedJIT frame-less dispatcher clustering ---
+   * Tiny (~16-48 bytes each) icache dispatchers grouped together so they share
+   * cache lines (spatial locality across ejit_entry switches) and reduce iTLB
+   * pressure.  KEEP prevents --gc-sections from dropping them.  ALIGN(64)
+   * matches the typical L1 cache-line size, avoiding false sharing. */
+  .text.ejit_dispatch : ALIGN(64)
+  {
+    KEEP(*(.text.ejit_dispatch))
+  } > CODE
+
   .text.ejit : ALIGN(4096)
   {
     __ejit_code_start = .;

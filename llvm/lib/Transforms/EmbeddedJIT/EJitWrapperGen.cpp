@@ -912,6 +912,13 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
         CI->setTailCallKind(CallInst::TailCallKind::TCK_MustTail);
         B.CreateRet(CI);
       }
+
+      // Cluster all frame-less dispatchers into a dedicated section so they
+      // share cache lines (spatial locality when the workload switches among
+      // multiple ejit_entry functions) and reduce iTLB pressure.  MissFn
+      // already copied F's original section above; only the tiny dispatcher
+      // (probe + two tail calls) moves here.
+      F->setSection(".text.ejit_dispatch");
     } else {
       //=== icache OFF: single-function wrapper (funcidx guard -> slow path) ==
       auto *JitEntry = BasicBlock::Create(Ctx, "jit_entry", F, &OrigEntry);
