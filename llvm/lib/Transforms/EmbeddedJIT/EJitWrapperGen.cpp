@@ -790,6 +790,7 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // Copy F's attributes so MissFn matches F's subtarget; re-affirm NoInline.
       MissFn->setAttributes(F->getAttributes());
       MissFn->addFnAttr(Attribute::NoInline);
+      MissFn->addFnAttr(Attribute::Cold);
       MissFn->setSection(F->getSection());
 
       // Move ALL of F's original blocks to MissFn (not just the entry block --

@@ -66,13 +66,12 @@
 ; IDEM-LABEL: define i32 @one_dim_entry(
 ; IDEM-COUNT-1: getelementptr {{.*}} @__ejit_icache_fn_one_dim_entry, i32 0, i32 {{.*}}
 
-; --- MissFn stays in default text section (NOT .text.ejit_dispatch) ---
-; ICACHE-LABEL: define internal i32 @zero_dim_entry_miss(
-; ICACHE-NOT: section
-; ICACHE-LABEL: define internal i32 @one_dim_entry_miss(
-; ICACHE-NOT: section
-; ICACHE-LABEL: define internal i32 @two_dim_entry_miss(
-; ICACHE-NOT: section
+; --- MissFn is marked cold (moved to .text.unlikely) so the AOT fallback body
+;     stays out of the hot I-cache path. ---
+; ICACHE: define internal i32 @zero_dim_entry_miss(i32 %0) #1 {
+; ICACHE: define internal i32 @one_dim_entry_miss(i32 %0) #1 {
+; ICACHE: define internal i32 @two_dim_entry_miss(i32 %0, i32 %1) #1 {
+; ICACHE-DAG: attributes #1 = { cold noinline }
 
 ; --- timing hit path: plain call (NOT musttail) + trace + ret. The miss path
 ;     stays musttail (no trailing calls), so we only forbid musttail within the
