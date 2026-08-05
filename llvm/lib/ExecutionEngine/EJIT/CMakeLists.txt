@@ -160,6 +160,13 @@ if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
   target_compile_definitions(LLVMEJIT PRIVATE EJIT_FIXED_CODE_POOL)
 endif()
 
+# Code-pool cache-set conflict padding.  Scoped to LLVMEJIT — used in
+# EJitCodePool.cpp allocateCode() to round each allocation to a 128-byte
+# boundary (2 cache lines).  Boolean, no numeric value needed.
+if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_CACHE_PAD)
+  target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_CACHE_PAD)
+endif()
+
 # EJIT_ICACHE_DIM_SIZE: per-dim bound D of the multi-version inline cache.
 # Used by icacheFill/icacheTry linearization in EJitSharedTaskPool. Must match
 # the AOT -mllvm -ejit-icache-dim-size value (both from the top-level CMake

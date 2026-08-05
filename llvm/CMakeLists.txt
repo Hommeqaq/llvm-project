@@ -681,6 +681,16 @@ if(EJIT_SRE_CODE_POOL AND EJIT_FIXED_CODE_POOL)
                  "(size is __ejit_code_end - __ejit_code_start from the linker script's .text.ejit block)")
 endif()
 
+# Round each JIT code-pool allocation up to a 128-byte boundary (2 cache lines
+# on AArch64) so adjacent functions do not share I-cache lines or fall into the
+# same cache set, reducing thrash on low-associativity L1 caches.  ON/OFF boolean
+# — no numeric knob needed.  Effective only when EJIT_SRE_CODE_POOL is ON.
+option(EJIT_CODE_POOL_CACHE_PAD
+  "Pad JIT code-pool allocations to 128-byte boundary to reduce I-cache set conflicts" OFF)
+if(EJIT_SRE_CODE_POOL AND EJIT_CODE_POOL_CACHE_PAD)
+  message(STATUS "EmbeddedJIT: code-pool cache pad enabled (128-byte boundary)")
+endif()
+
 #===-- EmbeddedJIT per-function inline cache (multi-version) -------------===#
 # EJIT_ICACHE_DIM_SIZE: the per-dimension bound D of the per-function
 # @__ejit_icache_fn_<name> [D]^numDims inline-cache array. MUST be a power of 2

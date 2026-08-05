@@ -115,7 +115,7 @@ JIT 特化对 D-cache 的影响更值得关注：
 
 ### Tier 1：几乎零成本
 
-- **代码池分配 padding**：在 `EJitCodePool` bump allocator 中对热点函数末尾填充 1-2 个 cache line（64-128 字节），避免两个热点函数落在同一 cache set
+- **代码池分配 padding**（已实现）：CMake boolean `EJIT_CODE_POOL_CACHE_PAD`（ON/OFF）。开启后，每次 `allocateCode()` 将 bump cursor 对齐到 128 字节（2 cache lines），使相邻函数不共享 I-cache line 或落入同一 cache set。用户无需指定数值——128 字节是内部固定常量。`ejit-minimal-aarch64_be` preset 默认 ON
 - **链接脚本偏移验证**：检查 `FIXED_CODE_POOL` 基址与 `.text` 热点函数地址之间的 offset，确保不是 2 的幂次倍数
 
 ### Tier 2：低实现成本
@@ -222,9 +222,38 @@ jit_entry:
 
 ---
 
-## 8. 后续行动计划
+## 8. 代码池 Cache Pad 实现
+
+### 8.1 CMake 控制
+
+```bash
+# Boolean ON/OFF，无需指定数值
+-DEJIT_CODE_POOL_CACHE_PAD=ON   # 开启（推荐）
+-DEJIT_CODE_POOL_CACHE_PAD=OFF  # 关闭（默认）
+```
+
+`ejit-minimal-aarch64_be` preset 默认 ON。
+
+内部固定对齐值：**128 字节**（2 个 AArch64 cache line）。选 128 的理由：
+- 单 cache line（64 B）仅防 false sharing，不防 set 冲突
+- 128 B = 2 lines，两个相邻函数相当于间隔 2 个 set，大幅降低同 set 概率
+- 不选更大的值（256+）因为浪费——嵌入式场景代码总量小，128 B 已经足够
+
+### 8.2 生效位置
+
+`EJitCodePoolManager::allocateCode()` 中两处 bump cursor 更新：
+
+- **Legacy 模式**：`Active_->used = EJIT_CACHE_PAD(Off + Size)` → 对齐到 128 B
+- **4K seal 模式**：`Active_->used = alignUp(EJIT_CACHE_PAD(Off + Size), 4096)` → 128 B 对齐被 4K 涵盖
+
+宏通过 `target_compile_definitions(LLVMEJIT PRIVATE EJIT_CODE_POOL_CACHE_PAD)` 传递（仅 boolean，无数值）。
+
+---
+
+## 9. 后续行动计划
 
 1. [ ] **PMU 测量**：在 aarch64_be 实板上测量 I-cache refill 率和 D-cache refill 率
 2. [ ] **热点路径 size 测量**：用 `objdump -d` 统计特化后的实际代码量
 3. [ ] **Set 冲突验证**：计算 `.text.ejit` 与 `.text` 中热点函数的物理地址 offset，检查是否命中同一 cache set
-4. [ ] **Dispatcher 聚类实验**：若 PMU 数据显示 I-cache miss 率 > 2%，实施聚类方案
+4. [x] **Dispatcher 聚类实验**：已实施（`ejit-icache-dispatcher-cluster`），待上板验证
+5. [x] **代码池 Cache Pad**：已实施（CMake `EJIT_CODE_POOL_CACHE_PAD=64`），待上板验证

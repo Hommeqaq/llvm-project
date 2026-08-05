@@ -13,6 +13,17 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+// When enabled, round each allocation to a 128-byte boundary (2 cache lines on
+// AArch64) so adjacent functions do not share I-cache lines or fall into the
+// same cache set.  Controlled by the ON/OFF CMake option
+// EJIT_CODE_POOL_CACHE_PAD (scoped to the LLVMEJIT target).
+#ifdef EJIT_CODE_POOL_CACHE_PAD
+static constexpr size_t kCachePadAlign = 128;
+#define EJIT_CACHE_PAD(X) alignUp((X), kCachePadAlign)
+#else
+#define EJIT_CACHE_PAD(X) (X)
+#endif
+
 namespace {
 
 inline size_t alignUp(size_t V, size_t A) { return (V + (A - 1)) & ~(A - 1); }
@@ -251,8 +262,9 @@ Expected<void *> EJitCodePoolManager::allocateCode(size_t Size, size_t Align) {
     size_t Off = alignUp(Active_->used, EffAlign);
     uint8_t *Ptr = Active_->base + Off;
     // Round the bump cursor up to a whole seal page so the next allocation
-    // starts on a page this one does not share.
-    Active_->used = alignUp(Off + Size, Opts_.sealPageSize);
+    // starts on a page this one does not share.  Cache-pad alignment (128 B)
+    // is applied first, then subsumed by the 4K round-up.
+    Active_->used = alignUp(EJIT_CACHE_PAD(Off + Size), Opts_.sealPageSize);
     EJIT_DIAG("allocateCode res4k: ptr=%p size=%zu", static_cast<void *>(Ptr),
               Size);
     return static_cast<void *>(Ptr);
@@ -275,7 +287,8 @@ Expected<void *> EJitCodePoolManager::allocateCode(size_t Size, size_t Align) {
 
   size_t Off = alignUp(Active_->used, EffAlign);
   uint8_t *Ptr = Active_->base + Off;
-  Active_->used = Off + Size;
+  // Round to a 128-byte boundary (2 cache lines) when cache-pad is on.
+  Active_->used = EJIT_CACHE_PAD(Off + Size);
   EJIT_DIAG("allocateCode res: ptr=%p size=%zu", static_cast<void *>(Ptr),
             Size);
   return static_cast<void *>(Ptr);
