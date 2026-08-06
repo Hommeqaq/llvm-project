@@ -41,6 +41,23 @@ public:
   /// to avoid dangling pointers to IR units from previous modules.
   void clearAnalyses();
 
+  /// Internalize every defined non-ejit_entry function in \p M (set
+  /// InternalLinkage + DefaultVisibility). The specialization module is
+  /// self-contained - the JIT looks up only ejit_entry symbols, and every
+  /// other definition is called module-internally - so non-entry defs can be
+  /// local. This enables IPSCCP (run later in runInterproceduralPropagation)
+  /// to enumerate every call site.
+  ///
+  /// MUST run before the module is handed to ORC's IR layer (addIRModule):
+  /// BasicIRLayerMaterializationUnit snapshots the symbol set at that point
+  /// (Layer.cpp skips hasLocalLinkage()). If internalize ran later - inside
+  /// the emit-time transform - the snapshot would still list these symbols as
+  /// external definitions. The specialization pipeline then makes some of
+  /// them unreachable, JITLink prunes them from the LinkGraph, and the stale
+  /// snapshot raises MissingSymbolDefinitions. Internalizing here keeps them
+  /// out of the snapshot entirely. Idempotent (skips already-local defs).
+  void internalizeNonEntryDefinitions(Module &M);
+
 private:
   /// Replace ejit_period_arr_ind parameters with their runtime constants.
   void preReplacePeriodIndices(Module &M, const SpecializationContext &ctx);

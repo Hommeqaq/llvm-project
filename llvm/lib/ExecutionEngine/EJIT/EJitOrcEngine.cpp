@@ -817,6 +817,16 @@ Error EJitOrcEngine::loadBitcodeModule(StringRef bitcodeData,
     if (!EntryF->isDeclaration() && EntryF->hasLocalLinkage())
       EntryF->setLinkage(GlobalValue::ExternalLinkage);
 
+  // Internalize non-entry definitions BEFORE addIRModule. ORC's IR layer
+  // snapshots the symbol set at addIRModule time (Layer.cpp: hasLocalLinkage()
+  // skip), and the JIT specialization pipeline (run at emit time, after the
+  // snapshot) makes some of these functions unreachable - JITLink then prunes
+  // them from the LinkGraph. If they entered the snapshot as external symbols,
+  // that pruning would raise MissingSymbolDefinitions and every lookup would
+  // fail. Internalizing here keeps them out of the snapshot. Idempotent with
+  // the internalize step inside runInterproceduralPropagation.
+  P->optimizer->internalizeNonEntryDefinitions(**ModuleOrErr);
+
   // Collect global variable addresses from the registry for symbols
   // that appear as external declarations in the bitcode module.
   orc::SymbolMap globalSymbols;

@@ -174,7 +174,7 @@ void EJitOptimizer::runInstCombine(Module &M) {
       FPM.run(F, FAM_);
 }
 
-void EJitOptimizer::runInterproceduralPropagation(Module &M) {
+void EJitOptimizer::internalizeNonEntryDefinitions(Module &M) {
   // IPSCCP only reasons about a function's arguments when it can enumerate
   // every call site: local linkage and no address-taken uses. The
   // specialization module is self-contained — the JIT looks up only the
@@ -183,6 +183,14 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
   // can be internalized. (Address-taken callees are internalized too; IPSCCP
   // itself skips their arguments, and their symbols are still resolved
   // module-internally.)
+  //
+  // This is split out of runInterproceduralPropagation so loadBitcodeModule
+  // can call it BEFORE addIRModule: ORC's IR layer snapshots the symbol set
+  // at that point (Layer.cpp skips hasLocalLinkage()). Internalizing there
+  // keeps non-entry defs out of the snapshot, so the emit-time pipeline can
+  // prune them without tripping MissingSymbolDefinitions. The IPSCCP half
+  // still runs in runInterproceduralPropagation (at emit time, after
+  // specialization).
   for (Function &F : M.functions()) {
     if (F.isDeclaration() || F.hasLocalLinkage())
       continue;
@@ -192,6 +200,13 @@ void EJitOptimizer::runInterproceduralPropagation(Module &M) {
     F.setVisibility(GlobalValue::DefaultVisibility);
     F.setLinkage(GlobalValue::InternalLinkage);
   }
+}
+
+void EJitOptimizer::runInterproceduralPropagation(Module &M) {
+  // Idempotent: loadBitcodeModule already internalized before addIRModule,
+  // so this is usually a no-op. Kept so runPipeline remains self-contained
+  // if ever called on a module that was not pre-internalized.
+  internalizeNonEntryDefinitions(M);
 
   ModulePassManager MPM;
   MPM.addPass(IPSCCPPass());

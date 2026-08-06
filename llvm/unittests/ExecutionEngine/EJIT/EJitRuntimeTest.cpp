@@ -55,6 +55,7 @@ namespace ejit {
 // an EJitOptimizer; all other call syntax is unchanged.
 struct EJitOptimizerTestAccess : EJitOptimizer {
   using EJitOptimizer::EJitOptimizer;
+  using EJitOptimizer::internalizeNonEntryDefinitions;
   using EJitOptimizer::preReplacePeriodIndices;
   using EJitOptimizer::runInstCombine;
   using EJitOptimizer::runInterproceduralPropagation;
@@ -2613,6 +2614,40 @@ TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
   auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
   ASSERT_NE(RetVal, nullptr) << "callee return did not fold";
   EXPECT_EQ(RetVal->getSExtValue(), 100); // mock[2].b == 7 → then-branch
+}
+
+// internalizeNonEntryDefinitions must run before addIRModule so ORC's
+// materialization symbol snapshot (Layer.cpp: hasLocalLinkage() skip)
+// excludes non-entry defs. Pin the linkage contract: every defined
+// non-entry function becomes local (with default visibility, as the
+// verifier requires), the ejit_entry stays external (the JIT lookup
+// target), and the pass is idempotent.
+TEST(EJitInterprocedural, InternalizeExcludesNonEntryFromSnapshot) {
+  LLVMContext Ctx;
+  auto M = parseInterprocModule(Ctx);
+  ASSERT_NE(M, nullptr);
+
+  Function *Callee = M->getFunction("ip_callee");
+  Function *Entry = M->getFunction("ip_entry");
+  ASSERT_NE(Callee, nullptr);
+  ASSERT_NE(Entry, nullptr);
+
+  EXPECT_FALSE(Callee->hasLocalLinkage());
+  EXPECT_FALSE(Entry->hasLocalLinkage());
+
+  PeriodArrayRegistry reg;
+  EJitOptimizerTestAccess opt(reg);
+  opt.internalizeNonEntryDefinitions(*M);
+
+  EXPECT_TRUE(Callee->hasLocalLinkage());
+  EXPECT_EQ(Callee->getVisibility(), GlobalValue::DefaultVisibility);
+  EXPECT_FALSE(Entry->hasLocalLinkage())
+      << "ejit_entry must remain the JIT lookup target";
+
+  // Idempotent: a second pass changes nothing.
+  opt.internalizeNonEntryDefinitions(*M);
+  EXPECT_TRUE(Callee->hasLocalLinkage());
+  EXPECT_FALSE(Entry->hasLocalLinkage());
 }
 
 //===----------------------------------------------------------------------===//
