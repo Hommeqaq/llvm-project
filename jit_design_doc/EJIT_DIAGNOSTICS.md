@@ -302,17 +302,20 @@ clang Sema 阶段发出以下告警，归入诊断组 `embedded-jit`（即 `-Wem
 | `-mllvm -ejit-warn-no-specialization` | **on** | #1 告警 | entry 的特化闭包内**无任何** `!ejit.may_const` load（特化无收益，考虑移除 `ejit_entry`） |
 | `-mllvm -ejit-warn-unused-dim` | **on** | #2 告警 | 声明了 `ejit_period_arr_ind("P")` 但闭包**从不索引** `ejit_period_arr("P")`（死维度） |
 | `-mllvm -ejit-report-mayconst` | **off** | info 报告 | 报告每个 entry 闭包内 `may_const` 读总数 K 及其中在循环内的 J |
+| `-mllvm -ejit-warn-few-mayconst=<N>` | `0`（off） | opt-in 告警 | entry 闭包内 `may_const` 读数 **< N** 时告警（如 `=4` 告警 0..3 读）。默认关闭 |
 
 **输出文本**（走 `stderr`）：
 
 ```
-#1  EJit warning: ejit_entry function '<name>' reads no ejit_may_const field in its specialization closure; no JIT specialization value, consider removing ejit_entry
-#2  EJit warning: ejit_entry function '<name>' declares ejit_period_arr_ind('<P>') but its specialization closure never indexes an ejit_period_arr('<P>'); unused specialization dimension, consider removing it
-info EJit info: ejit_entry function '<name>': <K> ejit_may_const read[s] (<J> in loops)   # K==1 时 read 无 s
+#1    EJit warning: ejit_entry function '<name>' reads no ejit_may_const field in its specialization closure; no JIT specialization value, consider removing ejit_entry
+#2    EJit warning: ejit_entry function '<name>' declares ejit_period_arr_ind('<P>') but its specialization closure never indexes an ejit_period_arr('<P>'); unused specialization dimension, consider removing it
+info  EJit info: ejit_entry function '<name>': <K> ejit_may_const read[s] (<J> in loops)   # K==1 时 read 无 s
+few   EJit warning: ejit_entry function '<name>' has only <K> ejit_may_const read[s] in its specialization closure (threshold: <N>); low specialization surface, consider adding more may-const fields   # K==1 时 read 无 s
 ```
 
 - **关闭默认 on 的告警**：`-mllvm -ejit-warn-no-specialization=false`（同理 `-ejit-warn-unused-dim=false`）。
-- **info 报告**仅报告、不 gating。理由：`may_const` 个数是特化价值的 poor proxy--单次 `may_const` 读若在热循环或喂给分支即为高收益，故唯一 sound 的阈值是 0（即 #1），N>0 会误报最高价值场景；判断权留给用户。
+- **info 报告**仅报告、不 gating。理由：`may_const` 个数是特化价值的 poor proxy--单次 `may_const` 读若在热循环或喂给分支即为高收益，故唯一 sound 的默认阈值是 0（即 #1），N>0 会误报最高价值场景；判断权留给用户。
+- **`-ejit-warn-few-mayconst=N`** 是 opt-in 的个数阈值告警，默认关闭。它不与 #1 冲突：#1（零=确定无价值）是默认 sound 基线，本标志供想对“特化面较窄”做更严格审查的用户按需开启（低计数只表示可折入的少，是否真的配置不当取决于这些读 gate 了什么，需人工判断）。
 
 **PASS5 对称检查（始终开启，无标志）**：AOT 后期 pass 在 entry 函数体**引用**了 `ejit_period_arr("P")` 但**未声明** `ejit_period_arr_ind("P")` 时告警，与 #2（声明但不用）反向对称：
 
