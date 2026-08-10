@@ -140,6 +140,12 @@ void ejitIcacheClearAll();
 // No-op for an out-of-range funcIndex or null base.
 void ejitIcacheRegisterSlot(uint32_t funcIndex, void *base, uint32_t numDims);
 
+/// Diagnostic: dump every registered icache slot to the diagnostic log.
+/// Shows funcIndex, base pointer, numDims, and cell[0] (the scalar or
+/// [0]...[0] cell) so the caller can quickly see which slots are wired,
+/// which are null, and whether the first cell has been filled.
+void ejitDumpIcacheSlots();
+
 /// One L0 slot, sized to a cache line. The identity is stored in full and
 /// re-checked on every hit, because the index hash is not injective: it selects
 /// a slot and nothing more, so a collision must evict, never answer.

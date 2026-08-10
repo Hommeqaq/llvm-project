@@ -566,11 +566,17 @@ inline void ejitIcacheFillOnSuccess(uint32_t funcIndex, void *fnPtr,
                                     const EJitDimPair *dims,
                                     uint32_t numDims) {
 #ifdef EJIT_SRE_SHARED_TASKPOOL
-  if (!fnPtr)
+  if (!fnPtr) {
+    EJIT_DIAG("icacheFillOnSuccess SKIP func=%u: fnPtr is null", funcIndex);
     return;
+  }
   EJitSharedTaskPool *sp = gEJIT ? gEJIT->sharedTaskPool() : nullptr;
-  if (sp)
-    sp->icacheFill(funcIndex, fnPtr, dims, numDims);
+  if (!sp) {
+    EJIT_DIAG("icacheFillOnSuccess SKIP func=%u: no shared pool (gEJIT=%p)",
+              funcIndex, (void *)gEJIT);
+    return;
+  }
+  sp->icacheFill(funcIndex, fnPtr, dims, numDims);
 #else
   (void)funcIndex;
   (void)fnPtr;
@@ -1160,6 +1166,14 @@ void ejit_taskpool_print_stats() {
   EJIT_DIAG("  pendingEntries   = %u", s.pendingEntries);
   EJIT_DIAG("  queueApproxSize  = %u", s.queueApproxSize);
   EJIT_DIAG("  reserved         = %u", s.reserved);
+
+  // Diagnostic: dump the inline-cache slot registry to help diagnose
+  // why cacheHits keeps growing despite icache being enabled.
+#ifdef EJIT_SRE_SHARED_TASKPOOL
+  ejitDumpIcacheSlots();
+#else
+  EJIT_DIAG("  icacheSlots       = (n/a: shared taskpool not built)");
+#endif
 }
 
 void ejit_taskpool_print_compiled() {
