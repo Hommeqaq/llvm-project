@@ -184,7 +184,15 @@ bool EJitSharedTaskPool::isInstanceEnabled(uint32_t dimType,
                                            uint32_t instanceId) const {
   if (dimType >= kEJitSharedDimTypes || instanceId >= kEJitSharedInstances)
     return false;
+  // EXPERIMENT: use loadAcquire to test if loadRelaxed (ldrb on ARM) reads
+  // stale L1 cache value. Compile with -DEJIT_DIAG_CELL10_LOAD_ACQUIRE to
+  // enable the acquire path. If cell 10 then appears in printActive output,
+  // the root cause is confirmed: relaxed load reordering on aarch64_be.
+#ifdef EJIT_DIAG_CELL10_LOAD_ACQUIRE
+  return state_->enabled[dimType][instanceId].loadAcquire() != 0;
+#else
   return state_->enabled[dimType][instanceId].loadRelaxed() != 0;
+#endif
 }
 
 bool EJitSharedTaskPool::isInstanceActive(uint32_t dimType,
