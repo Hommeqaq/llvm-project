@@ -184,15 +184,19 @@ bool EJitSharedTaskPool::isInstanceEnabled(uint32_t dimType,
                                            uint32_t instanceId) const {
   if (dimType >= kEJitSharedDimTypes || instanceId >= kEJitSharedInstances)
     return false;
-  // EXPERIMENT: use loadAcquire to test if loadRelaxed (ldrb on ARM) reads
-  // stale L1 cache value. Compile with -DEJIT_DIAG_CELL10_LOAD_ACQUIRE to
-  // enable the acquire path. If cell 10 then appears in printActive output,
-  // the root cause is confirmed: relaxed load reordering on aarch64_be.
-#ifdef EJIT_DIAG_CELL10_LOAD_ACQUIRE
-  return state_->enabled[dimType][instanceId].loadAcquire() != 0;
-#else
-  return state_->enabled[dimType][instanceId].loadRelaxed() != 0;
+#ifdef EJIT_DIAG_CELL10_CACHE_MAINT
+  // Invalidate D-cache line before reading so we observe the latest value
+  // written by another core. Needed when the shared memory segment
+  // (.mc_shared) is mapped as Normal Cacheable Non-Shareable and each core
+  // holds an independent dirty copy of the same physical line — a writeback
+  // from a core that never touched this byte can overwrite a prior writeback
+  // from the core that did.
+  uintptr_t addr = reinterpret_cast<uintptr_t>(
+      &state_->enabled[dimType][instanceId]);
+  __asm__ __volatile__("dc civac, %0" :: "r"(addr) : "memory");
+  __asm__ __volatile__("dsb ish" ::: "memory");
 #endif
+  return state_->enabled[dimType][instanceId].loadRelaxed() != 0;
 }
 
 bool EJitSharedTaskPool::isInstanceActive(uint32_t dimType,
@@ -390,6 +394,16 @@ bool EJitSharedTaskPool::setInstanceEnabled(uint32_t dimType,
   uint8_t expected = enabled ? 0 : 1;
   uint8_t desired = enabled ? 1 : 0;
   if (state_->enabled[dimType][instanceId].compareExchange(expected, desired)) {
+#ifdef EJIT_DIAG_CELL10_CACHE_MAINT
+    // Clean the written byte to the point of coherency so other cores see
+    // the update even when .mc_shared is Non-Shareable cacheable memory.
+    {
+      uintptr_t addr = reinterpret_cast<uintptr_t>(
+          &state_->enabled[dimType][instanceId]);
+      __asm__ __volatile__("dc cvac, %0" :: "r"(addr) : "memory");
+      __asm__ __volatile__("dsb ish" ::: "memory");
+    }
+#endif
     state_->version[dimType][instanceId].fetchAdd(1);
     // Cached L0 entries carry no version, so retire them all.
     state_->dispatchEpoch.fetchAdd(1);
