@@ -614,6 +614,20 @@ static std::string extractAndSerialize(Module &M,
     GV.setInitializer(nullptr);
     GV.setLinkage(GlobalValue::ExternalLinkage);
   }
+
+  // Clear hidden/protected visibility on all declarations so the JIT linker
+  // can resolve them from the host process or userSymbols map. Hidden
+  // visibility symbols are not exported from the AOT binary's dynamic symbol
+  // table; if preserved in the extracted bitcode, JITLink refuses to resolve
+  // them against externally-supplied absolute symbols, causing spurious
+  // "Symbols not found" errors.
+  for (Function &F : Extracted->functions())
+    if (F.isDeclaration() && !F.hasDefaultVisibility())
+      F.setVisibility(GlobalValue::DefaultVisibility);
+  for (GlobalVariable &GV : Extracted->globals())
+    if (GV.isDeclaration() && !GV.hasDefaultVisibility())
+      GV.setVisibility(GlobalValue::DefaultVisibility);
+
   logEJitGlobalMeta("extract-after-extern", *Extracted);
 
   // Optionally dump the extracted module for debugging (e.g. to confirm an
