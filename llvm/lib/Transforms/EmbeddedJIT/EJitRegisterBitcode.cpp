@@ -647,6 +647,28 @@ static std::string extractAndSerialize(Module &M,
     if (GV.isDeclaration() && !GV.hasDefaultVisibility())
       GV.setVisibility(GlobalValue::DefaultVisibility);
 
+  // Pre-internalize non-entry definitions so the JIT's IRMaterializationUnit
+  // does not advertise them in MR->getSymbols().  The JIT-side
+  // runInterproceduralPropagation also internalizes them (for IPSCCP), but
+  // that runs inside the IR transform callback — after the MU has already
+  // been created with the original symbol claim set.  If a helper is
+  // advertised as an external definition in the MU but codegen emits it as
+  // STB_LOCAL (because the JIT-side internalize ran after the MU was fixed),
+  // JITLink maps STB_LOCAL to Scope::Local and excludes it from
+  // InternedResult, breaking the ORC invariant that every claimed symbol has
+  // a matching definition.  Doing it here, before serialization, makes the
+  // embedded bitcode self-consistent: the MU only claims entry-point symbols
+  // (which still have external linkage), and the JIT-side internalize pass
+  // becomes a no-op for helpers (they already have local linkage).
+  for (Function &F : Extracted->functions()) {
+    if (F.isDeclaration() || F.hasLocalLinkage())
+      continue;
+    if (hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY))
+      continue;
+    F.setVisibility(GlobalValue::DefaultVisibility);
+    F.setLinkage(GlobalValue::InternalLinkage);
+  }
+
   logEJitGlobalMeta("extract-after-extern", *Extracted);
 
   // Optionally dump the extracted module for debugging (e.g. to confirm an
