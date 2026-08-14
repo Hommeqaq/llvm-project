@@ -240,6 +240,15 @@ public:
   /// Per-core platform primitive: seal one 4KiB page at \p pageVA to RX in the
   /// CALLING core's translation context (enable_ex). Returns true on success.
   using SealPageCallback = bool (*)(void *ctx, uintptr_t pageVA);
+  /// Per-core platform primitive: make one 4KiB page at \p pageVA writable
+  /// (RX -> RW, enable_rw) in the CALLING core's translation context. Returns
+  /// true on success. Used only in 4K page-seal mode, for the runtime-writable
+  /// data pages of a JIT function (e.g. the Tier-1 __profc_ counters), so a
+  /// non-owner core running from the fixed RX .text.ejit segment may execute
+  /// code that writes them without a write-permission abort. Applied ONLY to
+  /// writable, non-executable pages (page-disjoint from the code), so it never
+  /// makes an executable page writable (no RWX).
+  using EnableRwPageCallback = bool (*)(void *ctx, uintptr_t pageVA);
 
   /// Worker loop entry (provided by this class, run on the injected task).
   using WorkerEntryFn = void (*)(void *ctx);
@@ -309,10 +318,6 @@ public:
     /// This flag is an internal control signal; it does not affect status
     /// mapping or the C ABI.
     bool fastPathTerminal = false;
-    /// PGO (§6): set when this hit crosses the Tier-2 threshold — compileOrGet()
-    /// enqueues a one-shot Tier-2 (PGOUse) recompile. (Shared equivalent of
-    /// the non-shared CompileOrGetResult::tier2Arm.)
-    bool tier2Arm = false;
   };
   static_assert(kEJitSharedCacheBuckets < 255,
                 "bucketIndex is a uint8_t: the bucket count and its sentinel "
@@ -396,6 +401,14 @@ public:
     sealPageFn_ = fn;
     sealPageCtx_ = ctx;
   }
+  /// 4K mode: per-core per-page enable_rw primitive for runtime-writable data
+  /// (see EnableRwPageCallback). Optional: when unset, a slot that carries
+  /// runtime-writable ranges cannot be prepared on a peer core (clean fallback,
+  /// no fnPtr) rather than executing code whose counter writes would fault.
+  void setEnableRwPageCallback(EnableRwPageCallback fn, void *ctx) {
+    enableRwPageFn_ = fn;
+    enableRwPageCtx_ = ctx;
+  }
   void setWorkerHooks(WorkerStartFn start, WorkerStopFn stop, void *ctx) {
     workerStart_ = start;
     workerStop_ = stop;
@@ -473,10 +486,33 @@ public:
   void setPgoEnabled(bool enable, uint32_t threshold) {
     pgoEnabled_.storeRelaxed(enable ? 1 : 0);
     tier2Threshold_.storeRelaxed(enable ? threshold : 0u);
+    if (!state_ || state_->initState.loadAcquire() !=
+                       static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return;
+
+    // Publish the threshold before enabling so a peer that acquires the
+    // enabled flag also observes the matching threshold. Disable first when
+    // turning PGO off so no new hit can arm a Tier-2 request.
+    if (enable) {
+      state_->tier2Threshold.storeRelease(threshold);
+      state_->pgoEnabled.storeRelease(1);
+    } else {
+      state_->pgoEnabled.storeRelease(0);
+      state_->tier2Threshold.storeRelease(0);
+    }
+    // L0 hits bypass the shared slot hitCount. Retire every core's existing L0
+    // entries whenever PGO control changes; l0Fill() remains disabled while
+    // PGO is enabled so calls continue through the Tier-2 trigger path.
+    state_->dispatchEpoch.fetchAdd(1);
   }
 
   /// True when the shared PGO auto-trigger is armed.
-  bool isPgoEnabled() const { return pgoEnabled_.loadRelaxed() != 0; }
+  bool isPgoEnabled() const {
+    if (state_ && state_->initState.loadAcquire() ==
+                      static_cast<uint32_t>(EJitSharedInitState::Ready))
+      return state_->pgoEnabled.loadAcquire() != 0;
+    return pgoEnabled_.loadRelaxed() != 0;
+  }
 
   //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
   /// Publish the compile/taskpool mode as cross-core shared runtime state.
@@ -749,16 +785,17 @@ private:
     /// first-touch path (which self-revalidates), so the seqlock caller must not
     /// second-guess it with the bucket publishSeq check.
     bool coldPrepared = false;
-    /// PGO (§6): set when this hit crosses the Tier-2 threshold, arming
-    /// a one-shot lazy enqueue of a PGOUse recompile. compileOrGet()
-    /// consumes it on the fast-hit path. (Shared equivalent of
-    /// EJitCacheLookupResult::tier2Arm.)
-    bool tier2Arm = false;
   };
 
   // shared cache helpers (POD table in the shared blob)
   uint64_t hashIdentity(uint32_t funcIndex, const EJitDimPair *dims,
                         uint32_t numDims) const;
+  /// True only when the shared cache currently publishes \p fnPtr as Tier-2
+  /// for this exact identity and version snapshot. Used while online PGO is
+  /// enabled to keep Tier-1 out of the wrapper's direct inline cache without
+  /// duplicating hit accounting or triggering another Tier-2 request.
+  bool isPublishedTier2(uint32_t funcIndex, void *fnPtr,
+                        const EJitDimPair *dims, uint32_t numDims);
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
@@ -807,6 +844,10 @@ private:
   /// by cacheLookup() and all fixed-dimension specializations.
   SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
                                   uint32_t bucketIndex, uint32_t slotIndex);
+  /// Submit Tier-2 from an identity/version-validated slot while its bucket
+  /// read lock is held. This preserves the exact slot snapshot without
+  /// enlarging the 16-byte CompileOrGetResult hot-path return value.
+  void enqueueTier2FromSlot(const EJitSharedCacheSlot &slot);
   /// Cold non-owner first-touch execute-permission preparation for a matched
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
@@ -842,6 +883,15 @@ private:
     uint64_t codeSize = 0;
     uintptr_t poolBase = 0;
     uint64_t poolSize = 0;
+    /// Runtime-writable extents (e.g. __profc_) this core must enable_rw before
+    /// it may execute the code. Snapshotted with the range so the per-core
+    /// enable_rw runs with NO bucket lock held. writableCount 0 => none.
+    uint32_t writableCount = 0;
+    /// 1 => this pool is a fixed RX region: the peer must enable_rw the
+    /// writable pages. 0 => dynamic RW pool: no enable_rw (ranges are
+    /// diagnostic only).
+    uint32_t requiresPeerEnableRw = 0;
+    EJitSharedWritableRange writables[kEJitSharedMaxWritableRanges] = {};
   };
   /// Prepare execute permission for the current core over \p R's code range
   /// WITHOUT holding any bucket lock. 2M mode delegates to prepareCodeFn_; 4K
@@ -872,7 +922,14 @@ private:
   /// stale worker (older gen) therefore cannot clear a newer generation's bit.
   void dedupClear(uint32_t funcIndex, uint32_t gen);
 
-  void runCompile(const EJitCompileRequest &req, bool pgoClearExclusive = false);
+  /// Compile one dequeued request through the two version checkpoints and the
+  /// commit-gated publish. The Tier-2 aarch64 exclusive-monitor workaround
+  /// (pgoClearExclusive) is derived here from the request's encoded tier
+  /// (decodeReqTier), so a PGOUse (Tier-2) publish clears the monitor primed by
+  /// the arming hit's hitCount RMW while a Tier-1 publish keeps the normal
+  /// write lock. No caller-supplied flag: the worker owns this policy (spec
+  /// §4.9).
+  void runCompile(const EJitCompileRequest &req);
 
   /// Owner-only: snapshot the owner-core code-pool stats via the registered
   /// provider and storeRelaxed them into the shared mirror. Called after every
@@ -895,6 +952,8 @@ private:
   void *splitPoolCtx_ = nullptr;
   SealPageCallback sealPageFn_ = nullptr;
   void *sealPageCtx_ = nullptr;
+  EnableRwPageCallback enableRwPageFn_ = nullptr;
+  void *enableRwPageCtx_ = nullptr;
   bool fourKSeal_ = false;
   WorkerStartFn workerStart_ = nullptr;
   WorkerStopFn workerStop_ = nullptr;
@@ -915,19 +974,15 @@ private:
   // the cache. See setReleaser().
   bool icacheReclamationSafe_ = true;
 
-  EJitAtomicU8 pgoEnabled_{0}; // PGO (§6): gates the Tier-2 trigger (atomic —
-                               // read by compileOrGet/resolveMatchedSlot on any
-                               // core, written by setPgoEnabled on the owner)
-  EJitAtomicU32 tier2Threshold_{0}; // PGO: threshold for Tier-2 arming
-  EJitAtomicU8 tier2Pending_{0}; // PGO: set by compileOrGet, cleared by pollOne
-                                 // storeRelease/loadAcquire pairs with
-                                 // tier2PendingReq_ (the flag's acquire sees
-                                 // all plain stores the release ordered)
-  EJitCompileRequest tier2PendingReq_{}; // PGO: pending Tier-2 request data.
-                                 // Written BEFORE tier2Pending_.storeRelease(1);
-                                 // read AFTER tier2Pending_.loadAcquire().
-                                 // Single-producer by invariant: only the
-                                 // owner facade has pgoEnabled_=true.
+  // Pre-init staging only. Once the shared blob is Ready, state_->pgoEnabled
+  // and state_->tier2Threshold are the cross-core source of truth.
+  EJitAtomicU8 pgoEnabled_{0};
+  EJitAtomicU32 tier2Threshold_{0};
+  // PGO (§6): Tier-2 requests are NOT held in a facade-local bypass. A hit that
+  // crosses the threshold (on ANY producer core / facade) submits a fully
+  // value-initialized EJitCompileRequest through the shared MPSC queue, so the
+  // single owner worker consumes it via the normal pollOne()/runCompile() path.
+  // This is what lets a peer core's Tier-2 trigger actually be serviced.
 
   // Worker observability+ startup-wait bound (owner-local).
   EJitAtomicU64 workerConsumeLoops_{0};

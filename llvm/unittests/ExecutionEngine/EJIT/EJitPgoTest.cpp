@@ -11,7 +11,6 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitProfileMerge.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#include "llvm/Support/TargetSelect.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -21,16 +20,35 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/ProfileData/InstrProf.h"
+#include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/ProfileData/InstrProfWriter.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "gtest/gtest.h"
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 
 using namespace llvm;
 using namespace llvm::ejit;
+
+static void markEJitEntry(Function &F) {
+  LLVMContext &Ctx = F.getContext();
+  MDNode *Entry = MDNode::get(Ctx, {MDString::get(Ctx, TAG_EJIT_ENTRY)});
+  F.setMetadata(MD_EJIT_METADATA, MDNode::get(Ctx, {Entry}));
+}
+
+static std::string findCapturedPgoName(const EJitOptimizer &Opt,
+                                       StringRef FunctionName) {
+  for (const std::string &Name : Opt.getLastCounterNames())
+    if (Name == FunctionName || StringRef(Name).ends_with(FunctionName))
+      return Name;
+  return {};
+}
 
 // foo(i32 %n): if (n > 0) call @ea(n); else call @eb(n); ret n.
 // Both arms have external calls (unknown side effects) so SimplifyCFG cannot
@@ -46,6 +64,7 @@ static std::unique_ptr<Module> makeFooModule(LLVMContext &Ctx) {
   M->getOrInsertFunction("eb", CallTy);
   auto *F = Function::Create(FunctionType::get(I32, {I32}, false),
                              Function::ExternalLinkage, "foo", M.get());
+  markEJitEntry(*F);
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
   BasicBlock *Then = BasicBlock::Create(Ctx, "then", F);
   BasicBlock *Else = BasicBlock::Create(Ctx, "else", F);
@@ -163,6 +182,7 @@ std::unique_ptr<Module> makeFooCallsBarModule(LLVMContext &Ctx) {
     B.CreateRet(B.CreateAdd(M3, ConstantInt::get(I32, 2)));
   }
   auto *Foo = Function::Create(FnTy, Function::ExternalLinkage, "foo", M.get());
+  markEJitEntry(*Foo);
   {
     BasicBlock *BB = BasicBlock::Create(Ctx, "b", Foo);
     IRBuilder<> B(BB);
@@ -207,23 +227,24 @@ TEST(EJitPgo, Tier2PgoInlinesHotCallee) {
   sc1.fnName = "foo";
   sc1.tier = CompileTier::Instrumented;
   opt.runPipeline(*M1, sc1);
+  std::string barPgoName = findCapturedPgoName(opt, "bar");
+  ASSERT_FALSE(barPgoName.empty());
   uint64_t fooHash = 0, barHash = 0;
   unsigned fooCnt = 0, barCnt = 0;
   ASSERT_TRUE(readCounterInfo(*M1, "foo", fooHash, fooCnt));
-  ASSERT_TRUE(readCounterInfo(*M1, "bar", barHash, barCnt));
+  ASSERT_TRUE(readCounterInfo(*M1, barPgoName, barHash, barCnt));
 
   // Synthesize profiles: foo entry=100, bar entry=200 (called 2x, hot).
   InstrProfWriter Writer;
   consumeError(Writer.mergeProfileKind(InstrProfKind::IRInstrumentation));
-  auto addRec = [&](const char *name, uint64_t hash, unsigned cnt,
-                    uint64_t val) {
+  auto addRec = [&](StringRef name, uint64_t hash, unsigned cnt, uint64_t val) {
     std::vector<uint64_t> C(cnt, 0);
     C[0] = val;
     NamedInstrProfRecord Rec(name, hash, C);
     Writer.addRecord(std::move(Rec), 1, [](Error) {});
   };
   addRec("foo", fooHash, fooCnt, 100);
-  addRec("bar", barHash, barCnt, 200);
+  addRec(barPgoName, barHash, barCnt, 200);
   auto Buf = Writer.writeBuffer();
   ASSERT_NE(Buf, nullptr);
 
@@ -344,6 +365,7 @@ std::unique_ptr<Module> makeFooCallsMediumBarModule(LLVMContext &Ctx) {
   // foo(i32 %n): calls bar(%n) and returns the result.
   auto *FooFnTy = FunctionType::get(I32, {I32}, false);
   auto *Foo = Function::Create(FooFnTy, Function::ExternalLinkage, "foo", M.get());
+  markEJitEntry(*Foo);
   {
     BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Foo);
     IRBuilder<> B(BB);
@@ -377,10 +399,12 @@ TEST(EJitPgo, Tier2PgoInlinesAotRejectedCallee) {
   sc1.fnName = "foo";
   sc1.tier = CompileTier::Instrumented;
   opt.runPipeline(*M1, sc1);
+  std::string barPgoName = findCapturedPgoName(opt, "bar");
+  ASSERT_FALSE(barPgoName.empty());
   uint64_t fooHash = 0, barHash = 0;
   unsigned fooCnt = 0, barCnt = 0;
   ASSERT_TRUE(readCounterInfo(*M1, "foo", fooHash, fooCnt));
-  ASSERT_TRUE(readCounterInfo(*M1, "bar", barHash, barCnt));
+  ASSERT_TRUE(readCounterInfo(*M1, barPgoName, barHash, barCnt));
 
   // Step 2 — synthesize a hot profile: use a high uniform count so both
   // foo's and bar's entry counts sit above the profile-summary hot
@@ -391,15 +415,14 @@ TEST(EJitPgo, Tier2PgoInlinesAotRejectedCallee) {
   // Bar's ~250-400 static cost then fits comfortably under 3000.
   InstrProfWriter Writer;
   consumeError(Writer.mergeProfileKind(InstrProfKind::IRInstrumentation));
-  auto addRec = [&](const char *name, uint64_t hash, unsigned cnt,
-                    uint64_t val) {
+  auto addRec = [&](StringRef name, uint64_t hash, unsigned cnt, uint64_t val) {
     std::vector<uint64_t> C(cnt, 0);
     C[0] = val;
     NamedInstrProfRecord Rec(name, hash, C);
     Writer.addRecord(std::move(Rec), 1, [](Error) {});
   };
   addRec("foo", fooHash, fooCnt, 10000);
-  addRec("bar", barHash, barCnt, 10000);
+  addRec(barPgoName, barHash, barCnt, 10000);
   auto Buf = Writer.writeBuffer();
   ASSERT_NE(Buf, nullptr);
 
@@ -529,6 +552,7 @@ std::unique_ptr<Module> makeSimpleFooModule(LLVMContext &Ctx) {
   auto *I32 = Type::getInt32Ty(Ctx);
   auto *F = Function::Create(FunctionType::get(I32, {I32}, false),
                              Function::ExternalLinkage, "foo", M.get());
+  markEJitEntry(*F);
   BasicBlock *BB = BasicBlock::Create(Ctx, "b", F);
   IRBuilder<> B(BB);
   B.CreateRet(B.CreateAdd(F->getArg(0), ConstantInt::get(I32, 1)));
@@ -744,4 +768,86 @@ TEST(EJitPgo, Tier1ToTier2FullCycle) {
     if (EC)
       EXPECT_GT(EC->getCount(), 0u);
   }
+}
+
+// PGO (§5): shared Tier-1 machine code runs on multiple cores concurrently, so
+// the counter updates MUST be atomic (InstrProfOptions.Atomic). After Tier-1
+// lowering the __profc_* increment must be an `atomicrmw add`, not a plain
+// load/add/store that would race and lose counts across cores.
+TEST(EJitPgo, Tier1CountersUseAtomicRMW) {
+  LLVMContext Ctx;
+  auto M = makeFooModule(Ctx);
+  PeriodArrayRegistry reg;
+  EJitOptimizer opt(reg);
+  SpecializationContext sc;
+  sc.fnName = "foo";
+  sc.tier = CompileTier::Instrumented;
+  opt.runPipeline(*M, sc);
+
+  unsigned AtomicAdds = 0;
+  unsigned PlainCounterStores = 0;
+  for (Function &F : *M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+          if (RMW->getOperation() == AtomicRMWInst::Add)
+            ++AtomicAdds;
+        // A non-atomic lowering would emit a plain store back to the counter
+        // global; count stores whose pointer is a __profc_ GEP/global as a
+        // regression signal.
+        if (auto *St = dyn_cast<StoreInst>(&I)) {
+          const Value *Ptr = St->getPointerOperand()->stripPointerCasts();
+          if (const auto *GEP = dyn_cast<GetElementPtrInst>(Ptr))
+            Ptr = GEP->getPointerOperand()->stripPointerCasts();
+          if (const auto *GV = dyn_cast<GlobalVariable>(Ptr))
+            if (GV->getName().starts_with("__profc_"))
+              ++PlainCounterStores;
+        }
+      }
+
+  EXPECT_GT(AtomicAdds, 0u)
+      << "Tier-1 counter updates must lower to `atomicrmw add` (Atomic=true)";
+  EXPECT_EQ(PlainCounterStores, 0u)
+      << "no plain (non-atomic) store to a __profc_ counter may remain";
+}
+
+// PGO (§5): EJitProfileMerge must read the live __profc_ counters with a
+// RELAXED atomic load (they are being updated by shared Tier-1 code with
+// atomicrmw). This test feeds synthesizeProfileBuffer a faked, 64-bit
+// __llvm_profile_data + counter array and verifies the synthesized indexed
+// profile round-trips the counter VALUES exactly (proving the atomic read read
+// the correct scalars; typed uint64 loads keep it endian-safe).
+TEST(EJitPgo, ProfileMergeReadsCountersAtomically) {
+  // __llvm_profile_data layout (64-bit, InstrProfData.inc): FuncHash @8,
+  // NumCounters @48. Build a minimally sized, 8-byte-aligned blob.
+  alignas(8) uint8_t Profd[56] = {};
+  const uint64_t FuncHash = 0x1122334455667788ull;
+  const uint32_t NumCounters = 3;
+  std::memcpy(&Profd[8], &FuncHash, sizeof(FuncHash));
+  std::memcpy(&Profd[48], &NumCounters, sizeof(NumCounters));
+
+  alignas(8) uint64_t Counters[3] = {100, 5, 7};
+
+  PgoCounterRef Ref;
+  Ref.pgoName = "foo";
+  Ref.profdAddr = reinterpret_cast<uintptr_t>(&Profd[0]);
+  Ref.profcAddr = reinterpret_cast<uintptr_t>(&Counters[0]);
+
+  std::string Buf = synthesizeProfileBuffer({Ref});
+  ASSERT_FALSE(Buf.empty()) << "profile synthesis must produce a buffer";
+
+  // Read the synthesized indexed profile back and verify the counter values
+  // survived the (now atomic) read + record write.
+  auto ReaderOrErr = IndexedInstrProfReader::create(MemoryBuffer::getMemBuffer(
+      Buf, "ejit.prof", /*RequiresNullTerminator=*/false));
+  ASSERT_TRUE(static_cast<bool>(ReaderOrErr));
+  IndexedInstrProfReader &Reader = **ReaderOrErr;
+  auto RecOrErr = Reader.getInstrProfRecord("foo", FuncHash);
+  ASSERT_TRUE(static_cast<bool>(RecOrErr))
+      << "synthesized record must be retrievable by name + FuncHash";
+  NamedInstrProfRecord Rec = std::move(*RecOrErr);
+  ASSERT_EQ(Rec.Counts.size(), static_cast<size_t>(NumCounters));
+  EXPECT_EQ(Rec.Counts[0], 100u);
+  EXPECT_EQ(Rec.Counts[1], 5u);
+  EXPECT_EQ(Rec.Counts[2], 7u);
 }

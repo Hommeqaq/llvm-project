@@ -355,6 +355,11 @@ void EJitSharedTaskPool::l0Fill(uint32_t funcIndex, void *fnPtr,
                                 const EJitDimPair *dims, uint32_t numDims) {
   if (!icacheReclamationSafe_ || !state_ || !fnPtr)
     return;
+  // PGO hotness is counted in resolveMatchedSlot(). An L0 hit bypasses that
+  // path, so caching here would prevent the Tier-2 threshold from being
+  // reached. PGO-off behavior and its steady-state L0 hot path are unchanged.
+  if (state_->pgoEnabled.loadAcquire())
+    return;
   if (numDims > kEJitSharedMaxDims)
     return;
   if (state_->initState.loadAcquire() != kReady)
@@ -404,6 +409,15 @@ void EJitSharedTaskPool::icacheFill(uint32_t funcIndex, void *fnPtr,
               funcIndex, (void *)reg.base, reg.numDims, numDims);
     return; // unregistered, or shape mismatch: nowhere to write.
   }
+  // A wrapper-inline-cache hit bypasses the shared slot and therefore both
+  // PGO hit counting and observation of a later Tier-2 publish. Keep Tier-1
+  // out of the cell while PGO is enabled; the first taskpool hit that resolves
+  // the published Tier-2 pointer fills it, after this core has passed the
+  // normal execute-permission gate. Steady state then regains the original
+  // direct wrapper hit with no added guard.
+  if (state_->pgoEnabled.loadAcquire() &&
+      !isPublishedTier2(funcIndex, fnPtr, dims, numDims))
+    return;
   // Plain store: the slot is per-core private, so this write (on the calling
   // core) is ordered before the wrapper's read (same core) by program order.
   // The specialization is invariant per identity under the contract + NO_RECLAIM,
@@ -503,6 +517,12 @@ EJitDedupResult EJitSharedTaskPool::dedupMark(uint32_t funcIndex,
 }
 
 void EJitSharedTaskPool::dedupClear(uint32_t funcIndex, uint32_t gen) {
+  // PGO: Tier-2 requests carry the tier in funcIndex's top 2 bits
+  // (encodeReqTier). dedupMark strips them before indexing, so dedupClear MUST
+  // strip identically \u2014 otherwise an encoded Tier-2 funcIndex indexes out
+  // of range (or a different slot) and the in-flight bit is never cleared,
+  // which would permanently block the next Tier-2 claim for that function.
+  funcIndex = stripReqTier(funcIndex);
   if (funcIndex >= kEJitSharedMaxFuncIndex)
     return;
   // CAS gen->0: only clears the slot if it still holds OUR generation. A stale
@@ -584,6 +604,60 @@ static bool slotIdentityMatches(const EJitSharedCacheSlot &s,
         s.dims[i].instanceId != dims[i].instanceId)
       return false;
   return true;
+}
+
+bool EJitSharedTaskPool::isPublishedTier2(uint32_t funcIndex, void *fnPtr,
+                                          const EJitDimPair *dims,
+                                          uint32_t numDims) {
+  if (!state_ || !fnPtr || numDims > kEJitSharedMaxDims)
+    return false;
+
+  const uint64_t key = hashIdentity(funcIndex, dims, numDims);
+  const uint32_t bucket = static_cast<uint32_t>(key % kEJitSharedCacheBuckets);
+  EJitSharedCacheBucket &B = state_->buckets[bucket];
+
+  auto matchesTier2 = [&]() {
+    const uint32_t curGen = state_->generation.loadAcquire();
+    for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
+      EJitSharedCacheSlot &Slot = B.slots[s];
+      if (Slot.identityHash != key)
+        continue;
+      if (Slot.state.loadAcquire() !=
+          static_cast<uint32_t>(EJitSharedSlotState::Ready))
+        continue;
+      if (Slot.generation != curGen ||
+          !slotIdentityMatches(Slot, funcIndex, dims, numDims))
+        continue;
+      for (uint32_t i = 0; i < numDims; ++i)
+        if (Slot.versions[i] !=
+            instanceVersion(dims[i].dimType, dims[i].instanceId))
+          return false;
+      return Slot.tier.loadRelaxed() >= kEJitTierPgoUse &&
+             reinterpret_cast<void *>(Slot.fnPtr.loadAcquire()) == fnPtr;
+    }
+    return false;
+  };
+
+#ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
+  for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+    uint32_t seq0;
+    if (!bucketSeqBegin(B, seq0)) {
+      cpuRelax();
+      continue;
+    }
+    const bool match = matchesTier2();
+    if (bucketSeqStable(B, seq0))
+      return match;
+    cpuRelax();
+  }
+  return false;
+#else
+  if (!bucketTryRead(B))
+    return false;
+  const bool match = matchesTier2();
+  bucketReadRelease(B);
+  return match;
+#endif
 }
 
 EJitSharedTaskPool::SharedLookup
@@ -855,19 +929,17 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // We count all identity hits — even those rejected for shareability —
   // because the function IS being called; the PGO counter is a hotness
   // proxy, not an execution-completed count.
-  // PGO (§6): every identity-matched hit increments the slot's hitCount.
-  // The hit that crosses tier2Threshold_ arms a one-shot Tier-2 recompile.
   // A slot already at Tier-2 (PGOUse) is never re-armed — Tier-2 code does
   // not need another Tier-2 compile (§4 repeat-trigger).
-  if (pgoEnabled_.loadRelaxed()) {
+  if (state_->pgoEnabled.loadAcquire()) {
     uint8_t slotTier = Slot.tier.loadRelaxed();
     if (slotTier < kEJitTierPgoUse) {
       uint64_t prev = Slot.hitCount.fetchAdd(1);
-      uint32_t threshold = tier2Threshold_.loadRelaxed();
+      uint32_t threshold = state_->tier2Threshold.loadAcquire();
       // >= (not ==): if the enqueue fails (queue full / already pending),
       // the next hit can still arm — a transient failure is not fatal (§7).
       if (threshold && prev + 1 >= threshold)
-        R.tier2Arm = true;
+        enqueueTier2FromSlot(Slot);
     }
   }
 
@@ -940,9 +1012,38 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
     return R;
   }
 
-  // Cold: this core has never prepared this code. Delegate to the out-of-line
-  // helper so the hit path stays small.
+  // Cold: this core has never prepared this code. Tier-2 submission, when
+  // armed above, has already captured the exact slot.
   return peerPrepareSlot(B, bucket, slotIndex);
+}
+
+void EJitSharedTaskPool::enqueueTier2FromSlot(const EJitSharedCacheSlot &Slot) {
+  if (state_->mode.loadAcquire() !=
+      static_cast<uint32_t>(EJitCompileMode::Async))
+    return;
+
+  EJitCompileRequest T2{};
+  T2.funcIndex = encodeReqTier(Slot.funcIndex, kEJitTierPgoUse);
+  T2.numDims = Slot.numDims;
+  T2.generation = Slot.generation;
+  for (uint32_t i = 0; i < Slot.numDims && i < 4; ++i) {
+    T2.dims[i] = Slot.dims[i];
+    T2.versions[i] = Slot.versions[i];
+  }
+
+  if (dedupMark(T2.funcIndex, T2.generation) != EJitDedupResult::Claimed)
+    return;
+  if (queuePush(T2)) {
+    EJIT_STAT_INC(state_->counters.asyncEnqueues);
+    EJIT_DIAG_VERBOSE("shared taskpool PGO Tier-2 enqueued func=%u gen=%u",
+                      Slot.funcIndex, T2.generation);
+    return;
+  }
+
+  dedupClear(T2.funcIndex, T2.generation);
+  EJIT_STAT_INC(state_->counters.queueFull);
+  EJIT_DIAG("shared taskpool PGO Tier-2 drop func=%u: queue full",
+            Slot.funcIndex);
 }
 
 //===----------------------------------------------------------------------===//
@@ -977,6 +1078,19 @@ EJitSharedTaskPool::peerPrepareSlot(EJitSharedCacheBucket &B, uint32_t bucket,
   Snap.codeSize = Slot.codeSize;
   Snap.poolBase = Slot.poolBase;
   Snap.poolSize = Slot.poolSize;
+  // Snapshot the runtime-writable extents too: the per-core enable_rw must run
+  // with NO bucket lock held (like the split/seal below). Keep the raw count so
+  // prepareExecForCurrentCore stays the single authority that rejects an
+  // over-bound count; only the array copy is bounded.
+  Snap.writableCount = Slot.writableCount;
+  Snap.requiresPeerEnableRw = Slot.requiresPeerEnableRw;
+  uint32_t copyN = Slot.writableCount > kEJitSharedMaxWritableRanges
+                       ? kEJitSharedMaxWritableRanges
+                       : Slot.writableCount;
+  for (uint32_t i = 0; i < copyN; ++i) {
+    Snap.writables[i].addr = Slot.writableRanges[i].addr;
+    Snap.writables[i].size = Slot.writableRanges[i].size;
+  }
   bucketReadRelease(B);
 
   if (!prepareExecForCurrentCore(Snap, self)) {
@@ -1392,21 +1506,90 @@ bool EJitSharedTaskPool::prepareExecForCurrentCore(const PeerCodeRange &R,
     return false;
   }
 
-  // Seal every 4KiB page the code overlaps: page-align start down, end up.
   const uintptr_t Page = static_cast<uintptr_t>(kEJitSharedSealPage);
-  uintptr_t PageStart = R.codeStart & ~(Page - 1);
-  uintptr_t PageEnd =
+  const uintptr_t CodePageStart = R.codeStart & ~(Page - 1);
+  const uintptr_t CodePageEnd =
       (R.codeStart + static_cast<uintptr_t>(R.codeSize) + Page - 1) &
       ~(Page - 1);
-  for (uintptr_t VA = PageStart; VA < PageEnd; VA += Page)
+
+  // STEP 1: prepare the runtime-writable data pages (e.g. Tier-1 __profc_)
+  // FIRST, making them writable (enable_rw, RX -> RW) in THIS core's
+  // translation context, before any executable page is sealed and before the
+  // core-prepared bit is published. This is required ONLY for a fixed RX
+  // code-segment pool (requiresPeerEnableRw): its pages are RX on every core at
+  // load, so the JIT body's first counter atomicrmw would otherwise fault with
+  // a write-permission abort. A dynamic SRE_MemDbgAlloc pool
+  // (requiresPeerEnableRw=0) is already RW, so the writable ranges are
+  // diagnostic only and are NOT flipped here (and no enable_rw callback is
+  // required). Any anomaly on the fixed path is a clean fallback (no fnPtr, no
+  // core bit) so a peer that cannot be made safe simply runs AOT.
+  if (R.requiresPeerEnableRw && R.writableCount > 0) {
+    if (R.writableCount > kEJitSharedMaxWritableRanges) {
+      EJIT_DIAG("prepareExec fallback: core=%u writableCount=%u > max=%u", self,
+                R.writableCount, kEJitSharedMaxWritableRanges);
+      return false;
+    }
+    if (!enableRwPageFn_) {
+      EJIT_DIAG("prepareExec FAIL: core=%u fixed RX pool needs enable_rw but "
+                "no callback",
+                self);
+      return false;
+    }
+    for (uint32_t i = 0; i < R.writableCount; ++i) {
+      const uintptr_t WStart = R.writables[i].addr;
+      const uint64_t WSize = R.writables[i].size;
+      if (WSize == 0)
+        continue;
+      if (WStart + static_cast<uintptr_t>(WSize) < WStart) {
+        EJIT_DIAG_VERBOSE(
+            "prepareExec fallback: core=%u writable range overflow", self);
+        return false;
+      }
+      // Must lie wholly inside the code's pool (same split granule) so the page
+      // is already split to 4K in this core's translation.
+      if (WStart < R.poolBase ||
+          WStart + static_cast<uintptr_t>(WSize) > R.poolBase + R.poolSize) {
+        EJIT_DIAG_VERBOSE("prepareExec fallback: core=%u writable not in pool",
+                          self);
+        return false;
+      }
+      const uintptr_t WPageStart = WStart & ~(Page - 1);
+      const uintptr_t WPageEnd =
+          (WStart + static_cast<uintptr_t>(WSize) + Page - 1) & ~(Page - 1);
+      // W^X guard: a writable range must NEVER share a 4KiB page with the
+      // executable extent, or enable_rw would make a code page writable (RWX).
+      // The finalize layout guarantees this; re-verify so a malformed/hostile
+      // slot cannot bypass it.
+      if (WPageStart < CodePageEnd && CodePageStart < WPageEnd) {
+        EJIT_DIAG("prepareExec FAIL: core=%u writable page overlaps code "
+                  "(wStart=0x%llx codeStart=0x%llx) - refusing RWX",
+                  self, static_cast<unsigned long long>(WStart),
+                  static_cast<unsigned long long>(R.codeStart));
+        return false;
+      }
+      for (uintptr_t VA = WPageStart; VA < WPageEnd; VA += Page)
+        if (!enableRwPageFn_(enableRwPageCtx_, VA)) {
+          EJIT_DIAG("prepareExec FAIL: core=%u enable_rw pageVA=0x%llx", self,
+                    static_cast<unsigned long long>(VA));
+          return false; // failed enable_rw -> no callable pointer, no core bit.
+        }
+    }
+    EJIT_DIAG_VERBOSE("prepareExec: core=%u writable pages prepared count=%u",
+                      self, R.writableCount);
+  }
+
+  // STEP 2: seal every 4KiB page the code overlaps (enable_ex, RX): page-align
+  // start down, end up. Only after BOTH the writable and executable pages are
+  // prepared may the caller publish this core's prepared bit.
+  for (uintptr_t VA = CodePageStart; VA < CodePageEnd; VA += Page)
     if (!sealPageFn_ || !sealPageFn_(sealPageCtx_, VA)) {
       EJIT_DIAG("prepareExec FAIL: core=%u sealPage pageVA=0x%llx",
                 self, static_cast<unsigned long long>(VA));
       return false; // any page failure -> no callable pointer is returned.
     }
-  EJIT_DIAG_VERBOSE("prepareExec OK: core=%u fn=%p pages=[0x%llx,0x%llx)", self, R.fn,
-            static_cast<unsigned long long>(PageStart),
-            static_cast<unsigned long long>(PageEnd));
+  EJIT_DIAG_VERBOSE("prepareExec OK: core=%u fn=%p pages=[0x%llx,0x%llx)", self,
+                    R.fn, static_cast<unsigned long long>(CodePageStart),
+                    static_cast<unsigned long long>(CodePageEnd));
   return true;
 }
 
@@ -1416,6 +1599,15 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
                                  bool pgoClearExclusive) {
   if (!fnPtr || req.numDims > 4)
     return EJitPublishStatus::InvalidParam;
+  // Over-bound writable set: REJECT the publish outright (before touching any
+  // slot). Clamping would drop counter pages a peer must enable_rw, so the peer
+  // would under-prepare and fault. Rejecting here means no slot goes Ready, no
+  // fnPtr is published, and no executableCoreMask bit is set for this identity.
+  if (info && info->writableCount > kEJitSharedMaxWritableRanges) {
+    EJIT_DIAG("cachePublish REJECT: writableCount=%u > max=%u",
+              info->writableCount, kEJitSharedMaxWritableRanges);
+    return EJitPublishStatus::InvalidParam;
+  }
   uint32_t tier = decodeReqTier(req.funcIndex);
   uint32_t fidx = stripReqTier(req.funcIndex);
   uint64_t key = hashIdentity(fidx, req.dims, req.numDims);
@@ -1487,12 +1679,35 @@ EJitSharedTaskPool::cachePublish(const EJitCompileRequest &req, void *fnPtr,
     target->poolBase = info->poolBase;
     target->poolSize = info->poolSize;
     target->poolId = info->poolId;
+    // Runtime-writable extents (v9): copy the bounded set the peer may need to
+    // enable_rw. The over-bound case was already rejected at entry, so this
+    // never truncates. requiresPeerEnableRw records whether the peer must
+    // actually flip these writable (fixed RX pool) or they are diagnostic only
+    // (dynamic RW pool).
+    uint32_t wc = info->writableCount;
+    target->writableCount = wc;
+    target->requiresPeerEnableRw = info->requiresPeerEnableRw ? 1u : 0u;
+    for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+      if (i < wc) {
+        target->writableRanges[i].addr = info->writableRanges[i].addr;
+        target->writableRanges[i].size = info->writableRanges[i].size;
+      } else {
+        target->writableRanges[i].addr = 0;
+        target->writableRanges[i].size = 0;
+      }
+    }
   } else {
     target->codeStart = 0;
     target->codeSize = 0;
     target->poolBase = 0;
     target->poolSize = 0;
     target->poolId = 0;
+    target->writableCount = 0;
+    target->requiresPeerEnableRw = 0;
+    for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+      target->writableRanges[i].addr = 0;
+      target->writableRanges[i].size = 0;
+    }
   }
   target->rangeReserved = 0;
   target->fnPtr.storeRelease(reinterpret_cast<uintptr_t>(fnPtr));
@@ -1550,13 +1765,16 @@ namespace {
 // activated via ejit_activate before the JIT will compile it. This matches
 // the non-shared EJitRuntimeState::isActive default (no entry => inactive).
 // setInstanceEnabled(true) flips 0->1 and bumps version on first activate.
-void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
+void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode,
+                       uint32_t pgoEnabled, uint32_t tier2Threshold) {
   for (uint32_t d = 0; d < kEJitSharedDimTypes; ++d)
     for (uint32_t i = 0; i < kEJitSharedInstances; ++i) {
       st->enabled[d][i].storeRelaxed(0);
       st->version[d][i].storeRelaxed(0);
     }
   st->mode.storeRelaxed(mode);
+  st->tier2Threshold.storeRelaxed(pgoEnabled ? tier2Threshold : 0);
+  st->pgoEnabled.storeRelaxed(pgoEnabled ? 1 : 0);
   st->anyInstanceActivated.storeRelaxed(0);
   // dispatchEpoch is BUMPED, never reset. A per-core L0 entry filled under a
   // previous pool instance must not validate under this one, and the entries
@@ -1646,6 +1864,14 @@ void initSharedStorage(EJitSharedTaskPoolState *st, uint32_t mode) {
       Slot.poolSize = 0;
       Slot.poolId = 0;
       Slot.rangeReserved = 0;
+      // Runtime-writable ranges (ABI v9): cleared so a re-init never leaves a
+      // stale writable extent a peer could enable_rw for retired code.
+      Slot.writableCount = 0;
+      Slot.requiresPeerEnableRw = 0;
+      for (uint32_t i = 0; i < kEJitSharedMaxWritableRanges; ++i) {
+        Slot.writableRanges[i].addr = 0;
+        Slot.writableRanges[i].size = 0;
+      }
       // PGO (§6): clear hitCount + tier so a re-init never leaks stale
       // hotness state or tier-tracking from a prior generation.
       Slot.hitCount.storeRelaxed(0);
@@ -1681,7 +1907,9 @@ EJitSharedTaskPool::InitResult EJitSharedTaskPool::init() {
       // We are the owner. Build the whole blob, then publish Ready LAST.
       uint32_t self = EJitCoreId::current();
       uint32_t nextGen = state_->generation.loadRelaxed() + 1;
-      initSharedStorage(state_, static_cast<uint32_t>(configuredMode_));
+      initSharedStorage(state_, static_cast<uint32_t>(configuredMode_),
+                        pgoEnabled_.loadRelaxed(),
+                        tier2Threshold_.loadRelaxed());
       state_->generation.storeRelease(nextGen);
       state_->ownerCoreId.storeRelease(self);
       state_->codeSharingEnabled.storeRelease(codeSharingEnabled_ ? 1u : 0u);
@@ -1817,7 +2045,6 @@ void EJitSharedTaskPool::ownerShutdown() {
 __attribute__((always_inline)) EJitSharedTaskPool::CompileOrGetResult
 EJitSharedTaskPool::classifyHit(const SharedLookup &Hit) {
   CompileOrGetResult R;
-  R.tier2Arm = Hit.tier2Arm; // PGO (§6): propagate arming signal
   if (Hit.hasReadToken && Hit.fnPtr) {
     EJIT_STAT_INC(state_->counters.cacheHits);
     R.status = EJitCompileOrGetStatus::CacheHit;
@@ -2024,35 +2251,6 @@ EJitSharedTaskPool::compileOrGet(uint32_t funcIndex, const EJitDimPair *dims,
   // disabled instance, not-Ready, or ready-but-not-shareable) return directly.
   CompileOrGetResult R = tryCacheHit(funcIndex, dims, numDims);
   if (R.fastPathTerminal) {
-    // PGO (§6): snapshot the full request at arm time, including
-    // generation + versions from the matched cache slot.  The slot was
-    // validated by the seqlock read in resolveMatchedSlot, so its
-    // generation/versions are the Tier-1 publish epoch.  PollOne()
-    // no longer re-reads them — no TOCTOU between arm and poll.
-    if (R.tier2Arm && pgoEnabled_.loadRelaxed() &&
-        state_->mode.loadAcquire() ==
-            static_cast<uint32_t>(EJitCompileMode::Async)) {
-      tier2PendingReq_.funcIndex = encodeReqTier(funcIndex, kEJitTierPgoUse);
-      tier2PendingReq_.numDims = numDims;
-      for (uint32_t i = 0; i < numDims && i < 4; ++i)
-        tier2PendingReq_.dims[i] = dims[i];
-      // Read generation + versions from the cache slot we just matched.
-      if (R.bucketIndex < kEJitSharedCacheBuckets) {
-        EJitSharedCacheBucket &B = state_->buckets[R.bucketIndex];
-        for (uint32_t s = 0; s < kEJitSharedCacheSlots; ++s) {
-          EJitSharedCacheSlot &Slot = B.slots[s];
-          if (Slot.state.loadAcquire() !=
-                  static_cast<uint32_t>(EJitSharedSlotState::Ready) ||
-              Slot.funcIndex != funcIndex || Slot.numDims != numDims)
-            continue;
-          tier2PendingReq_.generation = Slot.generation;
-          for (uint32_t i = 0; i < numDims && i < 4; ++i)
-            tier2PendingReq_.versions[i] = Slot.versions[i];
-          break;
-        }
-      }
-      tier2Pending_.storeRelease(1);
-    }
     // Non-hit terminals surface the caller's fallback pointer (a hit already
     // carries the cached fnPtr + read token).
     if (R.status != EJitCompileOrGetStatus::CacheHit)
@@ -2217,8 +2415,14 @@ bool EJitSharedTaskPool::readCodePoolStats(EJitCodePoolStatsOut *out) const {
   return true;
 }
 
-void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
-                                    bool pgoClearExclusive) {
+void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req) {
+  // PGO (§4.9): the aarch64 exclusive-monitor workaround is a property of the
+  // Tier-2 publish, not a caller flag. A Tier-2 (PGOUse) request always follows
+  // an arming hit whose hitCount.fetchAdd primed the monitor on this bucket, so
+  // derive pgoClearExclusive from the request's encoded tier here in the
+  // worker.
+  const bool pgoClearExclusive =
+      decodeReqTier(req.funcIndex) == kEJitTierPgoUse;
   EJIT_DIAG_VERBOSE("shared worker compile begin func=%u dims=%u gen=%u", req.funcIndex,
             req.numDims, req.generation);
   // Checkpoint 0 (spec §11): generation guard. A request enqueued under an
@@ -2299,32 +2503,10 @@ bool EJitSharedTaskPool::pollOne() {
   if (!state_)
     return false;
 
-  // PGO (§6): if compileOrGet stored a Tier-2 request, fill in the
-  // shared-state fields (generation + versions — safe here, no bucket
-  // lock held), and compile it inline via runCompile.  The pgoClearExclusive
-  // flag tells cachePublish → bucketWrite to clear the aarch64 exclusive
-  // monitor before the CAS, working around the seqlock read + write-lock
-  // hang on the same bucket.
-  if (tier2Pending_.loadAcquire()) {
-    tier2Pending_.storeRelease(0);
-    // generation + versions are normally snapshotted from the cache slot
-    // at arm time.  In NO_RECLAIM builds R.bucketIndex is the sentinel
-    // (kEJitSharedCacheBuckets) so the slot scan is skipped; fill them
-    // in here as a fallback.  The arm-time snapshot (when available) is
-    // preferred because it avoids a TOCTOU between arm and poll.
-    if (tier2PendingReq_.generation == 0) {
-      tier2PendingReq_.generation = state_->generation.loadAcquire();
-      for (uint32_t i = 0; i < tier2PendingReq_.numDims && i < 4; ++i)
-        tier2PendingReq_.versions[i] =
-            instanceVersion(tier2PendingReq_.dims[i].dimType,
-                            tier2PendingReq_.dims[i].instanceId);
-    }
-    runCompile(tier2PendingReq_, /*pgoClearExclusive=*/true);
-    // After runCompile returns, the Tier-2 result is published (or
-    // discarded on version mismatch).  Continue to queuePop to process
-    // any other enqueued work.
-  }
-
+  // Both Tier-1 and Tier-2 (PGOUse) requests arrive on the SAME shared MPSC
+  // queue. runCompile() derives the Tier-2 aarch64 exclusive-monitor workaround
+  // from the request's encoded tier, so the worker needs no facade-local
+  // special case — it simply pops and compiles the next request (spec §1/§4.9).
   EJitCompileRequest Req{};
   if (!queuePop(Req))
     return false;
