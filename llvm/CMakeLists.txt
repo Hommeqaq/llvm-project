@@ -833,6 +833,8 @@ set(EJIT_ICACHE_FUNC_SLOTS "4096" CACHE STRING
 # irrelevant slot-table limit. (The static_assert in EJitSharedTaskPool.cpp is
 # the compile-time backstop for non-CMake builds.)
 message(STATUS "EmbeddedJIT: inline-cache slot capacity=${EJIT_ICACHE_FUNC_SLOTS}")
+set(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES "1" CACHE STRING
+  "EmbeddedJIT concurrent functions collecting online PGO profiles (1-16)")
 # Single source of truth for the worker task stack size (bytes). The worker —
 # shared OR per-instance — runs LLVM optimize/codegen/ORC/JITLink on its OWN
 # stack via EJitSreTask, so this drives the platform SRE_TaskCreate stack too
@@ -863,6 +865,7 @@ if(EJIT_SRE_TASKPOOL)
   add_definitions(-DEJIT_SRE_TASKPOOL_BUCKETS=${EJIT_SRE_TASKPOOL_BUCKETS})
   add_definitions(-DEJIT_SRE_TASKPOOL_QUEUE_CAPACITY=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY})
   add_definitions(-DEJIT_SRE_TASKPOOL_MAX_FUNC_INDEX=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX})
+  add_definitions(-DEJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_STACK_SIZE=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT})
   add_definitions(-DEJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})
@@ -870,6 +873,7 @@ if(EJIT_SRE_TASKPOOL)
                  "(buckets=${EJIT_SRE_TASKPOOL_BUCKETS}, "
                  "queue=${EJIT_SRE_TASKPOOL_QUEUE_CAPACITY}, "
                  "maxFuncIndex=${EJIT_SRE_TASKPOOL_MAX_FUNC_INDEX}, "
+                 "pgoConcurrentProfiles=${EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES}, "
                  "workerStack=${EJIT_SRE_TASKPOOL_WORKER_STACK_SIZE}, "
                  "throttleMult=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_MULT}, "
                  "throttleDelayTicks=${EJIT_SRE_TASKPOOL_WORKER_THROTTLE_DELAY_TICKS})")

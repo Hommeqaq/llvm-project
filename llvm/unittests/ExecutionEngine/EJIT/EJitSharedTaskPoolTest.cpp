@@ -177,6 +177,7 @@ struct WorkerHooks {
   int starts = 0;
   int stops = 0;
   bool failNext = false;
+  uint32_t startCore = kEJitInvalidCoreId;
 };
 bool mockWorkerStart(void *ctx, EJitSharedTaskPool::WorkerEntryFn /*entry*/,
                      void * /*entryCtx*/, uint64_t *outTaskId) {
@@ -184,6 +185,7 @@ bool mockWorkerStart(void *ctx, EJitSharedTaskPool::WorkerEntryFn /*entry*/,
   if (w->failNext)
     return false;
   ++w->starts;
+  w->startCore = EJitCoreId::current();
   *outTaskId = 0xABCDull;
   return true;
 }
@@ -2029,7 +2031,7 @@ TEST_F(SharedTaskPoolTest, FourKGenerationChangeDuringPrepareNotReturned) {
 // table is POD, dump state contains metadata only, and each bucket carries the
 // NO_RECLAIM seqlock publishSeq word.
 TEST_F(SharedTaskPoolTest, FourKAbiVersionAndRangeFieldSemantics) {
-  EXPECT_EQ(kEJitSharedAbiVersion, 9u);
+  EXPECT_EQ(kEJitSharedAbiVersion, 10u);
   EXPECT_TRUE(std::is_standard_layout<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(std::is_trivially_destructible<EJitSharedPoolSplit>::value);
   EXPECT_TRUE(
@@ -3714,9 +3716,262 @@ TEST_F(SharedTaskPoolTest, SharedPgoHitThresholdArmsTier2Recompile) {
   }
 }
 
+TEST_F(SharedTaskPoolTest, SharedPgoProfilesFunctionsSequentially) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2);
+  EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 1u);
+
+  // The first miss owns staged profiling and is explicitly queued as Tier-1.
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 6u);
+  EXPECT_EQ(state_->enqueuePos.loadRelaxed() -
+                state_->dequeuePos.loadRelaxed(),
+            1u);
+
+  // A different function stays on its AOT fallback and adds no compiler work.
+  auto deferred = pool.compileOrGet(6, nullptr, 0, codeFor(6));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.fnPtr, codeFor(6));
+  EXPECT_EQ(state_->enqueuePos.loadRelaxed() -
+                state_->dequeuePos.loadRelaxed(),
+            1u);
+  EXPECT_EQ(state_->pgoDeferredMisses.loadRelaxed(), 1u);
+
+  ASSERT_TRUE(pool.pollOne());
+  EJitSharedCacheSlot *tier1 = findReadySlot(5);
+  ASSERT_NE(tier1, nullptr);
+  EXPECT_EQ(tier1->tier.loadRelaxed(),
+            static_cast<uint8_t>(kEJitTierInstrumented));
+
+  // Only the active function accumulates profile progress and arms Tier-2.
+  for (unsigned i = 0; i < 2; ++i) {
+    auto hit = pool.compileOrGet(5, nullptr, 0, codeFor(5));
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      pool.releaseRead(hit.bucketIndex);
+  }
+  EXPECT_EQ(state_->pgoProgressQuarters[0].loadAcquire(), 4u);
+  EXPECT_EQ(pool.pendingCount(), 1u);
+
+  // Tier-2 completion releases admission. The next called function can then
+  // begin its own Tier-1; there is never more than one instrumented function.
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoCompletedFunctions.loadRelaxed(), 1u);
+  ASSERT_EQ(pool.compileOrGet(6, nullptr, 0, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 7u);
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoReleasesAdmissionForPreexistingWork) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  pool.setPgoEnabled(true, 2);
+
+  EXPECT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 0u);
+
+  EXPECT_EQ(pool.compileOrGet(6, nullptr, 0, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+  EXPECT_EQ(state_->pgoActiveFunctions[0].loadAcquire(), 7u);
+}
+
+TEST_F(SharedTaskPoolTest, SharedPgoHonorsConcurrentProfileLimit) {
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  pool.setPgoEnabled(true, 2, 2);
+
+  ASSERT_EQ(pool.compileOrGet(5, nullptr, 0, codeFor(5)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_EQ(pool.compileOrGet(6, nullptr, 0, codeFor(6)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 2u);
+  EXPECT_EQ(state_->pgoMaxActiveFunctions.loadAcquire(), 2u);
+
+  auto deferred = pool.compileOrGet(7, nullptr, 0, codeFor(7));
+  EXPECT_EQ(deferred.status, EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(deferred.fnPtr, codeFor(7));
+  ASSERT_TRUE(pool.pollOne());
+  ASSERT_TRUE(pool.pollOne());
+
+  for (unsigned i = 0; i < 2; ++i) {
+    auto hit = pool.compileOrGet(5, nullptr, 0, codeFor(5));
+    ASSERT_EQ(hit.status, EJitCompileOrGetStatus::CacheHit);
+    if (hit.hasReadToken)
+      pool.releaseRead(hit.bucketIndex);
+  }
+  ASSERT_TRUE(pool.pollOne());
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u);
+
+  ASSERT_EQ(pool.compileOrGet(7, nullptr, 0, codeFor(7)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 2u);
+}
+
+TEST_F(SharedTaskPoolTest,
+       DesignatedOwnerWorkerServesConcurrentPgoProducerCores) {
+  constexpr uint32_t kOwnerCore = 8;
+  constexpr uint32_t kProducerCount = 3;
+  constexpr uint32_t kProducerCores[kProducerCount] = {18, 19, 20};
+  constexpr uint32_t kFuncIndices[kProducerCount] = {5, 6, 7};
+
+  WorkerHooks hooks;
+  EJitSharedTaskPool owner;
+  EJitCoreId::setCurrentForTest(kOwnerCore);
+  owner.bind(state_.get());
+  owner.setCompiler(&mockCompile, nullptr);
+  owner.setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
+  owner.setMode(EJitCompileMode::Async);
+  owner.setCodeSharingEnabled(true);
+  owner.setPgoEnabled(true, /*threshold=*/2,
+                      /*maxConcurrentProfiles=*/2);
+  ASSERT_EQ(owner.init(), EJitSharedTaskPool::InitResult::BecameOwner);
+  ASSERT_EQ(state_->ownerCoreId.loadAcquire(), kOwnerCore);
+  ASSERT_EQ(hooks.starts, 1);
+  ASSERT_EQ(hooks.startCore, kOwnerCore);
+
+  EJitSharedTaskPool peers[kProducerCount];
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    peers[i].setWorkerHooks(&mockWorkerStart, &mockWorkerStop, &hooks);
+    EJitCoreId::setCurrentForTest(kProducerCores[i]);
+    peers[i].bind(state_.get());
+    peers[i].setMode(EJitCompileMode::Async);
+    ASSERT_EQ(peers[i].init(),
+              EJitSharedTaskPool::InitResult::AttachedReady);
+  }
+  ASSERT_EQ(hooks.starts, 1) << "peer cores must not start workers";
+
+  EJitCompileOrGetResult first[kProducerCount];
+  std::atomic<uint32_t> ready{0};
+  std::atomic<bool> go{false};
+  std::vector<std::thread> producers;
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    producers.emplace_back([&, i] {
+      EJitCoreId::setCurrentForTest(kProducerCores[i]);
+      ready.fetch_add(1, std::memory_order_release);
+      while (!go.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      first[i] = peers[i].compileOrGet(kFuncIndices[i], nullptr, 0,
+                                      codeFor(kFuncIndices[i]));
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != kProducerCount)
+    std::this_thread::yield();
+  go.store(true, std::memory_order_release);
+  for (auto &producer : producers)
+    producer.join();
+
+  uint32_t admitted = 0;
+  uint32_t deferred = kProducerCount;
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    if (first[i].status == EJitCompileOrGetStatus::EnqueuedPending) {
+      ++admitted;
+    } else {
+      EXPECT_EQ(first[i].status, EJitCompileOrGetStatus::AlreadyPending);
+      EXPECT_EQ(first[i].fnPtr, codeFor(kFuncIndices[i]));
+      deferred = i;
+    }
+  }
+  ASSERT_EQ(admitted, 2u);
+  ASSERT_LT(deferred, kProducerCount);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 2u);
+  EXPECT_EQ(owner.pendingCount(), 2u);
+
+  // Deterministically step the already-started core-8 worker. Producer-side
+  // admission above used real concurrent host threads; manual polling keeps
+  // compile completion ordering stable for the assertions below.
+  EJitCoreId::setCurrentForTest(kOwnerCore);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_FALSE(owner.pollOne());
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    if (i == deferred)
+      continue;
+    EJitSharedCacheSlot *slot = findReadySlot(kFuncIndices[i]);
+    ASSERT_NE(slot, nullptr);
+    EXPECT_EQ(slot->tier.loadRelaxed(),
+              static_cast<uint8_t>(kEJitTierInstrumented));
+  }
+
+  // The same producer cores now run together. The admitted functions collect
+  // two hits each and enqueue Tier-2; the deferred function remains on AOT.
+  ready.store(0, std::memory_order_relaxed);
+  go.store(false, std::memory_order_relaxed);
+  producers.clear();
+  EJitCompileOrGetResult profile[kProducerCount][2];
+  for (uint32_t i = 0; i < kProducerCount; ++i) {
+    producers.emplace_back([&, i] {
+      EJitCoreId::setCurrentForTest(kProducerCores[i]);
+      ready.fetch_add(1, std::memory_order_release);
+      while (!go.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      unsigned calls = i == deferred ? 1u : 2u;
+      for (unsigned hit = 0; hit < calls; ++hit) {
+        profile[i][hit] = peers[i].compileOrGet(
+            kFuncIndices[i], nullptr, 0, codeFor(kFuncIndices[i]));
+        if (profile[i][hit].hasReadToken)
+          peers[i].releaseRead(profile[i][hit].bucketIndex);
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != kProducerCount)
+    std::this_thread::yield();
+  go.store(true, std::memory_order_release);
+  for (auto &producer : producers)
+    producer.join();
+
+  EXPECT_EQ(profile[deferred][0].status,
+            EJitCompileOrGetStatus::AlreadyPending);
+  EXPECT_EQ(profile[deferred][0].fnPtr,
+            codeFor(kFuncIndices[deferred]));
+  EXPECT_EQ(owner.pendingCount(), 2u);
+  uint32_t profilesAtThreshold = 0;
+  for (uint32_t i = 0; i < kEJitSharedMaxConcurrentProfiles; ++i) {
+    if (state_->pgoActiveFunctions[i].loadAcquire() == 0)
+      continue;
+    ++profilesAtThreshold;
+    EXPECT_EQ(state_->pgoProgressQuarters[i].loadAcquire(), 4u);
+  }
+  EXPECT_EQ(profilesAtThreshold, 2u);
+  EJitCoreId::setCurrentForTest(kOwnerCore);
+  ASSERT_TRUE(owner.pollOne());
+  ASSERT_TRUE(owner.pollOne());
+  EXPECT_EQ(state_->pgoCompletedFunctions.loadRelaxed(), 2u);
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 0u);
+
+  // Once the two profiles finish, the function that stayed on AOT can claim a
+  // slot. The designated owner remains the only worker throughout.
+  EJitCoreId::setCurrentForTest(kProducerCores[deferred]);
+  EXPECT_EQ(peers[deferred]
+                .compileOrGet(kFuncIndices[deferred], nullptr, 0,
+                              codeFor(kFuncIndices[deferred]))
+                .status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  EJitCoreId::setCurrentForTest(kOwnerCore);
+  ASSERT_TRUE(owner.pollOne());
+  EJitSharedCacheSlot *last = findReadySlot(kFuncIndices[deferred]);
+  ASSERT_NE(last, nullptr);
+  EXPECT_EQ(last->tier.loadRelaxed(),
+            static_cast<uint8_t>(kEJitTierInstrumented));
+  EXPECT_EQ(hooks.starts, 1);
+}
+
 // Shared version bump test (§7.2 / §4): a Tier-2 request that was queued when
 // the identity was current is DISCARDED by the worker when a version bump lands
-// between arm and consume.  runCompile's checkpoint 1 (versionsCurrent) fails,
+// between arm and consume. runCompile's checkpoint 1 (versionsCurrent) fails,
 // the code is never published over Tier-1, and the encoded-funcIndex dedup bit
 // is cleared (dedupClear strips the tier bits), so a later hit can retry.
 TEST_F(SharedTaskPoolTest, SharedPgoTier2DiscardedOnVersionBump) {
@@ -4239,9 +4494,8 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
             EJitCompileOrGetStatus::EnqueuedPending);
   ASSERT_TRUE(pool.pollOne());
 
-  pool.setPgoEnabled(true, 1);
-
-  // Fill the shared queue with undrained Tier-1 (0-dim) requests until full.
+  // Fill the shared queue with ordinary undrained requests until full, then
+  // enable PGO so staged admission does not intentionally defer the fillers.
   bool full = false;
   uint32_t f = 100;
   for (; f < 100 + kEJitSharedQueueSlots + 8; ++f) {
@@ -4252,6 +4506,7 @@ TEST_F(SharedTaskPoolTest, Tier2QueueFullRollsBackDedup) {
     }
   }
   ASSERT_TRUE(full) << "expected the shared queue to reach capacity";
+  pool.setPgoEnabled(true, 1);
 
   // A hit on the target arms Tier-2, but the enqueue fails (queue full) and the
   // in-flight bit is rolled back (dedupClear strips the encoded tier bits).
@@ -4347,6 +4602,9 @@ TEST_F(SharedTaskPoolTest, Tier2DedupClearStripsTierBits) {
   ASSERT_TRUE(pool.pollOne()); // Tier-2 compile fails
   EXPECT_EQ(state_->inFlight[9].loadRelaxed(), 0u)
       << "failed Tier-2 compile must clear the in-flight bit";
+  EXPECT_EQ(state_->pgoActiveFunctionCount.loadAcquire(), 1u)
+      << "valid Tier-1 remains instrumented, so staged admission must stay "
+         "with this function for a later Tier-2 retry";
 }
 
 //===----------------------------------------------------------------------===//

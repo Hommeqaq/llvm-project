@@ -58,6 +58,9 @@
 #ifndef EJIT_SRE_TASKPOOL_QUEUE_CAPACITY
 #define EJIT_SRE_TASKPOOL_QUEUE_CAPACITY 1024u
 #endif
+#ifndef EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES
+#define EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES 1u
+#endif
 // Fixed slots per cache bucket. The shared cache is a fixed-capacity POD table
 // (no std::unordered_map can live in shared memory), so each bucket holds a
 // fixed array of slots. A bucket that fills evicts its oldest-generation slot.
@@ -102,7 +105,13 @@ constexpr uint32_t kEJitNoBucket = 0xFFFFFFFFu;
 constexpr uint32_t kEJitSharedCacheSlots = EJIT_SRE_SHARED_TASKPOOL_CACHE_SLOTS;
 constexpr uint32_t kEJitSharedQueueSlots = EJIT_SRE_TASKPOOL_QUEUE_CAPACITY;
 constexpr uint32_t kEJitSharedPoolSlots = EJIT_SRE_SHARED_TASKPOOL_POOL_SLOTS;
-constexpr uint32_t kEJitSharedDumpNameBytes = EJIT_SRE_SHARED_DUMP_NAME_BYTES;
+constexpr uint32_t kEJitSharedMaxConcurrentProfiles = 16u;
+static_assert(EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES >= 1u &&
+                  EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES <=
+                      kEJitSharedMaxConcurrentProfiles,
+              "EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES must be in [1, 16]");
+constexpr uint32_t kEJitSharedDumpNameBytes =
+    EJIT_SRE_SHARED_DUMP_NAME_BYTES;
 constexpr uint32_t kEJitSharedCacheLine = 64u;
 /// Execute-permission seal granularity (the platform's per-page enable_ex unit)
 /// and the large-page / split granularity. Fixed platform constants.
@@ -402,6 +411,15 @@ struct alignas(kEJitSharedCacheLine) EJitSharedTaskPoolState {
   EJitAtomicU32 mode; ///< EJitCompileMode (Off=0, Async=1)
   EJitAtomicU32 pgoEnabled;     ///< 1 => shared online-PGO trigger is enabled
   EJitAtomicU32 tier2Threshold; ///< shared hit threshold; 0 disables trigger
+  /// Staged PGO admission. Entries are funcIndex + 1; zero means free.
+  EJitAtomicU32 pgoAdmissionLock;
+  EJitAtomicU32 pgoMaxActiveFunctions;
+  EJitAtomicU32 pgoActiveFunctionCount;
+  EJitAtomicU32 pgoActiveFunctions[kEJitSharedMaxConcurrentProfiles];
+  /// Last logged progress quarter for each admission slot: 0..4.
+  EJitAtomicU32 pgoProgressQuarters[kEJitSharedMaxConcurrentProfiles];
+  EJitAtomicU64 pgoCompletedFunctions;
+  EJitAtomicU64 pgoDeferredMisses;
   EJitAtomicU32 anyInstanceActivated; ///< 1 once any instance first
                                       ///< setInstanceEnabled(true); gates the
                                       ///< instanceDisabledPreActivate counter.

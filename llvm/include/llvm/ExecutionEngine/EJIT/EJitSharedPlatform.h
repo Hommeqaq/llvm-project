@@ -89,7 +89,10 @@ constexpr uint32_t kEJitSharedAbiMagic = 0x456A5370u; // "EjSp"
 /// diagnostic only and a peer executes without enable_rw. The ranges are
 /// page-disjoint from the executable extent, so a peer never makes a code page
 /// writable (no RWX).
-constexpr uint32_t kEJitSharedAbiVersion = 9u;
+/// v10: staged PGO admission has a configurable fixed-capacity slot table, so
+/// one or more functions may profile concurrently with independent progress;
+/// the shared blob also records completed-function and deferred-miss counts.
+constexpr uint32_t kEJitSharedAbiVersion = 10u;
 
 /// Sentinel "no core" id. Out of any plausible core-id range.
 constexpr uint32_t kEJitInvalidCoreId = 0xFFFFFFFFu;
