@@ -170,6 +170,17 @@ struct EJitSharedCacheSlot {
   uint64_t poolSize;      ///< usable pool size
   uint32_t poolId;        ///< stable pool index (diagnostic / convenience key)
   uint32_t rangeReserved; ///< reserved, keeps the tail explicit (must be 0)
+  /// PGO (v7): per-slot hotspot counter for the Tier-2 auto-trigger (§6).
+  /// Incremented on cache hit; reset to 0 when Tier-2 publishes over Tier-1
+  /// (§7.1).  Counter addresses (__profc_/__profd_) are resolved by the
+  /// compile driver via ORC lookup and kept driver-private — they do not
+  /// need to live in the shared slot.
+  EJitAtomicU64 hitCount;
+  /// PGO (§7.1): current compile tier of the published code.  0 = Baseline /
+  /// not yet published, 1 = Instrumented (Tier-1), 2 = PGOUse (Tier-2).
+  /// Used to suppress the Tier-2 auto-trigger on slots that are already
+  /// Tier-2 — a Tier-2 hit should never request another Tier-2 compile.
+  EJitAtomicU8 tier;
 };
 
 //===----------------------------------------------------------------------===//
@@ -266,6 +277,11 @@ struct EJitSharedCounters {
                                              ///< setInstanceEnabled(true) — i.e.
                                              ///< the init→activate window.
   EJitAtomicU64 executePrepareFailed;
+  /// PGO (v7, EJIT_ONLINE_PGO.md §10): Tier-1/Tier-2 compile counts + profile
+  /// synthesis failures. Zero when PGO is off; fields always present for ABI.
+  EJitAtomicU64 tier1Compiles;
+  EJitAtomicU64 tier2Compiles;
+  EJitAtomicU64 profileMergeFails;
 };
 
 //===----------------------------------------------------------------------===//
