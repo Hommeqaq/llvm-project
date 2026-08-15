@@ -18,6 +18,11 @@
 // exactly like the user-registered symbols, just for names the AOT pass
 // cannot collect.
 //
+// The one exception is __llvm_profile_instrument_target: it is defined here
+// (weak) as a no-op because Tier-1 lowers llvm.instrprof.value.profile
+// intrinsics to calls of it, and bare-metal / freestanding targets have no
+// compiler-rt profile runtime. See the definition below for the rationale.
+//
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitLibcallStubs.h"
@@ -34,6 +39,17 @@ extern uintptr_t __stack_chk_guard;
 extern void __stack_chk_fail(void);
 }
 
+// The PGO indirect-call value-profiling hook, signature matching compiler-rt's
+// InstrProfilingValue.c. Online PGO consumes only the __profc_ counters and
+// the __profd_ FuncHash (Stage 1 is block layout; indirect-call promotion is
+// not planned), so returning the target unchanged is semantically correct.
+// Weak so a real profile runtime linked into the host binary takes precedence.
+extern "C" __attribute__((weak))
+void *__llvm_profile_instrument_target(void *TargetValue, void *Data,
+                                       uint32_t CounterIndex) {
+  return TargetValue;
+}
+
 namespace llvm {
 namespace ejit {
 
@@ -45,6 +61,8 @@ ArrayRef<LibcallSymbol> getLibcallSymbols() {
       {"memcmp", reinterpret_cast<void *>(&std::memcmp)},
       {"__stack_chk_guard", reinterpret_cast<void *>(&__stack_chk_guard)},
       {"__stack_chk_fail", reinterpret_cast<void *>(&__stack_chk_fail)},
+      {"__llvm_profile_instrument_target",
+       reinterpret_cast<void *>(&__llvm_profile_instrument_target)},
   };
   return Symbols;
 }

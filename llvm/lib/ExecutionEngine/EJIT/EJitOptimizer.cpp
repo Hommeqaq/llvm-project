@@ -3,6 +3,8 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Metadata.h"
@@ -127,6 +129,29 @@ void EJitOptimizer::runPipeline(Module &M,
   EJIT_DIAG_DEBUG("pipeline phase1ef done: callee InstCombine+StructFieldPass");
 
   if (ctx.tier == CompileTier::Instrumented) {
+    // The counter increment lowers to `atomicrmw add i64` (§5, InstrProfOpts
+    // .Atomic). AOT bitcode compiled for generic AArch64 carries
+    // "+outline-atomics" in its fn "target-features" attribute (the default
+    // on Linux aarch64 toolchains), which overrides the JIT's global target
+    // features and makes the backend outline the atomicrmw into an
+    // __aarch64_ldadd8_relax libcall that does not exist on SRE / freestanding.
+    // Drop just that feature so the counter increment becomes an inline
+    // ldxr/stxr loop, matching the AOT firmware's codegen.
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      Attribute A = F.getFnAttribute("target-features");
+      if (!A.isValid())
+        continue;
+      SmallVector<StringRef, 8> Feats;
+      StringRef(A.getValueAsString()).split(Feats, ',');
+      auto It = llvm::remove_if(Feats, [](StringRef S) {
+        return S == "+outline-atomics" || S == "-outline-atomics";
+      });
+      if (It != Feats.end())
+        F.addFnAttr("target-features", join(Feats, ","));
+    }
+
     // Tier-1 (PGO Gen): lightOpt then instrument. lightOpt is the shared
     // Gen/Use prefix (identical to Tier-2) so the CFG - and thus the PGO
     // hash - matches. No mainFPM_: Tier-1 is temporary, lightly optimized.
