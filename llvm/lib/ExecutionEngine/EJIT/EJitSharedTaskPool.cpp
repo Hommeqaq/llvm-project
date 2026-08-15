@@ -310,13 +310,14 @@ bool EJitSharedTaskPool::icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
   // The cache is only meaningful once the pool is Ready.
   if (state_->initState.loadAcquire() != kReady)
     return false;
-  // Cross-core fnPtr gate (compile-time, mirrors resolveMatchedSlot): a
-  // non-owner core may only read a cached pointer when code sharing is
-  // platform-validated.
+  // Cross-core fnPtr gate (mirrors resolveMatchedSlot): a non-owner core may
+  // only read a cached pointer when code sharing is enabled (runtime gate in
+  // builds with EJIT_SRE_SHARED_CODE_POINTERS; always false otherwise).
   uint32_t self = EJitCoreId::current();
   uint32_t owner = state_->ownerCoreId.loadRelaxed();
 #if defined(EJIT_SRE_SHARED_CODE_POINTERS)
-  constexpr bool mayReadPtr = true;
+  bool mayReadPtr = (self == owner) ||
+                    state_->codeSharingEnabled.loadAcquire();
 #else
   bool mayReadPtr = (self == owner);
 #endif
@@ -982,18 +983,17 @@ EJitSharedTaskPool::resolveMatchedSlot(EJitSharedCacheBucket &B,
   // suffices. The slot's state/fnPtr acquire loads still gate code publication
   // independently below.
   uint32_t owner = state_->ownerCoreId.loadRelaxed();
-  // codeSharingEnabled's value is fixed at compile time by
-  // EJIT_SRE_SHARED_CODE_POINTERS (the only setCodeSharingEnabled() calls are
-  // flag-gated in EJitCompileDriver.cpp), so the per-hit runtime load is
-  // redundant and replaced by the compile-time constant.
+  // The runtime gate is consulted on every hit: in builds with
+  // EJIT_SRE_SHARED_CODE_POINTERS the driver enables it by default
+  // (setCodeSharingEnabled(true)), but a deployment may still disable sharing
+  // per pool to force the clean readyButNotShareable fallback. In builds
+  // without the flag nobody sets it, so the load is always false and the
+  // compiler folds it to the old (self == owner) check. The extra acquire
+  // load is negligible against the slot's own acquire loads on this path.
 #if defined(EJIT_SRE_SHARED_CODE_POINTERS)
-  // Sharing unconditionally enabled in this build: any core may read the
-  // published pointer. The !mayReadPtr fallback below is dead-coded out.
-  constexpr bool mayReadPtr = true;
+  bool mayReadPtr = (self == owner) ||
+                    state_->codeSharingEnabled.loadAcquire();
 #else
-  // Sharing unconditionally disabled in this build: only the owner may read
-  // its own published pointer. (Equivalent to the former
-  // (codeSharingEnabled!=0) || (self==owner) with codeSharingEnabled==0.)
   bool mayReadPtr = (self == owner);
 #endif
   if (!mayReadPtr) {

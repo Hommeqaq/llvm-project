@@ -18,10 +18,11 @@
 // exactly like the user-registered symbols, just for names the AOT pass
 // cannot collect.
 //
-// The one exception is __llvm_profile_instrument_target: it is defined here
-// (weak) as a no-op because Tier-1 lowers llvm.instrprof.value.profile
-// intrinsics to calls of it, and bare-metal / freestanding targets have no
-// compiler-rt profile runtime. See the definition below for the rationale.
+// Two exceptions are defined here (weak): __stack_chk_guard, because glibc
+// >= 2.41 no longer exports it, and __llvm_profile_instrument_target, the PGO
+// value-profiling hook lowered from llvm.instrprof.value.profile (a no-op —
+// online PGO consumes only the __profc_ counters and the __profd_ FuncHash).
+// See the definitions below for the rationale.
 //
 //===----------------------------------------------------------------------===//
 
@@ -34,9 +35,17 @@
 // extern so taking their address resolves to the target's existing
 // definitions (uintptr_t matches the compiler-rt declaration). Provided by
 // the bare-metal pseudo-OS runtime already linked into the AOT binary.
+//
+// __stack_chk_guard is the exception: glibc >= 2.41 no longer exports it from
+// libc.so, so an extern-only declaration leaves an undefined reference when
+// the host does not define it. Define it weak here instead; a host that
+// provides its own (bare-metal pseudo-OS / compiler-rt) still takes
+// precedence. JIT'd code that references the guard reads and compares this
+// same global, so any value is self-consistent — a nonzero constant is used
+// because SRE / freestanding targets have no ASLR to randomize one.
 extern "C" {
-extern uintptr_t __stack_chk_guard;
 extern void __stack_chk_fail(void);
+__attribute__((weak)) uintptr_t __stack_chk_guard = 0x0badf00ddeadbeefULL;
 }
 
 // The PGO indirect-call value-profiling hook, signature matching compiler-rt's

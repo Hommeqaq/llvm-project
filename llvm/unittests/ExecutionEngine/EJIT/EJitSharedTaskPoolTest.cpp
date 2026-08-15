@@ -3854,7 +3854,7 @@ TEST_F(SharedTaskPoolTest,
   }
   ASSERT_EQ(hooks.starts, 1) << "peer cores must not start workers";
 
-  EJitCompileOrGetResult first[kProducerCount];
+  EJitSharedTaskPool::CompileOrGetResult first[kProducerCount];
   std::atomic<uint32_t> ready{0};
   std::atomic<bool> go{false};
   std::vector<std::thread> producers;
@@ -3911,7 +3911,7 @@ TEST_F(SharedTaskPoolTest,
   ready.store(0, std::memory_order_relaxed);
   go.store(false, std::memory_order_relaxed);
   producers.clear();
-  EJitCompileOrGetResult profile[kProducerCount][2];
+  EJitSharedTaskPool::CompileOrGetResult profile[kProducerCount][2];
   for (uint32_t i = 0; i < kProducerCount; ++i) {
     producers.emplace_back([&, i] {
       EJitCoreId::setCurrentForTest(kProducerCores[i]);
