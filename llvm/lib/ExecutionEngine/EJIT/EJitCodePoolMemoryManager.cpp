@@ -192,6 +192,24 @@ EJitCodePoolManager &EJitCodePoolMemoryManager::selectPool(
 void EJitCodePoolMemoryManager::allocate(const JITLinkDylib *JD, LinkGraph &G,
                                          OnAllocatedFunction OnAllocated) {
   EJitCodePoolManager &Pool = selectPool(JD);
+
+  // === issue #197 task 2 verification overlay (PR #203 promotion) ===
+  // Fold pure read-only sections into the executable segment BEFORE
+  // BasicLayout. BasicLayout groups blocks by {MemProt, MemLifetime}, so an
+  // R-- section and the R+X code section land in DIFFERENT segments and each
+  // occupies its own 4KiB page. Promoting R-- to R+X merges it into the code
+  // segment so text and rodata lay out contiguous within one segment and
+  // share a page. Gated on usesPageSeal() (4K-seal, near+far). Writable
+  // sections (e.g. __profc_ R+W) are excluded by the Write check. This is
+  // the PR-under-test; the probe/noncompact diagnostics below are kept from
+  // the diag-only base so the board can grep the before/after.
+  if (Pool.usesPageSeal())
+    for (Section &Sec : G.sections())
+      if ((Sec.getMemProt() & orc::MemProt::Read) != orc::MemProt::None &&
+          (Sec.getMemProt() & (orc::MemProt::Write | orc::MemProt::Exec)) ==
+              orc::MemProt::None)
+        Sec.setMemProt(orc::MemProt::Read | orc::MemProt::Exec);
+
   BasicLayout BL(G);
 
   bool ExecOnly = true;
