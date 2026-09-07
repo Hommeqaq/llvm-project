@@ -5,7 +5,7 @@
 ; RUN: rm -rf %t/ext-dump && mkdir -p %t/ext-dump
 ; RUN: opt -passes=ejit-register-bitcode -enable-ejit-global-ctors=1 -ejit-dump-bitcode-dir=%t/ext-dump -S %t/externalize.ll -o %t/ext.aot.ll
 ; RUN: opt -S %t/ext-dump/*.bc | FileCheck %s --check-prefix=EXT
-; RUN: FileCheck %s --check-prefix=EXT-MOD %t/ext.aot.ll
+; RUN: FileCheck %s --check-prefix=EXT-MOD --input-file %t/ext.aot.ll
 ; RUN: rm -rf %t/zero-dump && mkdir -p %t/zero-dump
 ; RUN: opt -passes=ejit-register-bitcode -ejit-externalize-min-insts=0 -ejit-dump-bitcode-dir=%t/zero-dump -S %t/externalize.ll -o /dev/null
 ; RUN: opt -S %t/zero-dump/*.bc | FileCheck %s --check-prefix=ZERO
@@ -15,21 +15,21 @@
 ; RUN: rm -rf %t/alias-zero-dump && mkdir -p %t/alias-zero-dump
 ; RUN: opt -passes=ejit-register-bitcode -enable-ejit-global-ctors=1 -ejit-externalize-min-insts=0 -ejit-dump-bitcode-dir=%t/alias-zero-dump -S %t/alias-root.ll -o %t/alias-zero.aot.ll
 ; RUN: opt -S %t/alias-zero-dump/*.bc | FileCheck %s --check-prefix=ALIAS-ZERO
-; RUN: FileCheck %s --check-prefix=ALIAS-ZERO-MOD %t/alias-zero.aot.ll
+; RUN: FileCheck %s --check-prefix=ALIAS-ZERO-MOD --input-file %t/alias-zero.aot.ll
 ; RUN: rm -rf %t/mutable-dump && mkdir -p %t/mutable-dump
 ; RUN: opt -passes=ejit-register-bitcode -ejit-dump-bitcode-dir=%t/mutable-dump -S %t/mutable.ll -o %t/mutable.aot.ll
 ; RUN: opt -S %t/mutable-dump/*.bc | FileCheck %s --check-prefix=MUTABLE
-; RUN: FileCheck %s --check-prefix=MUTABLE-MOD %t/mutable.aot.ll
+; RUN: FileCheck %s --check-prefix=MUTABLE-MOD --input-file %t/mutable.aot.ll
 ; RUN: rm -rf %t/mutable-alias-dump && mkdir -p %t/mutable-alias-dump
 ; RUN: opt -passes=ejit-register-bitcode -ejit-dump-bitcode-dir=%t/mutable-alias-dump -S %t/mutable-alias.ll -o %t/mutable-alias.aot.ll
 ; RUN: opt -passes=verify -disable-output %t/mutable-alias-dump/*.bc
 ; RUN: opt -S %t/mutable-alias-dump/*.bc | FileCheck %s --check-prefix=MUTABLE-ALIAS
-; RUN: FileCheck %s --check-prefix=MUTABLE-ALIAS-MOD %t/mutable-alias.aot.ll
+; RUN: FileCheck %s --check-prefix=MUTABLE-ALIAS-MOD --input-file %t/mutable-alias.aot.ll
 ; RUN: rm -rf %t/function-alias-ext-dump && mkdir -p %t/function-alias-ext-dump
 ; RUN: opt -passes=ejit-register-bitcode -enable-ejit-global-ctors=1 -ejit-externalize-min-insts=0 -ejit-dump-bitcode-dir=%t/function-alias-ext-dump -S %t/function-alias.ll -o %t/function-alias-ext.aot.ll
 ; RUN: opt -passes=verify -disable-output %t/function-alias-ext-dump/*.bc
 ; RUN: opt -S %t/function-alias-ext-dump/*.bc | FileCheck %s --check-prefix=FUNCTION-ALIAS-EXT
-; RUN: FileCheck %s --check-prefix=FUNCTION-ALIAS-EXT-MOD %t/function-alias-ext.aot.ll
+; RUN: FileCheck %s --check-prefix=FUNCTION-ALIAS-EXT-MOD --input-file %t/function-alias-ext.aot.ll
 ; RUN: rm -rf %t/function-alias-keep-dump && mkdir -p %t/function-alias-keep-dump
 ; RUN: opt -passes=ejit-register-bitcode -ejit-externalize-min-insts=100 -ejit-dump-bitcode-dir=%t/function-alias-keep-dump -S %t/function-alias.ll -o /dev/null
 ; RUN: opt -passes=verify -disable-output %t/function-alias-keep-dump/*.bc
@@ -41,8 +41,11 @@
 
 ; BASIC: @handlers = internal constant %table_t { [2 x ptr] [ptr @func1, ptr @func2_alias] }
 ; BASIC: @handler_root = internal constant ptr @handlers
-; BASIC: @cycle_a = internal constant ptr @cycle_b
-; BASIC: @cycle_b = internal constant ptr @cycle_a
+; The pointer-to-pointer cycle carries no code address, so both objects
+; externalize as keyed declarations (shared AOT rodata) instead of staying
+; JIT-side definitions.
+; BASIC: @{{ejit_static\.[^ ]+\.cycle_a}} = external constant ptr
+; BASIC: @{{ejit_static\.[^ ]+\.cycle_b}} = external constant ptr
 ; BASIC: @func2_alias = internal alias i32 (i32, i32), ptr @func2
 ; BASIC-DAG: define internal {{.*}}i32 @func1(
 ; BASIC-DAG: define internal {{.*}}i32 @func2(
@@ -83,29 +86,33 @@
 
 ; A mutable table becomes an external declaration in the serialized module.
 ; Its host initializer must not pull host_target into the JIT closure, while
-; the AOT module and global-symbol registration stay intact.
-; MUTABLE: @mutable_handlers = external {{.*}}global [1 x ptr]
+; the AOT module and global-symbol registration stay intact. The table here
+; is internal, so the declaration and the registration both use the
+; deterministic ejit_static.* key (module-local names are not
+; process-unique).
+; MUTABLE: @{{ejit_static\.[^ ]+\.mutable_handlers}} = external {{.*}}global [1 x ptr]
 ; MUTABLE-NOT: @host_target
 ; MUTABLE-NOT: undef
 ; MUTABLE-MOD: @mutable_handlers = internal global [1 x ptr] [ptr @host_target]
-; MUTABLE-MOD: define internal i32 @host_target(
-; MUTABLE-MOD: c"mutable_handlers\00"
+; MUTABLE-MOD: c"{{ejit_static\.[^ ]+\.mutable_handlers}}\00"
 ; MUTABLE-MOD: @.ejit.registry.bitcode = private constant
+; MUTABLE-MOD: define internal i32 @host_target(
 ; MUTABLE-MOD: call void @ejit_register_symbol({{.*}}ptr @mutable_handlers)
 
 ; An alias rooted at a mutable table must be dissolved in the extracted clone
 ; before the table becomes a declaration. The entry keeps the exact non-zero
 ; GEP offset, while the AOT alias and mutable initializer remain untouched.
-; MUTABLE-ALIAS: @mutable_handlers = external {{.*}}global [2 x ptr]
+; MUTABLE-ALIAS: @{{ejit_static\.[^ ]+\.mutable_handlers}} = external {{.*}}global [2 x ptr]
 ; MUTABLE-ALIAS-NOT: @mutable_handlers_alias
 ; MUTABLE-ALIAS-NOT: @mutable_handlers_alias_chain
-; MUTABLE-ALIAS: getelementptr inbounds ([2 x ptr], ptr @mutable_handlers, i64 0, i64 1)
+; MUTABLE-ALIAS: getelementptr inbounds ([2 x ptr], ptr @{{ejit_static\.[^ ]+\.mutable_handlers}}, i64 0, i64 1)
 ; MUTABLE-ALIAS-NOT: @host_target
 ; MUTABLE-ALIAS-NOT: undef
 ; MUTABLE-ALIAS-MOD: @mutable_handlers = internal global [2 x ptr] [ptr @host_target, ptr @host_target]
+; MUTABLE-ALIAS-MOD: c"{{ejit_static\.[^ ]+\.mutable_handlers}}\00"
+; MUTABLE-ALIAS-MOD: @.ejit.registry.bitcode = private constant
 ; MUTABLE-ALIAS-MOD: @mutable_handlers_alias = internal alias [1 x ptr], getelementptr inbounds ([2 x ptr], ptr @mutable_handlers, i64 0, i64 1)
 ; MUTABLE-ALIAS-MOD: @mutable_handlers_alias_chain = internal alias [1 x ptr], ptr @mutable_handlers_alias
-; MUTABLE-ALIAS-MOD: c"mutable_handlers\00"
 ; MUTABLE-ALIAS-MOD: call void @ejit_register_symbol({{.*}}ptr @mutable_handlers)
 
 ; Function aliases rooted at a helper externalized from the clone must be

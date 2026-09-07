@@ -93,6 +93,34 @@ static std::string ejitRegistrationKey(const Module &M, const Function &F) {
                              : F.getName().str();
 }
 
+/// Registration key for a global variable that extractAndSerialize
+/// externalizes out of the bitcode. Externally linked globals keep their
+/// (already process-unique) name; internal globals (static const tables,
+/// private string literals, static mutable state) are module-local only, so
+/// they get the same deterministic
+/// "ejit_static.<TU basename>.<hash>.<name>" scheme as externalized helper
+/// functions. Period variables are the one exception: PASS2 registers them
+/// under their ORIGINAL name (ejit_register_period_array /
+/// ejit_register_static_var) and the JIT optimizer looks arrays up by that
+/// bitcode name, so they always keep it. Single source of truth shared by
+/// the extracted-bitcode rename and both registration emitters, so the
+/// three sites can never disagree.
+///
+/// The runtime symbol table is a flat per-process map (EJitOrcEngine
+/// userSymbols): two TUs both defining `static const int table[]` (or two
+/// static mutable counters) would silently bind the second registration to
+/// the first address, so the module-unique prefix is mandatory for anything
+/// with local linkage. The IR name is appended verbatim: names are unique
+/// within a module, so the key is injective per TU (".str" and "_str" hash
+/// into the same suffix but keep distinct keys) and no per-run collision
+/// handling is needed.
+static std::string ejitGVRegistrationKey(const Module &M,
+                                         const GlobalVariable &GV) {
+  if (!GV.hasLocalLinkage() || GV.hasMetadata(MD_EJIT_METADATA))
+    return GV.getName().str();
+  return ejitStaticHelperKey(M.getName(), GV.getName());
+}
+
 static bool isEjitEntryFunction(const Function &F) {
   return hasMDStringEntry(F.getMetadata(MD_EJIT_METADATA), TAG_EJIT_ENTRY);
 }
@@ -153,18 +181,36 @@ static GlobalVariable *closureRootGlobal(Value *V, const DataLayout &DL) {
   return nullptr;
 }
 
+/// Ownership rule of the bitcode externalization: every kept global
+/// definition becomes an external declaration resolved from the host process,
+/// except const period objects — a const period array IS the specialization
+/// array itself — and the code-address constants (dispatch tables) computed
+/// by computeCodeAddressConsts.
+static bool
+ejitGvKeepsDefinition(const GlobalVariable &GV,
+                      const SmallPtrSetImpl<const GlobalVariable *>
+                          &CodeAddressConsts) {
+  if (GV.isConstant() && GV.hasMetadata(MD_EJIT_METADATA))
+    return true;
+  return CodeAddressConsts.count(&GV) != 0;
+}
+
 /// An alias in serialized bitcode may not ultimately point at a declaration.
-/// Mutable globals are deliberately externalized below so the JIT resolves the
-/// host object instead of receiving a private initializer copy. Before that
+/// Every global definition that the ownership rule externalizes is converted
+/// below so the JIT resolves the host object instead of receiving a private
+/// copy — mutable state must stay shared with the AOT image, and pure-data
+/// constants must resolve to the AOT image's own .rodata. Before that
 /// conversion, dissolve aliases rooted at those globals into their aliasee
 /// expressions. RAUW preserves constant GEP offsets, and processing every
 /// matching alias also collapses arbitrary alias chains.
-static void dissolveAliasesToMutableGlobals(Module &M) {
+static void dissolveAliasesToExternalizedGlobals(
+    Module &M, const SmallPtrSet<const GlobalVariable *, 8> &KeepDefinitions) {
   const DataLayout &DL = M.getDataLayout();
   SmallVector<GlobalAlias *, 8> ToErase;
   for (GlobalAlias &GA : M.aliases()) {
     GlobalVariable *Root = closureRootGlobal(&GA, DL);
-    if (Root && !Root->isDeclaration() && !Root->isConstant())
+    if (Root && !Root->isDeclaration() &&
+        !ejitGvKeepsDefinition(*Root, KeepDefinitions))
       ToErase.push_back(&GA);
   }
 
@@ -248,6 +294,45 @@ collectInitializerClosureRefs(Constant *C, SmallPtrSetImpl<Constant *> &Visited,
   for (Value *Op : C->operands())
     if (auto *OpC = dyn_cast<Constant>(Op))
       collectInitializerClosureRefs(OpC, Visited, Functions, Globals);
+}
+
+/// Compute the const globals that must keep their JIT-side definitions:
+/// those whose initializer transitively references a function, directly or
+/// through other const globals. These are dispatch tables (handler/jump
+/// tables), not rodata: after specialization folds the table index to a
+/// constant, the optimizers can only devirtualize the indirect call if the
+/// table is a local definition whose initializer points at the cloned
+/// targets — the exact behavior the initializer closure preserves targets
+/// for. Pure-data constants (strings, numeric tables) carry no code
+/// addresses and externalize to the AOT image's rodata. Runs on the
+/// extracted clone after preOptimizeBitcode so only shapes that actually
+/// survived are classified.
+static SmallPtrSet<const GlobalVariable *, 8>
+computeCodeAddressConsts(Module &M) {
+  SmallPtrSet<const GlobalVariable *, 8> CodeAddressConsts;
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (GlobalVariable &GV : M.globals()) {
+      if (!GV.isConstant() || !GV.hasInitializer() ||
+          GV.hasMetadata(MD_EJIT_METADATA) || CodeAddressConsts.count(&GV))
+        continue;
+      SmallPtrSet<Constant *, 16> Visited;
+      SetVector<Function *> RefFuncs;
+      SetVector<GlobalVariable *> RefGVs;
+      collectInitializerClosureRefs(GV.getInitializer(), Visited, RefFuncs,
+                                    RefGVs);
+      bool Keep = !RefFuncs.empty();
+      for (const GlobalVariable *RefGV : RefGVs)
+        if (CodeAddressConsts.count(RefGV))
+          Keep = true;
+      if (Keep) {
+        CodeAddressConsts.insert(&GV);
+        Changed = true;
+      }
+    }
+  }
+  return CodeAddressConsts;
 }
 
 static void
@@ -919,16 +1004,60 @@ static std::string extractAndSerialize(Module &M,
                     << " of " << ToExternalize.size()
                     << " closure helper(s) in bitcode\n");
 
-  // Convert kept non-constant global definitions to external declarations
-  // so the JIT linker resolves them from the host process. Constants (e.g.
-  // version strings, lookup tables) are kept as-is since they're embedded
-  // in the bitcode and don't need external resolution.
-  dissolveAliasesToMutableGlobals(*Extracted);
+  // Convert kept global definitions to external declarations so the JIT
+  // linker resolves them from the host process — including constants.
+  // Constant definitions in the extracted bitcode materialize as JIT-side
+  // .rodata: every adrp+ldr that survives preOptimizeBitcode then reads a
+  // private copy instead of the AOT original. Externalizing every surviving
+  // const definition (closures whose loads folded away lose their dead
+  // definition entirely) resolves the loads to the AOT image's own rodata,
+  // so the JIT object carries no constant pool of its own. Mutable globals
+  // were always externalized this way; the ownership rule is uniform now
+  // (see ejitGvKeepsDefinition): only const period objects and
+  // code-address-carrying dispatch tables keep their definition, and a
+  // mutable period object externalizes like any other mutable global — it
+  // is shared state that belongs to the AOT image, never a JIT-private
+  // copy.
+  //
+  // Names and ownership are independent rules. Internal (local-linkage)
+  // non-period globals — const or mutable — are renamed to their
+  // deterministic registration key: module-local names are not
+  // process-unique and the runtime's flat symbol table would collide across
+  // TUs. External globals keep their unique name, and period globals keep
+  // their registry-contract original name (see ejitGVRegistrationKey). The
+  // rename and the registration both derive from that helper, so they
+  // cannot disagree.
+  //
+  // Aliases rooted at a global about to become a declaration are dissolved
+  // first (an alias may not point at a declaration), and COMDAT membership
+  // is dropped: a declaration may not be in a Comdat.
+  SmallPtrSet<const GlobalVariable *, 8> CodeAddressConsts =
+      computeCodeAddressConsts(*Extracted);
+  dissolveAliasesToExternalizedGlobals(*Extracted, CodeAddressConsts);
   for (GlobalVariable &GV : Extracted->globals()) {
-    if (GV.isDeclaration() || GV.isConstant())
+    if (GV.isDeclaration() || ejitGvKeepsDefinition(GV, CodeAddressConsts))
       continue;
+    // Capture the key before dropping the linkage: internal globals are
+    // renamed to it and the registration emitters must use the same value.
+    // ejitGVRegistrationKey only reads the module name and the GV name, so
+    // calling it on the clone's GV against the original module is fine.
+    bool WasLocal = GV.hasLocalLinkage();
+    std::string Key = ejitGVRegistrationKey(M, GV);
     GV.setInitializer(nullptr);
+    GV.setVisibility(GlobalValue::DefaultVisibility);
     GV.setLinkage(GlobalValue::ExternalLinkage);
+    // InternalLinkage implies dso_local and changing the linkage does not
+    // clear it (same pitfall the closure-helper externalization above
+    // fixes); a dso_local declaration drives PC-relative addressing and
+    // GOT lowering against a definition that no longer exists in this
+    // module.
+    GV.setDSOLocal(false);
+    // A declaration may not sit in a Comdat (verifier rule); internal
+    // constants and mutable globals can carry one from linkonce_odr-style
+    // shapes.
+    GV.setComdat(nullptr);
+    if (WasLocal)
+      GV.setName(Key);
   }
   // Pre-internalize non-entry definitions so the JIT's IRMaterializationUnit
   // does not advertise them in MR->getSymbols().  The JIT-side
@@ -1084,21 +1213,24 @@ static void generateSymbolRegisters(
             }
           }
         }
-        // External global variable references. A const global *with a local
-        // definition* (initializer) is embedded in the extracted bitcode by
-        // extractAndSerialize, so it needs no registration. A const global that
-        // is only a *declaration* (extern const, no initializer in this TU)
-        // cannot be embedded and must be resolved from the host process at JIT
-        // link time, so it MUST be registered — dropping it leaves an
-        // unresolved external that fails JITLink. Resolve through bitcasts/GEPs
-        // via rootGlobal so every global the collector kept in the extracted
-        // bitcode is actually registered here.
+        // Global variable references. Non-period closure globals are
+        // resolved from the host process at JIT link time: const and
+        // mutable definitions are externalized by extractAndSerialize (no
+        // JIT-side copy — loads resolve to the AOT image's own rodata or
+        // the shared host object). Dropping any of them leaves an
+        // unresolved external that fails JITLink. Internal globals are
+        // registered under their deterministic ejit_static.* key, matching
+        // the extracted-bitcode rename; period globals are skipped here —
+        // the period registry and the static registry table own their
+        // plain-name registration. Resolve through bitcasts/GEPs via
+        // rootGlobal so registration matches what collectReferencedGlobals
+        // kept in the extracted bitcode.
         for (Use &U : I.operands()) {
           auto *GV = rootGlobal(U.get(), DL);
-          if (!GV || (GV->isConstant() && !GV->isDeclaration()))
+          if (!GV)
             continue;
           if (GV->isDeclaration() || !isPeriodVar(*GV)) {
-            std::string Name = GV->getName().str();
+            std::string Name = ejitGVRegistrationKey(M, *GV);
             if (registered.insert(Name).second) {
               IRBuilder<> Builder(InsertBefore);
               Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
@@ -1113,16 +1245,18 @@ static void generateSymbolRegisters(
 
   // Alias-rooted globals are present in ClosureGlobals even though rootGlobal
   // intentionally does not follow aliases. Register those closure members as
-  // a fallback so an extracted clone whose mutable aliases were dissolved can
-  // resolve the same host object. The set keeps the direct-reference path
+  // a fallback so an extracted clone whose aliases were dissolved can
+  // resolve the same host object. Every closure global resolves from the
+  // host process at JIT link time — const definitions included, since
+  // extractAndSerialize externalizes them — except period definitions,
+  // which the period registry owns. The set keeps the direct-reference path
   // above unchanged and avoids duplicate registrations.
   for (GlobalVariable *GV : ClosureGlobals) {
-    if ((GV->isConstant() && !GV->isDeclaration()) ||
-        GV->getName().starts_with("llvm."))
+    if (GV->getName().starts_with("llvm."))
       continue;
     if (!GV->isDeclaration() && isPeriodVar(*GV))
       continue;
-    std::string Name = GV->getName().str();
+    std::string Name = ejitGVRegistrationKey(M, *GV);
     if (registered.insert(Name).second) {
       IRBuilder<> Builder(InsertBefore);
       Builder.CreateCall(
@@ -1341,15 +1475,19 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
         for (const Value *Op : I.operands()) {
           const GlobalVariable *GV =
               rootGlobal(const_cast<Value *>(Op), DL);
-          // Skip const globals that have a local definition (they're embedded
-          // in the bitcode), but keep const *declarations* (extern const) so
-          // they get registered and resolved from the host at JIT link time.
-          if (!GV || (GV->isConstant() && !GV->isDeclaration()) ||
-              GV->getName().starts_with("llvm."))
+          // Every closure global is registered: const and mutable
+          // definitions are externalized in the extracted bitcode and must
+          // resolve to the AOT original at JIT link time; extern const /
+          // extern mut were always declarations. Internal globals register
+          // under their deterministic ejit_static.* key, matching the
+          // extracted-bitcode rename (same source of truth as
+          // generateSymbolRegisters).
+          if (!GV || GV->getName().starts_with("llvm."))
             continue;
           if (!GVsDone.insert(GV).second)
             continue;
-          Constant *NameStr = ConstantDataArray::getString(Ctx, GV->getName(), true);
+          std::string Key = ejitGVRegistrationKey(M, *GV);
+          Constant *NameStr = ConstantDataArray::getString(Ctx, Key, true);
           auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
               GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
           Entries.push_back(ConstantStruct::get(EntryTy, {
@@ -1368,12 +1506,14 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   // Closure discovery follows aliases, while rootGlobal above deliberately
   // retains its existing alias-free behavior. Add any remaining externally
   // resolved closure globals so the static registry mirrors ctor registration
-  // after mutable aliases are dissolved in the extracted clone.
+  // after aliases are dissolved in the extracted clone. Const definitions
+  // are externalized by extractAndSerialize, so they resolve from the host
+  // too — under the same registration key the rename used.
   for (GlobalVariable *GV : ClosureGlobals) {
-    if ((GV->isConstant() && !GV->isDeclaration()) ||
-        GV->getName().starts_with("llvm.") || !GVsDone.insert(GV).second)
+    if (GV->getName().starts_with("llvm.") || !GVsDone.insert(GV).second)
       continue;
-    Constant *NameStr = ConstantDataArray::getString(Ctx, GV->getName(), true);
+    std::string Key = ejitGVRegistrationKey(M, *GV);
+    Constant *NameStr = ConstantDataArray::getString(Ctx, Key, true);
     auto *NameGV =
         new GlobalVariable(M, NameStr->getType(), true,
                            GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
