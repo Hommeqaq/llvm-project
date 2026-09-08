@@ -1034,9 +1034,35 @@ static std::string extractAndSerialize(Module &M,
   SmallPtrSet<const GlobalVariable *, 8> CodeAddressConsts =
       computeCodeAddressConsts(*Extracted);
   dissolveAliasesToExternalizedGlobals(*Extracted, CodeAddressConsts);
+  // Volume accounting for the rodata-externalization diagnostic: the bytes
+  // this loop removes from every specialization object compiled from this
+  // bitcode, and the bytes deliberately kept (const period arrays are the
+  // specialization arrays themselves; dispatch tables must stay definitions
+  // for devirtualization). getTypeAllocSize is the per-object footprint the
+  // definition would have materialized pre-externalization — approximate
+  // (alignment padding included, section overheads not), good enough for a
+  // diagnostic. Mutable globals are not counted: their externalization is
+  // baseline behavior, not part of the read-only-data story. The runtime
+  // reads this on every Baseline and Tier-2 (PGOUse) compile for its
+  // "rodata-extern" diagnostic (see EJitOptimizer); the metadata is inert
+  // until then.
+  const DataLayout &DL = Extracted->getDataLayout();
+  uint64_t ExternBytes = 0, KeptBytes = 0;
+  unsigned ExternCount = 0, KeptCount = 0;
   for (GlobalVariable &GV : Extracted->globals()) {
-    if (GV.isDeclaration() || ejitGvKeepsDefinition(GV, CodeAddressConsts))
+    if (GV.isDeclaration())
       continue;
+    if (ejitGvKeepsDefinition(GV, CodeAddressConsts)) {
+      if (!GV.getValueType()->isScalableTy()) {
+        KeptBytes += DL.getTypeAllocSize(GV.getValueType());
+        ++KeptCount;
+      }
+      continue;
+    }
+    if (GV.isConstant() && !GV.getValueType()->isScalableTy()) {
+      ExternBytes += DL.getTypeAllocSize(GV.getValueType());
+      ++ExternCount;
+    }
     // Capture the key before dropping the linkage: internal globals are
     // renamed to it and the registration emitters must use the same value.
     // ejitGVRegistrationKey only reads the module name and the GV name, so
@@ -1123,6 +1149,23 @@ static std::string extractAndSerialize(Module &M,
       }
       FnList.splice(InsertPt, FnList, F->getIterator());
     }
+  }
+
+  // Serialize the volume accounting as a named metadata operand: rides in
+  // the bitcode at negligible cost, does not participate in codegen, and
+  // survives every stage the module passes through (the Tier-2 audit clone,
+  // the IR dumps). Absent when nothing was externalized — no noise for
+  // constant-free TUs.
+  if (ExternCount) {
+    LLVMContext &Ctx = Extracted->getContext();
+    auto *I64 = Type::getInt64Ty(Ctx);
+    Metadata *Ops[] = {
+        ConstantAsMetadata::get(ConstantInt::get(I64, ExternBytes)),
+        ConstantAsMetadata::get(ConstantInt::get(I64, ExternCount)),
+        ConstantAsMetadata::get(ConstantInt::get(I64, KeptBytes)),
+        ConstantAsMetadata::get(ConstantInt::get(I64, KeptCount))};
+    Extracted->getOrInsertNamedMetadata("ejit.rodata_extern")
+        ->addOperand(MDNode::get(Ctx, Ops));
   }
 
   logEJitGlobalMeta("extract-after-extern", *Extracted);

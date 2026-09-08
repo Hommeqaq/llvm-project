@@ -445,6 +445,100 @@ TEST(EJitPgo, Tier2PgoUseAnnotatesBranchWeights) {
   EXPECT_TRUE(foundProf);
 }
 
+// The pipeline reads the "ejit.rodata_extern" named metadata (written by
+// PASS1's externalization accounting; see EJitRegisterBitcode) purely for
+// the per-compile diagnostic line - printed for Baseline and Tier-2 (PGOUse)
+// compiles, skipped for the temporary Tier-1 (Instrumented) probe code. The
+// metadata is diagnostic-only: a malformed operand list must never fail the
+// compile in any tier, and the well-formed one must survive the pipeline
+// untouched (named metadata is not part of any transform's input). EJIT_DIAG
+// output itself is not asserted - it is a no-op when EJIT_DIAG_ENABLE is
+// undefined (see the EJitRuntimeTest comment around line 4300).
+TEST(EJitPgo, RodataExternMetadataToleratesMalformedShapes) {
+  LLVMContext Ctx;
+
+  // Well-formed 4-operand node (extern bytes/count, kept bytes/count),
+  // exercised on both printing tiers.
+  for (CompileTier Tier : {CompileTier::Baseline, CompileTier::PGOUse}) {
+    auto M = makeFooModule(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    Metadata *Ops[] = {
+        ConstantAsMetadata::get(ConstantInt::get(I64, 27)),
+        ConstantAsMetadata::get(ConstantInt::get(I64, 2)),
+        ConstantAsMetadata::get(ConstantInt::get(I64, 8)),
+        ConstantAsMetadata::get(ConstantInt::get(I64, 1)),
+    };
+    M->getOrInsertNamedMetadata("ejit.rodata_extern")
+        ->addOperand(MDNode::get(Ctx, Ops));
+    PeriodArrayRegistry reg;
+    EJitOptimizer opt(reg);
+    SpecializationContext SC;
+    SC.fnName = "foo";
+    SC.tier = Tier;
+    opt.runPipeline(*M, SC);
+    NamedMDNode *NMD = M->getNamedMetadata("ejit.rodata_extern");
+    ASSERT_NE(NMD, nullptr);
+    EXPECT_EQ(NMD->getNumOperands(), 1u);
+    EXPECT_EQ(NMD->getOperand(0)->getNumOperands(), 4u);
+  }
+
+  // Wrong operand count (2 instead of 4) on Tier-1 (skipped tier) - the
+  // pipeline still must not fail.
+  {
+    auto M = makeFooModule(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    Metadata *Ops[] = {
+        ConstantAsMetadata::get(ConstantInt::get(I64, 1)),
+        ConstantAsMetadata::get(ConstantInt::get(I64, 2)),
+    };
+    M->getOrInsertNamedMetadata("ejit.rodata_extern")
+        ->addOperand(MDNode::get(Ctx, Ops));
+    PeriodArrayRegistry reg;
+    EJitOptimizer opt(reg);
+    SpecializationContext SC;
+    SC.fnName = "foo";
+    SC.tier = CompileTier::Instrumented;
+    opt.runPipeline(*M, SC);
+    EXPECT_NE(M->getNamedMetadata("ejit.rodata_extern"), nullptr);
+  }
+
+  // Wrong operand count (2 instead of 4) on Baseline - skipped silently.
+  {
+    auto M = makeFooModule(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    Metadata *Ops[] = {
+        ConstantAsMetadata::get(ConstantInt::get(I64, 1)),
+        ConstantAsMetadata::get(ConstantInt::get(I64, 2)),
+    };
+    M->getOrInsertNamedMetadata("ejit.rodata_extern")
+        ->addOperand(MDNode::get(Ctx, Ops));
+    PeriodArrayRegistry reg;
+    EJitOptimizer opt(reg);
+    SpecializationContext SC;
+    SC.fnName = "foo";
+    SC.tier = CompileTier::Baseline;
+    opt.runPipeline(*M, SC);
+    EXPECT_NE(M->getNamedMetadata("ejit.rodata_extern"), nullptr);
+  }
+
+  // Non-ConstantInt operand - skipped silently.
+  {
+    auto M = makeFooModule(Ctx);
+    Metadata *Ops[] = {MDString::get(Ctx, "not-a-number"),
+                       MDString::get(Ctx, "x"), MDString::get(Ctx, "y"),
+                       MDString::get(Ctx, "z")};
+    M->getOrInsertNamedMetadata("ejit.rodata_extern")
+        ->addOperand(MDNode::get(Ctx, Ops));
+    PeriodArrayRegistry reg;
+    EJitOptimizer opt(reg);
+    SpecializationContext SC;
+    SC.fnName = "foo";
+    SC.tier = CompileTier::PGOUse;
+    opt.runPipeline(*M, SC);
+    EXPECT_NE(M->getNamedMetadata("ejit.rodata_extern"), nullptr);
+  }
+}
+
 namespace {
 // foo(i32) calls bar(i32) twice; bar(i32) = x*3 + 2 (small, inlinable).
 std::unique_ptr<Module> makeFooCallsBarModule(LLVMContext &Ctx) {

@@ -146,6 +146,45 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
   lastMayConstLoadSites_.clear();
 #endif
 
+#if defined(EJIT_DIAG_ENABLE)
+  // One line per compile reporting the read-only data this object does NOT
+  // materialize (PASS1 externalized it out of the bitcode; see
+  // EJitRegisterBitcode's "ejit.rodata_extern" accounting). Baseline and
+  // Tier-2 (PGOUse) both print - those are the objects that stay published -
+  // while the Tier-1 (Instrumented) code is temporary probe code whose
+  // per-compile line adds nothing, so it stays silent. Summed over the
+  // published compiles of a session this approximates the pool bytes the
+  // externalization saves. One line per compile - no loop, so no
+  // ejitDiagPrintThrottle needed. Malformed shapes are skipped silently:
+  // the metadata is diagnostic-only and must never fail a compile.
+  if (ctx.tier != CompileTier::Instrumented)
+    if (NamedMDNode *NMD = M.getNamedMetadata("ejit.rodata_extern"))
+      if (NMD->getNumOperands() == 1)
+        if (MDNode *N = NMD->getOperand(0); N && N->getNumOperands() == 4) {
+          auto *ExternBytesC =
+              mdconst::dyn_extract<ConstantInt>(N->getOperand(0));
+          auto *ExternCountC =
+              mdconst::dyn_extract<ConstantInt>(N->getOperand(1));
+          auto *KeptBytesC =
+              mdconst::dyn_extract<ConstantInt>(N->getOperand(2));
+          auto *KeptCountC =
+              mdconst::dyn_extract<ConstantInt>(N->getOperand(3));
+          if (ExternBytesC && ExternCountC && KeptBytesC && KeptCountC)
+            EJIT_DIAG("rodata-extern entry=%s key=0x%016llx module=%s "
+                      "extern=%lluB/%u kept=%lluB/%u",
+                      ctx.fnName.c_str(),
+                      static_cast<unsigned long long>(ctx.cacheKey),
+                      M.getName().str().c_str(),
+                      static_cast<unsigned long long>(
+                          ExternBytesC->getZExtValue()),
+                      static_cast<unsigned>(
+                          ExternCountC->getZExtValue()),
+                      static_cast<unsigned long long>(
+                          KeptBytesC->getZExtValue()),
+                      static_cast<unsigned>(KeptCountC->getZExtValue()));
+        }
+#endif
+
 #ifdef EJIT_VERIFY_SUBSTITUTION
   if (verifySubstitution_)
     EJIT_DIAG("verify mode: checking may_const values instead of freezing "

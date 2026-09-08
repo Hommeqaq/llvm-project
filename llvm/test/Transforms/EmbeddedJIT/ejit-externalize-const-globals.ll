@@ -120,6 +120,14 @@ entry:
 ; EXT-NOT: [i32 10, i32 20, i32 30, i32 40]
 ; EXT-NOT: zeroinitializer
 
+; Volume accounting for the runtime's Tier-2 "rodata-extern" diagnostic:
+; externalized const bytes = @msg [11 x i8] 11 + @tbl [4 x i32] 16 = 27B in
+; 2 globals; kept const bytes = @const_cells [2 x i32] 8B in 1 global (const
+; period arrays and dispatch tables keep their definitions). Mutable globals
+; and already-external declarations are not counted.
+; EXT: !ejit.rodata_extern = !{![[ROEXT:[0-9]+]]}
+; EXT: ![[ROEXT]] = !{i64 27, i64 2, i64 8, i64 1}
+
 !0 = !{!"ejit_entry"}
 !1 = distinct !{!0}
 !2 = distinct !{!{!"ejit_period_arr", !"cell", i32 0}}
