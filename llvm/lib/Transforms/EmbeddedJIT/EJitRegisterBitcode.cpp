@@ -183,15 +183,17 @@ static GlobalVariable *closureRootGlobal(Value *V, const DataLayout &DL) {
 
 /// Ownership rule of the bitcode externalization: every kept global
 /// definition becomes an external declaration resolved from the host process,
-/// except const period objects — a const period array IS the specialization
-/// array itself — and the code-address constants (dispatch tables) computed
-/// by computeCodeAddressConsts.
+/// including const period objects — the specialization chain (registration,
+/// resolveBase, may_const substitution) reads runtime memory through the
+/// period registry by the original name and never reads the bitcode
+/// initializer, so a kept definition would only materialize a stale private
+/// copy. The sole exceptions are the code-address constants (dispatch
+/// tables) computed by computeCodeAddressConsts, whose initializers point at
+/// JIT-compiled copies and must stay local definitions for devirtualization.
 static bool
 ejitGvKeepsDefinition(const GlobalVariable &GV,
                       const SmallPtrSetImpl<const GlobalVariable *>
                           &CodeAddressConsts) {
-  if (GV.isConstant() && GV.hasMetadata(MD_EJIT_METADATA))
-    return true;
   return CodeAddressConsts.count(&GV) != 0;
 }
 
@@ -1013,11 +1015,15 @@ static std::string extractAndSerialize(Module &M,
   // definition entirely) resolves the loads to the AOT image's own rodata,
   // so the JIT object carries no constant pool of its own. Mutable globals
   // were always externalized this way; the ownership rule is uniform now
-  // (see ejitGvKeepsDefinition): only const period objects and
-  // code-address-carrying dispatch tables keep their definition, and a
-  // mutable period object externalizes like any other mutable global — it
-  // is shared state that belongs to the AOT image, never a JIT-private
-  // copy.
+  // (see ejitGvKeepsDefinition): only code-address-carrying dispatch tables
+  // keep their definition. Period objects externalize like any other global
+  // — const or mutable, a period array is shared state whose live values
+  // the specialization chain reads through the period registry at runtime,
+  // never a JIT-private copy. A kept const period definition would be worse
+  // than dead weight: the JIT-side param-substitution fold against that
+  // initializer would bake the extraction-time values, silently bypassing
+  // the runtime memory read (the specialization trigger), so the trigger
+  // load MUST stay alive to be substituted from live memory.
   //
   // Names and ownership are independent rules. Internal (local-linkage)
   // non-period globals — const or mutable — are renamed to their
@@ -1036,16 +1042,15 @@ static std::string extractAndSerialize(Module &M,
   dissolveAliasesToExternalizedGlobals(*Extracted, CodeAddressConsts);
   // Volume accounting for the rodata-externalization diagnostic: the bytes
   // this loop removes from every specialization object compiled from this
-  // bitcode, and the bytes deliberately kept (const period arrays are the
-  // specialization arrays themselves; dispatch tables must stay definitions
-  // for devirtualization). getTypeAllocSize is the per-object footprint the
-  // definition would have materialized pre-externalization — approximate
-  // (alignment padding included, section overheads not), good enough for a
-  // diagnostic. Mutable globals are not counted: their externalization is
-  // baseline behavior, not part of the read-only-data story. The runtime
-  // reads this on every Baseline and Tier-2 (PGOUse) compile for its
-  // "rodata-extern" diagnostic (see EJitOptimizer); the metadata is inert
-  // until then.
+  // bitcode, and the bytes deliberately kept (dispatch tables must stay
+  // definitions for devirtualization). getTypeAllocSize is the per-object
+  // footprint the definition would have materialized pre-externalization —
+  // approximate (alignment padding included, section overheads not), good
+  // enough for a diagnostic. Mutable globals are not counted: their
+  // externalization is baseline behavior, not part of the read-only-data
+  // story. The runtime reads this on every Baseline and Tier-2 (PGOUse)
+  // compile for its "rodata-extern" diagnostic (see EJitOptimizer); the
+  // metadata is inert until then.
   const DataLayout &DL = Extracted->getDataLayout();
   uint64_t ExternBytes = 0, KeptBytes = 0;
   unsigned ExternCount = 0, KeptCount = 0;

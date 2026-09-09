@@ -19,10 +19,13 @@
 ;
 ; Period objects follow the registry name contract: PASS2 registers them
 ; under their ORIGINAL name and the JIT optimizer looks arrays up by that
-; name, so they never rename. Ownership: a mutable period object is shared
-; host state — it externalizes like any other mutable global (a JIT-private
-; copy would silently diverge from the AOT/shared object), while a CONST
-; period object is the specialization array itself and keeps its definition.
+; name, so they never rename. Ownership: every period object — const or
+; mutable — is shared host state whose live values the specialization chain
+; reads through the period registry at runtime, so it externalizes like any
+; other global. A kept const period definition would bake extraction-time
+; values into JIT-side constant pools and let the JIT-side fold bypass the
+; runtime memory read (the specialization trigger); externalized, the
+; trigger load survives to be substituted from live memory.
 ;
 ; NOTE: the EXT assertions assume preOptimizeBitcode actually RUNS: it is
 ; #ifdef NDEBUG-guarded (cyclic link dependency in debug/shared builds), so
@@ -57,9 +60,16 @@
 ; original name (period registry contract).
 @cells = global [2 x i32] zeroinitializer, !ejit.metadata !2
 
-; Const period array — the specialization array itself: keeps its
-; definition, name and metadata.
-@const_cells = constant [2 x i32] [i32 5, i32 6], !ejit.metadata !3
+; Const period array — externalizes like every other period object (dso_local
+; here is clang-realistic: clang emits it on file-scope const definitions),
+; keeping its original name and metadata.
+@const_cells = dso_local constant [2 x i32] [i32 5, i32 6], !ejit.metadata !3
+
+; Alias to the const period array. Pre-flip the alias survived (its root
+; kept its definition); post-flip the root becomes a declaration and an
+; alias may not point at one, so the alias dissolves into its aliasee and
+; every use resolves through @const_cells itself.
+@alias_to_const_period = alias [2 x i32], ptr @const_cells
 
 define i32 @entry(i32 %i) !ejit.metadata !1 {
 entry:
@@ -73,7 +83,7 @@ entry:
   %nl = load i32, ptr @counter_local
   %pc = getelementptr [2 x i32], ptr @cells, i32 0, i32 %i
   %p = load i32, ptr %pc
-  %pcc = getelementptr [2 x i32], ptr @const_cells, i32 0, i32 %i
+  %pcc = getelementptr [2 x i32], ptr @alias_to_const_period, i32 0, i32 %i
   %q = load i32, ptr %pcc
   %s1 = add i32 %n, %ci
   %s2 = add i32 %s1, %v
@@ -88,45 +98,56 @@ entry:
 
 ; MOD side: the registration strings (globals print before functions), then
 ; the ctor registration calls. Internal globals register under their
-; ejit_static.* key; the period array only appears via the static registry
-; table (the ctor path skips period definitions).
+; ejit_static.* key; period objects appear via the static registry table only
+; (the ctor path skips period registrations — both arrays' plain-name symbol
+; entries come from the .ejit_bitcode section, where they provide the
+; bare-metal JIT-link fallback for the externalized declarations).
 ; MOD: c"ejit_static._stdin_.{{0x[0-9a-f]+}}.counter_local\00"
 ; MOD: c"cells\00"
+; MOD: c"const_cells\00"
 ; MOD: define internal void @ejit_auto_register()
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @msg)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @g_ext_const)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @counter)
 ; MOD-DAG: call void @ejit_register_symbol(ptr @{{.*}}, ptr @counter_local)
 ; MOD-NOT: call void @ejit_register_symbol(ptr @{{.*}}, ptr @cells)
+; MOD-NOT: call void @ejit_register_symbol(ptr @{{.*}}, ptr @const_cells)
 
 ; EXT side: the extracted bitcode declares (does not define) every
 ; externalized global; internal globals are renamed to their deterministic
-; key, the mutable period array keeps its plain name as a declaration, and
-; the const period array keeps its definition. Renamed internal globals keep
-; dso_local (set by their original internal linkage and not cleared by the
-; external conversion) so data access stays direct ADRP+ADD — no per-global
-; GOT entry.
+; key and both period arrays keep their plain names as declarations. Renamed
+; internal globals keep dso_local (set by their original internal linkage and
+; not cleared by the external conversion), and an explicitly emitted dso_local
+; (const period, clang-realistic) survives the conversion too, so data access
+; stays direct ADRP+ADD — no per-global GOT entry.
 ; EXT: @msg = external constant
 ; EXT: @ejit_static._stdin_.{{0x[0-9a-f]+}}.tbl = external dso_local constant
 ; EXT: @g_ext_const = external constant
 ; EXT: @counter = external global
 ; EXT: @ejit_static._stdin_.{{0x[0-9a-f]+}}.counter_local = external dso_local global
 ; EXT: @cells = external global [2 x i32]
-; EXT: @const_cells = constant [2 x i32] [i32 5, i32 6]
+; EXT: @const_cells = external dso_local constant [2 x i32]
 
 ; ...and no externalized initializer survives anywhere in the extracted
 ; module:
 ; EXT-NOT: c"helloworld\00"
 ; EXT-NOT: [i32 10, i32 20, i32 30, i32 40]
 ; EXT-NOT: zeroinitializer
+; EXT-NOT: [i32 5, i32 6]
+
+; The alias rooted at the now-external const period array dissolves (an
+; alias may not point at a declaration): no @alias_to_const_period survives
+; and the entry's GEP resolves through @const_cells itself.
+; EXT-NOT: @alias_to_const_period
 
 ; Volume accounting for the runtime's Tier-2 "rodata-extern" diagnostic:
-; externalized const bytes = @msg [11 x i8] 11 + @tbl [4 x i32] 16 = 27B in
-; 2 globals; kept const bytes = @const_cells [2 x i32] 8B in 1 global (const
-; period arrays and dispatch tables keep their definitions). Mutable globals
-; and already-external declarations are not counted.
+; externalized const bytes = @msg [11 x i8] 11 + @tbl [4 x i32] 16 +
+; @const_cells [2 x i32] 8 = 35B in 3 globals; nothing is kept (only
+; code-address dispatch tables would keep their definitions, and this module
+; has none). Mutable globals and already-external declarations are not
+; counted.
 ; EXT: !ejit.rodata_extern = !{![[ROEXT:[0-9]+]]}
-; EXT: ![[ROEXT]] = !{i64 27, i64 2, i64 8, i64 1}
+; EXT: ![[ROEXT]] = !{i64 35, i64 3, i64 0, i64 0}
 
 !0 = !{!"ejit_entry"}
 !1 = distinct !{!0}

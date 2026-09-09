@@ -14,6 +14,17 @@
 // materialized inside the JIT object. IR-level counterpart:
 // llvm/test/Transforms/EmbeddedJIT/ejit-externalize-const-globals.ll.
 //
+// The ownership flip (const period arrays externalize too): the probe set
+// additionally carries a CONST period array (g_ro_const_cells) sharing
+// period "cell" with the mutable trigger. Before the flip the extracted
+// bitcode kept its definition — a JIT-side private constant pool whose
+// initializer the JIT-side fold (after param substitution) baked into the
+// specialized body, silently bypassing the runtime memory read. After the
+// flip the module carries an external dso_local constant resolved to the
+// AOT original, the param-indexed may_const read is substituted from live
+// memory, and the per-compile rodata-extern accounting counts it on the
+// extern side (extern=95B/5, kept=0B/0).
+//
 // Core falsifiable assertion — address consistency. Three entries return
 // the address of a read-only object as a uint64_t; the producer compares
 // each against the address of the SAME object taken in test code (same
@@ -37,11 +48,13 @@
 // g_ro_msg is initialized with it.
 //
 // Specialization trigger. Every entry takes an ejit_period_arr_ind(cell)
-// index and reads a may_const field of the shared period array
-// g_rodata_ref_cells — the field is the trigger (what the JIT specializes
-// on), the const-data probes are the payload. After substitution the
-// trigger's guard folds away, so the specialized body reduces to the pure
-// probe and the returned address stays comparable. The guard compares
+// index and reads a may_const field of a period array — for probes 1–5 the
+// shared mutable trigger array g_rodata_ref_cells (the field is the trigger
+// what the JIT specializes on, the const-data probes are the payload; after
+// substitution the trigger's guard folds away, so the specialized body
+// reduces to the pure probe and the returned address stays comparable), and
+// for probe 6 the const period array g_ro_const_cells itself (the flip
+// probe: its may_const read is trigger AND payload). Both guards compare
 // against a sentinel the producer never writes; a may_const load is what
 // newer toolchains require (an ejit_entry whose closure reads no may_const
 // field gets the "no JIT specialization value" diagnostic), and what makes
@@ -51,7 +64,7 @@
 // Fallback assertions (correct under any implementation): a libc-free
 // content check (the board has no strcmp/strlen), a const-table sum with a
 // runtime index, repeated-call cache stability, and taskpool gates
-// (asyncCompiles >= baseline + 5, readyEntries >= 5, compileFailed == 0,
+// (asyncCompiles >= baseline + 6, readyEntries >= 6, compileFailed == 0,
 // publishFailed == 0, queue drained). The gates prove the specializations
 // exist and were published — without them a silently-failed compile would
 // keep every call on the AOT path and the probes would pass vacuously.
@@ -89,7 +102,7 @@
 //   2. Run test_ejit_period on core 25. It attaches as a peer, activates
 //      cell 1, sets the may_const field through the ejit_period_guard
 //      setter, calls each entry once (AOT fallback + async enqueue), waits
-//      for the five compiles to publish, calls each entry again (JIT
+//      for the six compiles to publish, calls each entry again (JIT
 //      path), runs every assertion, and prints the PASS/FAIL summary.
 //   3. Run test_ejit_rodata_ref_print on core 6. It prints the compiled
 //      list, the optimized entry IR, and the full specialization module —
@@ -227,16 +240,18 @@ extern uint8_t g_ucLocalCoreID;
 // it, so the guard folds away after specialization and the returned
 // address/value stays independent of the trigger.
 #define RODATA_REF_SENTINEL 0xFFFFFFFFu
-#define RODATA_REF_ENTRY_COUNT 5u
+#define RODATA_REF_ENTRY_COUNT 6u
 // kEJitInvalidFuncIndex / kEJitInvalidDimType (EJitCommon.h): the sentinel a
 // failed name-keyed registry resolution leaves in the slot.
 #define RODATA_REF_INVALID_INDEX 0xFFFFFFFFu
 #define RODATA_REF_WAIT_ROUNDS 6000u
 #define RODATA_REF_WAIT_TICKS 10u
-// The dump-armed entry: the minimal address probe. Its specialization
-// module is the print step's object-level evidence — g_ro_str shows up as
-// an external declaration with no const definition in the module.
-#define RODATA_REF_DUMP_ENTRY "jit_ro_str_addr"
+// The dump-armed entry: the const-period flip probe. Its specialization
+// module is the print step's object-level evidence — g_ro_const_cells shows
+// up as an external dso_local constant with no const definition anywhere in
+// the module (and g_ro_str keeps its own evidence through the address
+// assertions).
+#define RODATA_REF_DUMP_ENTRY "jit_ro_const_val"
 
 enum RodataRefStage {
   RODATA_REF_RESET = 0,
@@ -272,6 +287,27 @@ struct RodataRefCell {
 EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell)
 struct RodataRefCell g_rodata_ref_cells[RODATA_REF_CELL_COUNT];
 
+// The const period array: the ownership-flip probe. It shares period
+// "cell" with the mutable trigger array above — one time-window, two arrays
+// resolved by their own var names (PASS2 registers both; the registry's
+// multi-array path keys each by name) — so no second dimType capture,
+// activation, or dispatch dimension is needed. No shared-section attribute:
+// const data belongs in the AOT image's own .rodata. Before the flip the
+// extracted bitcode kept this definition (a JIT-side private constant pool,
+// and the JIT-side fold after param substitution baked the extraction-time
+// cell value into the specialized body); after the flip the bitcode carries
+// an external dso_local constant resolved to THIS original, and the
+// param-indexed may_const read is substituted from live memory.
+struct RodataRefConstCell {
+  ejit_may_const uint32_t value;
+};
+
+ejit_period_arr(cell) const struct RodataRefConstCell
+    g_ro_const_cells[RODATA_REF_CELL_COUNT] = {
+        {1000u}, {1100u}, {1200u}, {1300u},
+        {1400u}, {1500u}, {1600u}, {1700u},
+};
+
 //===-- AOT-side read-only data -------------------------------------------===//
 
 // Named read-only data. The extracted bitcode used to carry a definition
@@ -301,10 +337,12 @@ void rodata_ref_set_cell_type(ejit_period_arr_ind(cell) uint8_t cellIdx,
 
 //===-- Probe entries -----------------------------------------------------===//
 //
-// Every entry follows the same shape: read the may_const trigger (the
+// Probes 1–5 follow the same shape: read the may_const trigger (the
 // specialization substrate — the JIT substitutes the period index, then
 // folds the field load and the sentinel guard away), then perform the
-// read-only-data probe (the payload this test is about).
+// read-only-data probe (the payload this test is about). Probe 6's trigger
+// IS its payload: a param-indexed may_const read of the const period array
+// itself.
 
 // Probe 1: value of the named const pointer g_ro_msg — the address of the
 // "GOODBYRE" literal it points to. Exercises the externalized g_ro_msg
@@ -355,6 +393,22 @@ jit_ro_sum_tbl(ejit_period_arr_ind(cell) uint8_t cellIndex, uint8_t i) {
   if (g_rodata_ref_cells[cellIndex].cellType == RODATA_REF_SENTINEL)
     return 0u;
   return g_ro_tbl[i & 7u] + g_ro_tbl[0];
+}
+
+// Probe 6 (the dump entry): the const period array after the ownership
+// flip. The param-indexed may_const read is the trigger AND the payload:
+// with the externalized declaration there is no initializer left to fold
+// against, so the read survives extraction and JIT-side optimization to be
+// substituted from live memory (this .rodata original) — before the flip
+// the JIT-side fold against the kept definition baked the extraction-time
+// value instead. The printed specialization module must show
+// @g_ro_const_cells as an external dso_local constant, with no definition
+// anywhere in the module.
+ejit_entry uint32_t
+jit_ro_const_val(ejit_period_arr_ind(cell) uint8_t cellIndex) {
+  if (g_ro_const_cells[cellIndex].value == RODATA_REF_SENTINEL)
+    return 0u;
+  return g_ro_const_cells[cellIndex].value;
 }
 
 //===-- Assertions ----------------------------------------------------===//
@@ -503,16 +557,24 @@ static int run_producer(void) {
   // --- First calls: AOT fallback bodies while the worker compiles -------
   SRE_printf("\n--- first calls (AOT fallback + async enqueue) ---\n");
   const uint8_t cell = (uint8_t)RODATA_REF_CELL;
+  // First-hand view of the const period cell (same translation unit; the
+  // compiler folds it to the static initializer — never mirror the data
+  // into a second copy for comparison).
+  const uint32_t aot_const_val = g_ro_const_cells[RODATA_REF_CELL].value;
   const uint64_t aot_path_msg = jit_ro_msg_addr(cell);
   const uint64_t aot_path_str = jit_ro_str_addr(cell);
   const uint64_t aot_path_lit = jit_ro_lit_addr(cell);
   const uint32_t aot_path_content = jit_ro_check_content(cell);
   const uint32_t aot_path_sum = jit_ro_sum_tbl(cell, 3u);
+  const uint32_t aot_path_const = jit_ro_const_val(cell);
 
   VERIFY(aot_path_content == 1u,
          "AOT jit_ro_check_content() == 1 (got %u)", aot_path_content);
   VERIFY(aot_path_sum == 50u, "AOT jit_ro_sum_tbl(3) == 50 (got %u)",
          aot_path_sum);
+  VERIFY(aot_path_const == aot_const_val,
+         "AOT jit_ro_const_val() == %u (got %u)", aot_const_val,
+         aot_path_const);
   VERIFY(aot_path_msg == aot_msg && aot_path_str == aot_str &&
              aot_path_lit == aot_lit,
          "AOT path sees the original addresses (msg/str/lit)");
@@ -527,6 +589,7 @@ static int run_producer(void) {
   const uint64_t jit_lit = jit_ro_lit_addr(cell);
   const uint32_t jit_content = jit_ro_check_content(cell);
   const uint32_t jit_sum = jit_ro_sum_tbl(cell, 3u);
+  const uint32_t jit_const = jit_ro_const_val(cell);
 
   SRE_printf("  g_ro_msg: AOT=0x%llx JIT=0x%llx\n",
              (unsigned long long)aot_msg, (unsigned long long)jit_msg);
@@ -553,6 +616,12 @@ static int run_producer(void) {
   VERIFY(jit_content == 1u, "JIT jit_ro_check_content() == 1 (got %u)",
          jit_content);
   VERIFY(jit_sum == 50u, "JIT jit_ro_sum_tbl(3) == 50 (got %u)", jit_sum);
+  // The const period cell through the JIT path: the value itself cannot
+  // distinguish snapshot from original (a genuinely const object never
+  // changes), so this pins the mechanism's result; the externality itself
+  // is the print step's module evidence plus the accounting count.
+  VERIFY(jit_const == aot_const_val,
+         "JIT jit_ro_const_val() == %u (got %u)", aot_const_val, jit_const);
 
   // Repeated calls stay stable (cache-hit path).
   VERIFY(jit_ro_sum_tbl(cell, 3u) == jit_sum &&
@@ -574,7 +643,13 @@ static int run_producer(void) {
   // results to cover every expected body value — each JIT body, called
   // outside any wrapper, must compute its own AOT-original result.
   //
-  // All five bodies are callable through one prototype: the extra second
+  // The classifier below buckets on raw value equality, so the const period
+  // initializers must stay distinct from the other bodies' results (1, 50)
+  // and from any address (the AOT image sits far above 0x1000; the values
+  // 1000–1700 hold) — a colliding initializer would miscount as "an
+  // unexpected value" or silently inflate another bucket.
+  //
+  // All six bodies are callable through one prototype: the extra second
   // argument is ignored by the one-argument bodies (AAPCS), a w0 return
   // reads as the zero-extended x0 value, and the two address probes share
   // one anonymous literal, so their bucket counts together.
@@ -585,6 +660,7 @@ static int run_producer(void) {
            "dimType captured for period cell (%u)", cellDim);
 
     uint32_t addrBodies = 0, strBodies = 0, contentBodies = 0, sumBodies = 0;
+    uint32_t constBodies = 0;
     for (uint32_t idx = 0; idx < RODATA_REF_ENTRY_COUNT; ++idx) {
       uint32_t bucket = 0;
       void *fn = lookup_jit_fn(idx, cellDim, RODATA_REF_CELL, &bucket);
@@ -600,6 +676,8 @@ static int run_producer(void) {
         ++contentBodies;
       } else if (v == 50u) {
         ++sumBodies;
+      } else if (v == aot_const_val) {
+        ++constBodies;
       } else {
         VERIFY(0, "index %u body returned an unexpected value (0x%llx)", idx,
                (unsigned long long)v);
@@ -611,6 +689,7 @@ static int run_producer(void) {
     VERIFY(contentBodies == 1u, "the content-check body ran (%u/1)",
            contentBodies);
     VERIFY(sumBodies == 1u, "the table-sum body ran (%u/1)", sumBodies);
+    VERIFY(constBodies == 1u, "the const-period body ran (%u/1)", constBodies);
   }
 
   // Taskpool gates: the specializations exist, are published, and nothing
@@ -637,7 +716,8 @@ static int run_producer(void) {
   VERIFY(ejit_taskpool_pending_count() == 0, "queue drained");
 
   __atomic_store_n(&g_rodata_ref_sink,
-                   jit_msg ^ jit_str ^ jit_lit ^ (uint64_t)jit_sum,
+                   jit_msg ^ jit_str ^ jit_lit ^ (uint64_t)jit_sum ^
+                       (uint64_t)jit_const,
                    __ATOMIC_RELEASE);
   __atomic_store_n(&g_rodata_ref_stage, RODATA_REF_COMPILED,
                    __ATOMIC_RELEASE);
@@ -699,9 +779,12 @@ int test_ejit_rodata_ref_print(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_print_dumped(RODATA_REF_DUMP_ENTRY);
   SRE_printf("\n[RODATA-REF] === SPECIALIZATION MODULE ===\n");
   ejit_print_dumped_module(RODATA_REF_DUMP_ENTRY);
-  SRE_printf("[RODATA-REF][core=%u] expect: %s references g_ro_str as an "
-             "external DECLARATION (no const definition left in the "
-             "module); the resolve binds it to the AOT .rodata original\n",
+  SRE_printf("[RODATA-REF][core=%u] expect: %s references g_ro_const_cells "
+             "as an external dso_local constant DECLARATION (the const "
+             "period array keeps no definition in the module); the resolve "
+             "binds it to the AOT .rodata original, and the per-compile "
+             "rodata-extern accounting must count 5 externalized consts "
+             "(extern=95B/5) with nothing kept\n",
              core, RODATA_REF_DUMP_ENTRY);
   SRE_printf("[RODATA-REF][core=%u] PASS sink=0x%llx failures=%u\n", core,
              (unsigned long long)__atomic_load_n(&g_rodata_ref_sink,
