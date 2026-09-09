@@ -103,10 +103,11 @@ ejit_entry 函数本身在 IR 中不含 period 依赖的直接声明。依赖通
 步骤:
 1. CollectEntryFunctions(M) → 收集所有 ejit_entry 函数
 2. ComputeTransitiveClosure(entryFuncs) → 计算依赖函数集
-3. ExtractModule(fullFuncSet) → 提取独立的 bitcode Module
-4. SerializeToBitcode(extractedModule) → 序列化为字节数组
-5. EmbedBitcodeInModule(M, bitcodeBytes) → 在原始 Module 中创建全局变量
-6. GenerateRegisterCall(M, globalVar) → 插入注册函数调用
+3. ExtractModule(fullFuncSet) → 提取独立的 bitcode Module（含 preOptimizeBitcode）
+4. ExternalizeGlobals(extractedModule) → 全局定义转外部声明（所有权规则，§3.7；函数外化见 EJIT_BITCODE_SLIMMING.md）
+5. SerializeToBitcode(extractedModule) → 序列化为字节数组
+6. EmbedBitcodeInModule(M, bitcodeBytes) → 在原始 Module 中创建全局变量
+7. GenerateRegisterCall(M, globalVar) → 插入注册函数调用（闭包符号按 §3.7 注册键注册）
 ```
 
 ### 3.2 详细伪代码
@@ -332,6 +333,82 @@ void insertBitcodeRegisterCall(Module& M, GlobalVariable* bitcodeGV,
 }
 ```
 
+### 3.7 提取模块的全局变量外化（所有权规则）
+
+> 版本: 2026-09-09。const 全局外化由 PR216 引入；const period 数组的所有权翻转
+> （保定义 → 转声明）由其后续提交 043b5c0 完成，本节描述翻转后的最终规则。
+
+**架构原则**：主干是 AOT，JIT 编译出的特化代码只是附属汇编，**不应当拥有资源**。
+提取位码里任何"数据定义"都是与 AOT 主干分叉的副本——既是内存开销，也是正确性
+隐患。因此 `extractAndSerialize` 在 preopt 之后把**所有幸存的全局定义转为外部
+声明**，JIT link 期按注册键解析到 AOT 镜像原件；唯一的豁免是**dispatch table**
+（见下）。
+
+```cpp
+// EJitRegisterBitcode.cpp — ejitGvKeepsDefinition
+static bool ejitGvKeepsDefinition(const GlobalVariable &GV,
+                                  const SmallPtrSetImpl<const GlobalVariable *>
+                                      &CodeAddressConsts) {
+  return CodeAddressConsts.count(&GV) != 0;
+}
+```
+
+| 数据类别 | 处置 | 依据 |
+|---------|------|------|
+| const 全局（具名常量/内部静态表/字符串字面量） | 转声明，解析到 AOT .rodata 原件 | 保定义只会物化 JIT 私有常量池 |
+| const period 数组 | 转声明（原名 + metadata + dso_local 保留） | 特化链不读 initializer（见下）；保定义时 JIT 侧参数代入后的折叠会把提取时刻的值烙进特化体，旁路特化触发本身 |
+| mutable 全局 / mutable period 数组 | 转声明（基线行为，早于 PR216） | 共享状态属于 AOT 镜像 |
+| dispatch table（`computeCodeAddressConsts`：const 且 initializer 传递引用函数） | **保定义** | JIT 自身代码语义：条目指向 JIT 编译副本而非 AOT 原件，特化折叠表索引后只有本地定义能去虚化为直达调用 |
+
+**const period 数组为何不依赖定义**——特化链各环节逐一核实过：
+
+1. PASS2 注册只读 metadata（period 名/size），不读 initializer；
+2. 运行时 `resolveBase`（EJitStructFieldPass.cpp）按位码**声明名**查
+   PeriodArrayRegistry 取 `baseAddr`；
+3. may_const 代入在 baseAddr 处读**运行时活内存**做替换。
+
+**命名规则**（`ejitGVRegistrationKey` 是唯一事实源，改名与两条注册发射器共用）：
+
+- internal（local linkage）非 period 全局 → 确定性键 `ejit_static.<TU 基名>.<hash>.<名>`（进程级平坦符号表防跨 TU 撞名）；
+- external 全局 → 保持原名；
+- period 全局（const/mutable）→ **保持原名**（PASS2 注册表契约）。
+
+**转换机制**（外化循环，EJitRegisterBitcode.cpp ~L1054）：`setInitializer(nullptr)`
++ `ExternalLinkage` + `DefaultVisibility`；**dso_local 刻意保留**（数据访问保持
+直接 ADRP+ADD，Small code model 下无需 GOT）；声明不可带 Comdat，成员资格剥除；
+指向被外化全局的别名先 dissolve（别名不可指向声明）。
+
+**注册**：静态注册表发射器（`generateRegistryTable`，裸机/测试回退路径）**全量**
+注册闭包 GV（含 period，按原名）——这是板端 JIT link 的兜底；ctor 发射器
+（`generateSymbolRegisters`，hosted 路径）按既有契约跳过 period GV（period
+registry 拥有它们的注册）。板端生产环境 100% 走静态表（preset 钉核编译期强制
+`forceStaticRegistry=true` + `-enable-ejit-global-ctors=false`）。
+
+**体积会计**：`!ejit.rodata_extern = !{!{i64 externBytes, i64 externCount, i64
+keptBytes, i64 keptCount}}`（`getTypeAllocSize` 估算，对齐含、段开销不含；mutable
+不计——其外化是基线行为）。运行时每次 Baseline/Tier-2 编译打一行
+`rodata-extern entry=… extern=NNB/N kept=NNB/N`。rodata_ref 板测当前基线
+`extern=95B/5 kept=0B/0`（5 个 const 全外化：.str×2、g_ro_str、g_ro_tbl、
+g_ro_const_cells）。
+
+**已知边界**（均为有意接受，详见 PR216 描述"已知边界"节）：
+
+1. **hosted link-fail**：ctor 路径上未被代入消除的 period 引用（const/mutable
+   一致）JIT link 响亮失败并诊断符号名——优于静默读陈旧快照；板端不受影响；
+2. **去虚化损失**：const period 且 initializer 引用函数的表转声明后，间接调用
+   解析到 AOT 原件经 wrapper（语义正确），损失"去虚化到 JIT 副本"优化；
+3. **提取期常量索引折叠**：`preOptimizeBitcode`（含 InstCombine）先于外化运行，
+   常量索引读仍折叠成立即数——对真 const 数据无害（快照≡原件）。翻转消除的是
+   **参数索引**读的 JIT 侧折叠（参数代入后对保留定义折叠 → 烙提取时刻值），
+   转声明后该读必然活到 StructFieldPass 从活内存代入。
+
+**测试**：lit `ejit-externalize-const-globals.ll`（形态断言 `external dso_local
+constant`、会计 `{35,3,0,0}`、别名 dissolve、MOD-NOT 钉 ctor 路径跳过 period）；
+板端 `ejit_test/baremetal/ejit_rodata_ref_test.c`（const period 数组
+`g_ro_const_cells` + 探针 `jit_ro_const_val`：dump 模块 IR 为外部声明、会计
+95B/5、AOT/JIT 双路径值一致、直接调分派 constBodies=1）。函数外化的姊妹机制
+（阈值 16 指令）见 EJIT_BITCODE_SLIMMING.md。
+
 ---
 
 ## 4. 输出 IR 变化
@@ -447,6 +524,12 @@ EJitPeriodHandlerPass    (晚期: 生命周期处理)
 ; 3. bitcode 全局变量正确创建
 ; 4. 注册函数正确生成
 ; 5. 外部函数声明被保留
+;
+; 全局外化（§3.7）: ejit-externalize-const-globals.ll
+; 6. const 定义（含 const period 数组）转 external 声明，原名/metadata/dso_local 保留
+; 7. 内部全局改名为 ejit_static.* 键；period 保持原名
+; 8. 体积会计 !ejit.rodata_extern 与 kept/extern 分账正确
+; 9. 指向被外化全局的别名 dissolve
 ```
 
 ### 8.2 验证点

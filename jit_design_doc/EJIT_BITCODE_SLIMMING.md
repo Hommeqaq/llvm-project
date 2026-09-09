@@ -15,6 +15,7 @@ PASS1(`EJitRegisterBitcodePass`)按**传递闭包**提取:从所有 `ejit_entry`
 
 - **preopt cleanup + 内联**(commit `0ffe768af503`):inliner 之前加 frontend-cleanup round,使小函数/inlinehint helper 内联进 entry,其 standalone 定义被 GlobalDCE 删除——已消化掉一部分闭包
 - **`-finline-hint-functions`**(团队即将在场景构建中开启):未标 `inline` 的函数被前端加 `noinline`,两个管线的 inliner 都不内联它们 → preopt 后**幸存者集合变大且由源码标注完全确定**,这是本方案的主要处理对象
+- **全局变量外化**(PR216 + 043b5c0,姊妹机制):提取位码中所有幸存的全局定义(含 const period 数组)转外部声明、按注册键解析到 AOT 原件,JIT 对象不携带数据副本——与本文的函数外化共用"声明+注册解析"骨架;所有权规则全文见 PASS1_EJitRegisterBitcode.md §3.7
 
 关键约束(决定方案形态):
 
