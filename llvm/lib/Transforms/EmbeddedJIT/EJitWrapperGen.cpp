@@ -97,6 +97,28 @@ static cl::opt<bool> EJitInlineCache(
              "cached specialization pointer) before the taskpool "
              "compile_or_get call in ejit_entry wrappers"));
 
+// Collapse the per-function @__ejit_icache_fn_<name> table to ONE scalar cell
+// (the 0-dim shape) regardless of how many ejit_dim params the entry marks:
+// the global is a plain ptr, the probe is a single load with no GEP, and the
+// slot registers as numDims == 0 -- while MissFn still resolves through the
+// taskpool with the REAL dim count, so specialization identity, lifecycle
+// retirement, and drain semantics are unchanged.
+//
+// CONTRACT (deployment, not checkable here): all marked dims share ONE value
+// per run, and a value change happens only across a process/board boundary or
+// a lifecycle activate/deactivate -- which drains the cell, so the next probe
+// re-resolves. A same-process bare value switch (no boundary, no toggle)
+// serves the stale specialization: WRONG CODE, silently. No effect without
+// -ejit-inline-cache; 0-dim entries are byte-identical either way.
+static cl::opt<bool> EJitIcacheSingleSlot(
+    "ejit-icache-single-slot", cl::init(false), cl::Hidden,
+    cl::desc("Collapse the per-function inline-cache table to ONE scalar cell "
+             "regardless of marked ejit_dim params (registers as numDims=0). "
+             "Requires -ejit-inline-cache. Contract: all marked dims share one "
+             "value per run and change only across process/board boundaries "
+             "or a lifecycle activate/deactivate (which drains); a "
+             "same-process value switch then serves a stale specialization"));
+
 // Section for the per-function @__ejit_icache_fn_<name> cell table. In the
 // inter-core SHARED section (.mc_shared, where the taskpool state blob also
 // lives) the table is ONE object every core reads, so a deactivate zeroes a
@@ -307,12 +329,14 @@ static GlobalVariable *getOrCreateFuncIndexGlobal(Module &M,
       ConstantInt::get(I32Ty, kEJitInvalidFuncIndex), GVName);
 }
 
-// A per-function inline-cache global plus its dimensionality (number of
-// ejit_dim params). The runtime needs NumDims to linearize the [D]^NumDims
-// array on fill, and the hit-path emitter needs it to build the GEP. The
-// slot's sentinel (when the table is defined pre-filled with &MissFn) is
-// derived from the table's initializer at registration-emission time, so no
-// bookkeeping is kept here.
+// A per-function inline-cache global plus the TABLE's dimensionality. The
+// runtime needs NumDims to linearize the [D]^NumDims array on fill, and the
+// hit-path emitter needs it to build the GEP. Normally the number of
+// ejit_dim params; -ejit-icache-single-slot collapses it to 0 (the scalar
+// cell), in which case the wrapper's MissFn still resolves with the REAL dim
+// count. The slot's sentinel (when the table is defined pre-filled with
+// &MissFn) is derived from the table's initializer at registration-emission
+// time, so no bookkeeping is kept here.
 struct IcacheSlotInfo {
   GlobalVariable *GV = nullptr;
   unsigned NumDims = 0;
@@ -331,7 +355,9 @@ struct IcacheSlotInfo {
 //
 // Multi-version: the global is a [D]^NumDims array (D = EJIT_ICACHE_DIM_SIZE,
 // power-of-2) indexed by the ejit_dim argument values, so each dim identity
-// gets its own cell. NumDims=0 is a scalar ptr (one cell).
+// gets its own cell. NumDims=0 is a scalar ptr (one cell): a 0-dim entry, or a
+// single-slot-mode function (-ejit-icache-single-slot) whose marked dims share
+// one value per run, so one cached specialization is all it ever needs.
 static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
                                                  StringRef FuncName,
                                                  unsigned NumDims) {
@@ -473,6 +499,10 @@ emitIcacheSlotRegistration(Module &M,
   // void ejit_register_icache_slot(const char *name, void *slot, uint32_t numDims,
   //                                void *missFn)
   // numDims tells the runtime the [D]^numDims shape so icacheFill can linearize.
+  // numDims=0 (a 0-dim entry, or -ejit-icache-single-slot collapsing the
+  // table to one cell while MissFn resolves with the real dim count) names a
+  // scalar slot: icacheFill writes cell 0 for any dim tuple, and the runtime's
+  // cross-core scalar gate applies.
   // missFn is non-null exactly for sentinel-form slots: the runtime writes it
   // back into the cells on drain / fill-retract so the branchless probe never
   // BLRs 0. Null for guarded (3D/4D, timing) slots, whose drain value stays 0.
@@ -693,9 +723,19 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // compile error, so this just avoids emitting a wasteful [D]^N global.
       if (NumDims > EJIT_ICACHE_MAX_DIMS)
         continue;
+      // Single-slot mode collapses the table dimensionality to 0: the global
+      // is a scalar ptr and the slot registers as numDims == 0, while the
+      // probe, the Sentinelize decision, and the registration emission below
+      // all key on this map value and so follow automatically. The REAL dim
+      // count stays in PeriodInds/DimCount (wrap loop) for MissFn's
+      // compile_or_get, keeping specialization identity and lifecycle
+      // retirement unchanged. Store the TABLE's dimensionality only -- keeping
+      // the real NumDims here with a separate "scalar" bit would need the
+      // same conditional at every use site and risk a GEP into the scalar.
+      const unsigned TableDims = EJitIcacheSingleSlot ? 0u : NumDims;
       IcacheSlotInfo Info;
-      Info.GV = getOrCreateIcacheFnGlobal(M, F->getName(), NumDims);
-      Info.NumDims = NumDims;
+      Info.GV = getOrCreateIcacheFnGlobal(M, F->getName(), TableDims);
+      Info.NumDims = TableDims;
       IcacheFnGlobals.emplace(F->getName().str(), Info);
     }
     // The slot registration is emitted AFTER the wrap loop below: it now
@@ -1217,10 +1257,14 @@ PreservedAnalyses EJitWrapperGenPass::run(Module &M,
       // The sentinel initializer is a [D]^NumDims splat of &MissFn: at D=16
       // that is 1/16/256 relocations for 0/1/2 dims, but 4096 and 65536 for
       // 3 and 4 - so 3D/4D keep the zero-init table and the null guard.
-      // Function-body timing is also excluded: it threads an extra wrapper-
-      // begin argument into MissFn (changing its signature away from F's) and
-      // emits trace calls around the specialization call, neither of which
-      // survives a single-block musttail BLR.
+      // NumDims here is the TABLE's dimensionality (the map value), so under
+      // -ejit-icache-single-slot it is 0 for every entry: the sentinel form
+      // then applies to any real dim count (one relocation) and timing still
+      // forces the guarded form. Function-body timing is also excluded: it
+      // threads an extra wrapper-begin argument into MissFn (changing its
+      // signature away from F's) and emits trace calls around the
+      // specialization call, neither of which survives a single-block musttail
+      // BLR.
       const bool Sentinelize = !EJitWrapperTiming && !EJitFunctionBodyTiming &&
                                NumDims <= 2;
       if (!Sentinelize) {
