@@ -129,6 +129,8 @@ static cl::opt<bool> EJitIcacheSingleSlot(
 // resolves to the same virtual address either way, so a per-core table under a
 // cross-core runtime is undetectable. Default comes from the CMake
 // EJIT_ICACHE_SECTION var; the flag lets tests pin a value.
+// -ejit-icache-cluster derives a subsection of this name for the cell tables;
+// see that flag's comment for the contract it adds.
 #ifndef EJIT_ICACHE_SECTION
 #define EJIT_ICACHE_SECTION ""
 #endif
@@ -137,6 +139,49 @@ static cl::opt<std::string> EJitIcacheSection(
     cl::desc("Section for the @__ejit_icache_fn_<name> inline-cache cell "
              "table. Must name the inter-core SHARED section on a multi-core "
              "target; empty leaves the table in per-core .bss"));
+
+// Substring appended to -ejit-icache-section under -ejit-icache-cluster: the
+// derived default is ".mc_shared.ejit_icache". MUST stay in lockstep with the
+// linker-script KEEP() patterns (ejit_registry.ld and the deployment script)
+// -- the pass cannot verify link-time placement, and a typo on either side
+// degrades the shared cache to per-core with no diagnostic (P2).
+static constexpr StringLiteral EJitIcacheClusterSuffix = ".ejit_icache";
+
+// D-cache analog of -ejit-dispatcher-cluster. When ON (and -ejit-icache-section
+// is non-empty), every per-function @__ejit_icache_fn_<name> cell table is
+// emitted into the DERIVED subsection <ejit-icache-section> + ".ejit_icache"
+// (default ".mc_shared.ejit_icache") instead of the shared section itself: in
+// the embedded shape each TU contributes one cell, so cross-TU grouping must
+// come from the LINKER -- same-named input sections concatenate in link order.
+// The shared section also carries each TU's toggle-written period arrays and
+// the MB-scale taskpool state blob, whose writes evict the probe-hot cell
+// lines; a distinct name concatenates all cells into one contiguous region
+// whose lines hold only cells (read-mostly, so no false sharing: fills are
+// once per specialization and drains write every cell regardless of layout).
+// Per-cell alignment STAYS 8 (a cell never straddles a 64B line and 8 scalar
+// cells pack one line); line-granularity isolation is the linker script's
+// ALIGN(64), exactly as for .text.ejit_dispatch.
+//
+// PLACEMENT IS A LINK-TIME CONTRACT (P2, EJIT_ICACHE_SHARED_TABLE.md): a
+// linker script that does not map the derived name into the inter-core shared
+// region leaves the fragments as orphans (exact-match scripts) or folds them
+// back into the shared section interleaved (a *(.mc_shared*) glob swallows the
+// name) -- either way the cache silently degrades to per-core. The deployment
+// script needs a matching entry (see ejit_registry.ld); verify with readelf/nm
+// after link. No effect when -ejit-icache-section is empty (per-core .bss has
+// no cross-TU grouping and no contract to touch). No effect without
+// -ejit-inline-cache. Doubling the suffix (a section already ending in
+// ".ejit_icache") is harmless and left undiagnosed.
+static cl::opt<bool> EJitIcacheCluster(
+    "ejit-icache-cluster", cl::init(false), cl::Hidden,
+    cl::desc("Cluster the per-function inline-cache cell tables into the "
+             "derived '<section>.ejit_icache' subsection (default "
+             "'.mc_shared.ejit_icache') so the linker concatenates them into "
+             "one D-cache-contiguous region away from the toggle-written "
+             "period arrays. Requires -ejit-inline-cache and a non-empty "
+             "-ejit-icache-section; the deployment linker script must map "
+             "the derived name into the inter-core shared region (P2): an "
+             "unmapped name degrades the cache to per-core, silently"));
 
 // When the inline-cache probe is enabled, put the frame-less dispatcher
 // (probe + two tail calls, ~16-48 bytes) into a dedicated
@@ -351,7 +396,9 @@ struct IcacheSlotInfo {
 // probe yields the old pointer or 0, never a torn value.
 //
 // Placed in EJitIcacheSection when set - SHARED across cores, partitioned by
-// dim identity so writers never collide.
+// dim identity so writers never collide. Under -ejit-icache-cluster the name
+// is the derived "<section>.ejit_icache" subsection instead, so the linker
+// concatenates all cells into one D-cache-contiguous region.
 //
 // Multi-version: the global is a [D]^NumDims array (D = EJIT_ICACHE_DIM_SIZE,
 // power-of-2) indexed by the ejit_dim argument values, so each dim identity
@@ -379,8 +426,15 @@ static GlobalVariable *getOrCreateIcacheFnGlobal(Module &M,
   auto *GV = new GlobalVariable(M, SlotTy, /*isConstant=*/false,
                                 GlobalValue::InternalLinkage, Init, GVName);
   GV->setAlignment(Align(8));
-  if (!EJitIcacheSection.empty())
-    GV->setSection(EJitIcacheSection);
+  if (!EJitIcacheSection.empty()) {
+    // Cluster mode derives the input-section name so same-named fragments
+    // concatenate across TUs at link time; the name is the ONLY change --
+    // type, initializer, alignment, probe and registration are untouched.
+    std::string Section = EJitIcacheSection;
+    if (EJitIcacheCluster)
+      Section += EJitIcacheClusterSuffix;
+    GV->setSection(Section);
+  }
   return GV;
 }
 

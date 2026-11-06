@@ -17,6 +17,17 @@
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-single-slot -ejit-icache-section= -S %s | FileCheck %s --check-prefix=SINGLE
 ; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-single-slot -ejit-icache-section= -ejit-wrapper-timing -S %s | FileCheck %s --check-prefix=TIMING
 ; RUN: opt -passes=ejit-wrapper-gen,ejit-wrapper-gen -ejit-inline-cache -ejit-icache-single-slot -ejit-icache-section= -S %s | FileCheck %s --check-prefix=IDEM
+; --- single-slot x cluster: every table is an 8B scalar, so the derived
+;     cluster region packs EIGHT cells per 64B line -- the best-case shape. ---
+; RUN: opt -passes=ejit-wrapper-gen -ejit-inline-cache -ejit-icache-single-slot -ejit-icache-section=.mc_shared -ejit-icache-cluster -S %s | FileCheck %s --check-prefix=CLUSTER
+
+; CLUSTER-DAG: @__ejit_icache_fn_zero_dim_entry = internal global ptr @zero_dim_entry_miss, section ".mc_shared.ejit_icache", align 8
+; CLUSTER-DAG: @__ejit_icache_fn_one_dim_entry = internal global ptr @one_dim_entry_miss, section ".mc_shared.ejit_icache", align 8
+; CLUSTER-DAG: @__ejit_icache_fn_three_dim_entry = internal global ptr @three_dim_entry_miss, section ".mc_shared.ejit_icache", align 8
+; CLUSTER-LABEL: define i32 @three_dim_entry(
+; CLUSTER-NOT: getelementptr
+; CLUSTER: load atomic ptr, ptr @__ejit_icache_fn_three_dim_entry monotonic, align 8
+; CLUSTER: musttail call {{.*}} %ejit_ic_fn
 
 ; --- Cell tables: scalar for EVERY entry, each defined pre-filled with its
 ;     own &MissFn (one cell, so the sentinel splat is always affordable --
