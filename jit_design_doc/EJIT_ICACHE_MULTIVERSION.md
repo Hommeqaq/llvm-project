@@ -247,6 +247,7 @@ present period values. Under NO_RECLAIM the cached fnPtr never dangles.
 | Flag / define | Default | Effect |
 |---|---|---|
 | `-ejit-inline-cache` (AOT cl::opt) | off | emit the multi-version probe |
+| `-ejit-icache-cluster` (AOT cl::opt) | off | emit the cell tables into the derived `<section>.ejit_icache` subsection so the linker concatenates them into one D-cache-contiguous region (see EJIT_ICACHE_SHARED_TABLE.md §3.1/§4); needs a matching deployment-script entry (P2); no-op with an empty section |
 | `EJIT_ICACHE_DIM_SIZE` (CMake -> `#define` on both LLVMEmbeddedJIT + LLVMEJIT) | 16 (power-of-2) | uniform per-dim bound D |
 | `EJIT_ICACHE_MAX_DIMS` (header `#define`) | 4 | max cached dims; >N -> compile error |
 | `EJIT_ICACHE_FUNC_SLOTS` | 64 | registration table size (unchanged) |
@@ -481,6 +482,13 @@ mismatched fills are declined (today's shape-mismatch rule), the cell stays
 at its sentinel, and MissFn + taskpool serve correct results with no icache
 speedup -- a graceful degradation, not a hazard. New runtime + old AOT: the
 relaxed path is unreachable.
+
+Clustering composes: `-ejit-icache-cluster` moves the scalar cells into the
+derived `<section>.ejit_icache` region (EJIT_ICACHE_SHARED_TABLE.md §3.1), and
+the 8B cells pack EIGHT per 64B line -- an image-wide cell region of a few
+lines, fetched once and resident, with the script's `ALIGN(64)` making the
+line isolation exact. The two flags are otherwise decoupled: single-slot sets
+the table's shape, cluster sets only its section name.
 
 Future (out of scope here):
 - Witness-checked slot (`{fn, witness}` cell + all-equal probe check) restores
