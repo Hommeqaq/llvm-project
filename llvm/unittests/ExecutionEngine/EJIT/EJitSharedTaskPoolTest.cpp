@@ -5775,6 +5775,58 @@ TEST_F(SharedTaskPoolTest, SharedPgoInlineCacheRequiresExactTier2Identity) {
   ejitIcacheClearAll();
 }
 
+// SINGLE-SLOT x PGO composition: the slot registers numDims == 0 while the
+// wrapper still resolves with the REAL dim count. The PGO fill gate
+// (isPublishedTier2) keys on the caller's real tuple and never on the
+// registered shape, so the composed flow must hold: a Tier-1 pointer from a
+// 3-dims resolve must NOT fill the scalar cell, and the published Tier-2 for
+// that same tuple must. Covers the mismatched caller-vs-registered shape the
+// two tests above leave unpinned (both register matching shapes).
+TEST_F(SharedTaskPoolTest, SharedPgoSingleSlotWaitsForTier2FromDimResolve) {
+  ejitIcacheClearAll();
+  EJitSharedTaskPool pool;
+  bringUpOwner(pool);
+  EJitCoreId::setCurrentForTest(0);
+  constexpr uint32_t kFunc = 5;
+  // Scalar slot (single-slot shape) + a canary word the fill must not touch.
+  uintptr_t cells[2] = {testSentinel(), 0};
+  ejitIcacheRegisterSlot(kFunc, &cells[0], 0, testSentinelPtr());
+  pool.setPgoEnabled(true, 1);
+  pool.setInstanceEnabled(1, 1, true);
+  EJitDimPair d3[3] = {dim(1, 1), dim(1, 1), dim(1, 1)};
+
+  // Tier-1 (instrumented) publishes; its 3-dims resolve must NOT fill the
+  // scalar cell while PGO is training.
+  ASSERT_EQ(pool.compileOrGet(kFunc, d3, 3, codeFor(kFunc)).status,
+            EJitCompileOrGetStatus::EnqueuedPending);
+  ASSERT_TRUE(pool.pollOne());
+  auto tier1 = pool.tryCacheHit3D(kFunc, 1, 1, 1, 1, 1, 1);
+  ASSERT_EQ(tier1.status, EJitCompileOrGetStatus::CacheHit);
+  pool.icacheFill(kFunc, tier1.fnPtr, d3, 3, pool.icacheBeginResolve());
+  EXPECT_EQ(cells[0], testSentinel())
+      << "a Tier-1 pointer must not fill the scalar cell from a 3-dims resolve";
+  EXPECT_EQ(cells[1], 0u);
+  if (tier1.hasReadToken)
+    pool.releaseRead(tier1.bucketIndex);
+
+  // Tier-2 publishes for the SAME tuple; the next resolve's fill passes the
+  // gate and writes cell 0 (registered numDims 0, caller dims 3).
+  ASSERT_TRUE(pool.pollOne());
+  auto tier2 = pool.tryCacheHit3D(kFunc, 1, 1, 1, 1, 1, 1);
+  ASSERT_EQ(tier2.status, EJitCompileOrGetStatus::CacheHit);
+  pool.icacheFill(kFunc, tier2.fnPtr, d3, 3, pool.icacheBeginResolve());
+  EXPECT_EQ(cells[0], reinterpret_cast<uintptr_t>(tier2.fnPtr));
+  EXPECT_EQ(cells[1], 0u) << "the fill must not walk past the scalar cell";
+  EXPECT_NE(tier2.fnPtr, tier1.fnPtr);
+  if (tier2.hasReadToken)
+    pool.releaseRead(tier2.bucketIndex);
+
+  void *out = nullptr;
+  EXPECT_TRUE(pool.icacheTry(kFunc, d3, 3, &out));
+  EXPECT_EQ(out, tier2.fnPtr);
+  ejitIcacheClearAll();
+}
+
 // Shared equivalent of EJitTaskPoolTest::PgoHitThresholdArmsTier2Recompile.
 // Set PGO threshold=3, publish Tier-1, hit it twice (below threshold), then
 // the third hit crosses the threshold -> Tier-2 request enqueued.
