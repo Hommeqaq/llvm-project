@@ -22,13 +22,19 @@ Inline Cache 把该指针直接缓存在每函数的全局变量里：命中路�
 行为，输出等价于未开启。
 
 > **平台前提（重要，先读）**：单槽模式的"命中加速"要求平台满足
-> `icacheCrossCoreExecutable`——即 **4K-seal 形态**。在"逐核准备执行权限"的
-> 平台（legacy 2MiB seal：运行时接线 prepareCodeFn_，host 构建即此形态），
-> **标量槽一律不发布**（正确性门：共享标量任何核都会读，未密封的指针会让
-> 他核跳到未准备页）。此时单槽表现为：特化照常发生、结果正确，但每次调用
-> 都走 taskpool 慢路径并叠加探测开销——**比不开单槽的基础 icache 更慢**
-> （维表槽不受该门约束、照常直达）。因此 host / 非 4K-seal 平台不要开启单槽
-> 做性能评测；单槽部署以 4K-seal 板为前提。聚类开关不受此门影响。
+> `icacheCrossCoreExecutable`——即 **4K-seal 形态**。其生效条件是构建同时开启
+> `EJIT_SRE_CODE_POOL=ON` 与 `EJIT_CODE_POOL_4K_SEAL=ON`（**只开后者无效**：
+> CMake 仅在两者同开时才把 define 传给 LLVMEJIT；host 预设默认
+> `EJIT_SRE_CODE_POOL=OFF`，缓存里的 `4K_SEAL=ON` 因此空转，驱动实际接线
+> legacy 逐核 prepareCodeFn_）。在"逐核准备执行权限"的平台，**标量槽一律不
+> 发布**（正确性门：共享标量任何核都会读，未密封的指针会让他核跳到未准备
+> 页）。此时单槽表现为：特化照常发生、结果正确，但每次调用都走 taskpool
+> 慢路径并叠加探测开销——**比不开单槽的基础 icache 更慢**（维表槽不受该门
+> 约束、照常直达）。因此 host / 非 4K-seal 平台不要开启单槽做性能评测；单槽
+> 部署以 4K-seal 板为前提（板侧 aarch64_be 预设两者皆 ON）。聚类开关不受此
+> 门影响。**一行判别法**：诊断开启时看运行日志有无
+> `icacheFill DECLINE ... scalar slot shares one cell across cores`——出现即
+> 该平台不发布标量槽。
 
 ## 2. 使用步骤
 
