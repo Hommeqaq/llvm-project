@@ -415,6 +415,10 @@ void ejit_print_period_const_ranking(void);
 /// New code should use ejit_print_period_const_ranking().
 void ejit_print_mayconst_ranking(void);
 
+/// Queue a summary on the designated shared worker's idle loop. Debug builds
+/// with worker substitution verification only; call from the worker core.
+ejit_status_t ejit_worker_verify_dump(void);
+
 /// Print the currently-active time-window instances through the platform log:
 /// for each registered period, every active (period, cell) is listed. Works
 /// across builds (queries the same isActive() path the JIT gate uses: the

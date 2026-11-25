@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace llvm {
@@ -517,6 +518,19 @@ public:
     periodConstRankingFn_ = fn;
     periodConstRankingCtx_ = ctx;
   }
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+  using WorkerVerifyCallback = void (*)(void *, bool);
+  void setWorkerVerifyCallbacks(CompileCallback Compile, WorkerVerifyCallback Fn,
+                                void *Ctx) {
+    workerVerifyCompileFn_ = Compile;
+    workerVerifyFn_ = Fn;
+    workerVerifyCtx_ = Ctx;
+  }
+  bool requestWorkerVerifyDump();
+  /// nullopt means the cache identity could not be snapshotted this time.
+  std::optional<bool> workerVerifyLive(const EJitCompileRequest &Req,
+                                       uintptr_t Fn) const;
+#endif
   void setReleaser(ReleaseCallback fn, void *ctx) {
     releaseFn_ = fn;
     releaseCtx_ = ctx;
@@ -1315,6 +1329,12 @@ private:
   void *codePoolStatsCtx_ = nullptr;
   PeriodConstRankingCallback periodConstRankingFn_ = nullptr;
   void *periodConstRankingCtx_ = nullptr;
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+  CompileCallback workerVerifyCompileFn_ = nullptr;
+  WorkerVerifyCallback workerVerifyFn_ = nullptr;
+  void *workerVerifyCtx_ = nullptr;
+  EJitAtomicU32 workerVerifyDump_{};
+#endif
   CodeReadyCallback codeReadyFn_ = nullptr;
   CodeBatchFlushCallback codeBatchFlushFn_ = nullptr;
   void *codeBatchCtx_ = nullptr;

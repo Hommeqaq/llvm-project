@@ -19,6 +19,7 @@ OPTIONAL_APIS = (
     "ejit_print_dumped_module",
     "ejit_print_period_const_ranking",
     "ejit_print_mayconst_ranking",
+    "ejit_worker_verify_dump",
     "ejit_vp_get_stats",
 )
 RETIRED_APIS = (

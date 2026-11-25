@@ -944,6 +944,18 @@ endif()
 #   -DEJIT_SHARED_SECTION_ATTR=__attribute__((section(\".ejit_shared\")))
 set(EJIT_SHARED_SECTION_ATTR "" CACHE STRING
   "Attribute placing the shared taskpool state into inter-core shared memory")
+option(EJIT_WORKER_VERIFY_SUBSTITUTION
+  "Check selected live period_const substitutions on the shared worker" OFF)
+set(EJIT_WORKER_VERIFY_PERIOD "" CACHE STRING
+  "Name of a shared, resident period to check on the worker")
+if(EJIT_WORKER_VERIFY_SUBSTITUTION)
+  if(NOT EJIT_DIAG_ENABLE OR
+     NOT EJIT_WORKER_VERIFY_PERIOD MATCHES "^[A-Za-z0-9_.-]+$")
+    message(FATAL_ERROR
+      "Worker verification requires diagnostics, and a named shared EJIT_WORKER_VERIFY_PERIOD")
+  endif()
+  add_definitions(-DEJIT_WORKER_VERIFY_SUBSTITUTION)
+endif()
 # FUNC_SLOTS is the gIcacheSlots[] capacity; any funcIndex >= FUNC_SLOTS has
 # its icacheFill silently dropped and the wrapper's inline probe misses
 # forever (every call falls through to MissFn -> tryCacheHit -> cacheHits++).
