@@ -13,7 +13,7 @@
 
 ## 1. Problem
 
-The probe is four instructions inside `ejit_entry`, so it **cannot ask whether
+The probe is four instructions inside `EJIT_ENTRY`, so it **cannot ask whether
 the cell is still valid** without ceasing to be four instructions. Invalidation
 has to happen *to the cell*, from outside.
 
@@ -144,7 +144,7 @@ The retire also saturates at zero.
 **P1 — cores drive disjoint dim identities.** Assumed, not enforced, and the real
 cost of this design. The cell index is the dim identity, not the core id, so
 "partitioned by core" holds only insofar as the application gives each core its
-own `ejit_period_lc` instance indices.
+own `ejit_guard` instance indices.
 
 If it holds, no core ever *reads* a cell another core filled: every pointer it
 loads is one it put there after resolving through the taskpool, which is where it
@@ -157,8 +157,8 @@ second core branches into a page it never sealed.
 Nothing in the runtime can check it: a cell carries no record of which core wrote
 it, and adding one puts a per-core gate back on the probe.
 
-> **Contract:** each core drives its own `ejit_period_lc` instance indices, and
-> no two cores call one `ejit_entry` with the same `ejit_dim` values.
+> **Contract:** each core drives its own `ejit_guard` instance indices, and
+> no two cores call one `EJIT_ENTRY` with the same `ejit_dim` values.
 
 **P1a — the 0-dim exception, which IS enforced.** An entry with no `ejit_dim`
 params has one cell and no identity to partition it by, so P1 cannot cover it:
@@ -193,7 +193,7 @@ probe requires, so the gate was closed in every build the cache was allowed in.
 **P2 — placement must match the deployment.** `EJIT_ICACHE_SECTION` must name an
 inter-core shared section. This is a link-time contract with no runtime check: the
 symbol resolves to the same address either way, so the mistake is undetectable
-from code. CMake warns when `EJIT_SRE_SHARED_TASKPOOL + EJIT_FREESTANDING` is
+from code. CMake warns when `EJIT_FREESTANDING` is
 configured with an empty section. See §8.
 
 **P3 — `ejit_dim` values stay in `[0, D)`.** The accepted ranges never agreed: the
@@ -304,13 +304,11 @@ objdump -d image.elf --disassemble=<entry> | head -8   # adrp/add/ldr/cbz/br, no
 The linked-address check is the one the code cannot do for you: land outside the
 shared window and the cache silently degrades to per-core.
 
-At run time, `-mllvm -ejit-wrapper-timing` prints one line per 100000 icache hits
-(`status=254` is the hit sentinel); or watch `ejit_print_stats` — once warm,
-`cacheHits` stops growing while the application keeps calling.
+Use the board profiler for hit-path cost. Runtime lookup counters do not count direct wrapper hits.
 
 To prove it is *shared* rather than merely warm (a per-core table hits too):
 warm a cell on core A, toggle `ejit_deactivate`/`ejit_activate` on **core B only**,
-then re-read core A's cell — it must be 0, and core A must take exactly one extra
+then re-read the cell: guarded tables return to null, sentinel tables to the miss function.
 miss. Comparing `&__ejit_icache_fn_foo` across cores proves nothing: per-core
 `.bss` at the same virtual address gives equal pointers to different storage.
 

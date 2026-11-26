@@ -1,5 +1,7 @@
 # EJIT function-body and wrapper cycle timing
 
+> Historical design only. These compiler flags and recorder APIs were removed in #268. Rebuild old instrumented objects; the online PGO audit is separate.
+
 This diagnostic mode compares executed AOT and JIT bodies and reports the
 enclosing wrapper cost from the same invocation. The body interval excludes
 taskpool lookup, inline-cache probing, dispatch, read-token release, and timing
@@ -9,7 +11,7 @@ wrapper's entry through read-token release, but still excludes aggregation.
 ## Build
 
 Pass the hidden AOT option when compiling translation units that contain
-`ejit_entry` functions:
+`EJIT_ENTRY` functions:
 
 ```text
 -mllvm -ejit-function-body-timing

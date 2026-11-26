@@ -12,21 +12,20 @@
 #ifndef __has_attribute
 #define __has_attribute(x) 0
 #endif
-#if !__has_attribute(ejit_entry) || !__has_attribute(ejit_dim) || \
+#if !__has_attribute(EJIT_ENTRY) || !__has_attribute(ejit_dim) || \
     !__has_attribute(ejit_period_const) || \
-    !__has_attribute(ejit_in_period_array) || !__has_attribute(ejit_free_dim)
+    !__has_attribute(ejit_group) || !__has_attribute(EJIT_FREE_DIM)
 #error "Use the matching EJIT Clang; unknown attributes are not a valid demo"
 #endif
 #ifdef EJIT_DISABLE
 #error "This demo requires real EJIT annotations and generated wrappers"
 #endif
-#if !defined(EJIT_SRE_SHARED_TASKPOOL) || \
-    !defined(EJIT_SRE_PGO_BRANCH_AUDIT) || !defined(EJIT_DIAG_ENABLE)
+#if !defined(EJIT_SRE_PGO_BRANCH_AUDIT) || !defined(EJIT_DIAG_ENABLE)
 #error "Build demo and runtime with shared taskpool, branch audit and diagnostics"
 #endif
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 
-_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 56 &&
+_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 24 &&
                sizeof(ejit_taskpool_stats_t) == 88,
                "Use the matching 64-bit spec5 public runtime header");
 extern void SRE_printf(const char *, ...);
@@ -45,11 +44,11 @@ extern uint8_t g_ucLocalCoreID;
 #define LFD_PHASES 3u
 
 struct LocalSlot {
-  ejit_may_const uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t mode;
   uint32_t payload;
 };
 struct LocalCell { struct LocalSlot slots[LFD_SLOTS]; };
-LFD_SHARED ejit_period_arr(cell) struct LocalCell g_local_free_cells[2];
+LFD_SHARED EJIT_GROUP(cell) struct LocalCell g_local_free_cells[2];
 LFD_SHARED volatile struct { uint32_t slot; } g_local_free_runtime;
 LFD_SHARED volatile uint32_t g_local_free_initializer_calls;
 
@@ -58,9 +57,9 @@ static __attribute__((always_inline)) unsigned next_local_slot(void) {
   return g_local_free_runtime.slot;
 }
 
-ejit_entry uint32_t
-local_free_work(ejit_period_arr_ind(cell) uint32_t cell) {
-  const size_t offset ejit_free_dim =
+EJIT_ENTRY uint32_t
+local_free_work(EJIT_DIM(cell) uint32_t cell) {
+  const size_t offset EJIT_FREE_DIM =
       (size_t)next_local_slot() * sizeof(struct LocalSlot);
   const struct LocalSlot *p = (const struct LocalSlot *)(
       (const char *)&g_local_free_cells[cell].slots[0] + offset);
@@ -288,7 +287,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = cfg.forceStaticRegistry = true;
+  cfg.forceStaticRegistry = true;
   if (ejit_init_pgo(&cfg) != EJIT_OK)
     return lfd_fail("normal online PGO initialization failed");
   if (ejit_taskpool_get_worker_core() != 6u)

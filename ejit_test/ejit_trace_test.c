@@ -25,34 +25,34 @@
 //===-- EJIT 属性 -----------------------------------------------------------===//
 
 struct BoardConfig {
-    ejit_may_const uint32_t boardType;
+    EJIT_PERIOD_CONST uint32_t boardType;
     uint32_t xx;
 };
 
 struct CellConfig {
-    ejit_may_const uint32_t cellType;
-    ejit_may_const uint32_t cellId;
+    EJIT_PERIOD_CONST uint32_t cellType;
+    EJIT_PERIOD_CONST uint32_t cellId;
     uint32_t trafficLoad;
 };
 
 struct TrpConfig {
-    ejit_may_const uint32_t trpType;
+    EJIT_PERIOD_CONST uint32_t trpType;
     uint32_t status;
 };
 
 //===-- 全局变量 -------------------------------------------------------------===//
 
-ejit_period(static) struct BoardConfig g_boardCfg;
+EJIT_GROUP(static) struct BoardConfig g_boardCfg;
 
 #define N_CELL 16
-ejit_period_arr(cell) struct CellConfig g_cellCfg[N_CELL];
+EJIT_GROUP(cell) struct CellConfig g_cellCfg[N_CELL];
 
 #define M_TRP 8
-ejit_period_arr(trp) struct TrpConfig g_trpCfg[M_TRP];
+EJIT_GROUP(trp) struct TrpConfig g_trpCfg[M_TRP];
 
 //===-- 场景 1: 仅 static 时间窗 ----------------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_board(void)
 {
     if (g_boardCfg.boardType == 0x01) {
@@ -64,9 +64,9 @@ void process_board(void)
 
 //===-- 场景 2: static + cell -----------------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_cell(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
     if (g_cellCfg[cellIdx].cellType == 0xFD) {
         g_cellCfg[cellIdx].trafficLoad += 5;
@@ -75,9 +75,9 @@ void process_cell(
     }
 }
 
-ejit_period_lc(cell)
+EJIT_GUARD(cell)
 void update_cell_config(
-    ejit_period_arr_ind(cell) uint8_t cellIdx)
+    EJIT_DIM(cell) uint8_t cellIdx)
 {
     g_cellCfg[cellIdx].cellType = 0xFD;
     g_cellCfg[cellIdx].cellId   = 42;
@@ -85,10 +85,10 @@ void update_cell_config(
 
 //===-- 场景 3: static + cell + trp -----------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 void process_trp_task(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx)
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx)
 {
     uint32_t cell_t = g_cellCfg[cellIdx].cellType;
     uint32_t trp_t  = g_trpCfg[trpIdx].trpType;
@@ -99,11 +99,11 @@ void process_trp_task(
     }
 }
 
-ejit_period_lc(cell)
-ejit_period_lc(trp)
+EJIT_GUARD(cell)
+EJIT_GUARD(trp)
 void update_all_config(
-    ejit_period_arr_ind(cell) uint8_t cellIdx,
-    ejit_period_arr_ind(trp)  uint8_t trpIdx)
+    EJIT_DIM(cell) uint8_t cellIdx,
+    EJIT_DIM(trp)  uint8_t trpIdx)
 {
     g_cellCfg[cellIdx].cellType = 0xEC;
     g_trpCfg[trpIdx].trpType   = 2;
@@ -158,8 +158,8 @@ int main(int argc, char **argv)
     printf("    ejit_activate(\"trp\", %u)  => %d, is_active=%d\n\n",
            ti, rc, ejit_is_active("trp", ti));
 
-    // --- 4. 调用 ejit_entry 函数 (JIT dispatch) ---
-    printf("[4] 调用 ejit_entry 函数 (首次触发 JIT dispatch)...\n");
+    // --- 4. 调用 EJIT_ENTRY 函数 (JIT dispatch) ---
+    printf("[4] 调用 EJIT_ENTRY 函数 (首次触发 JIT dispatch)...\n");
 
     printf("    process_board()...\n");
     process_board();
@@ -203,7 +203,6 @@ int main(int argc, char **argv)
 
     // Verify the async path actually compiled (not silent AOT fallback).
     ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     {
         ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
         ejit_taskpool_get_stats(&ts);
@@ -211,7 +210,6 @@ int main(int argc, char **argv)
             printf("FAIL: async path produced no compiles (silent AOT)\n");
         }
     }
-#endif
 
     // --- 7. 关闭 ---
     printf("[8] ejit_shutdown...\n");

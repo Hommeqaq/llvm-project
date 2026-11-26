@@ -33,26 +33,26 @@ Integration tests for the EmbeddedJIT JIT compilation system.
 | `ejit_complex_test` | 4-dimension, multi-array, external cellIdx, early-return |
 | `ejit_config_api_test` | Config, stats, cache, compile-mode API validation |
 | `ejit_external_idx_test` | External cellIdx with multi-dim arrays |
-| `ejit_inline_asm_test` | AArch64 inline asm inside an `ejit_entry` function |
+| `ejit_inline_asm_test` | AArch64 inline asm inside an `EJIT_ENTRY` function |
 | `ejit_jit_verify_test` | JIT correctness: constant folding, dead branch elimination |
-| `ejit_lifecycle_test` | ejit_period_lc: deactivate/activate pairing |
+| `ejit_lifecycle_test` | ejit_guard: deactivate/activate pairing |
 | `ejit_multidim_test` | 2D multi-dim array with external cellIdx |
-| `ejit_multi_tu_test` | Two TUs each with ejit_entry + period globals, linked together (registry no-duplicate-symbol regression) |
+| `ejit_multi_tu_test` | Two TUs each with EJIT_ENTRY + period globals, linked together (registry no-duplicate-symbol regression) |
 | `ejit_baremetal_link_test` | Bare-metal path: global ctors disabled + custom linker script (`ejit_baremetal.ld`) defining `__start_/__stop_` so the static registry tables drive registration |
 | `ejit_multiversion_test` | Multi-version JIT specialization per cellIdx |
-| `ejit_nested_struct_test` | 2-level and 3-level nested struct may_const |
+| `ejit_nested_struct_test` | 2-level and 3-level nested struct period_const |
 | `ejit_opt_level_test` | L1/L2/L3 optimization level validation |
 | `ejit_perf_bench` | Performance benchmark: JIT compile time, cache hit latency |
-| `ejit_ptr_period_test` | Pointer-type ejit_period_arr and ejit_period (NEW) |
+| `ejit_ptr_period_test` | Pointer-type ejit_group and ejit_group (NEW) |
 | `ejit_trace_test` | Runtime trace: JIT dispatch, fallback, lifecycle hooks |
 
 ### Board-only Multicore Demo
 
-`ejit_bound_ptr_sre_multicore_test.c` provides the SRE `test_ejit_period`
+`ejit_bound_ptr_sre_multicore_test.c` provides the SRE `test_ejit_group`
 entry for validating dimension-bound raw pointers across cores:
 
-1. Core 8 runs `test_ejit_period` to start the shared worker and arm capture.
-2. Core 18 runs `test_ejit_period` to enqueue independent cell 1 (`scale=5`)
+1. Core 8 runs `test_ejit_group` to start the shared worker and arm capture.
+2. Core 18 runs `test_ejit_group` to enqueue independent cell 1 (`scale=5`)
    and cell 2 (`scale=9`) shared objects, then verifies both JIT versions.
 3. Core 8 runs `test_ejit_bound_ptr_print` to print the optimized function.
 
@@ -77,17 +77,17 @@ After compilation, check these LLVM IR features:
 
 | Check | grep command | Expected |
 |-------|-------------|----------|
-| Wrapper jit_entry block | `jit_entry:` | One per ejit_entry function |
+| Wrapper jit_entry block | `jit_entry:` | One per EJIT_ENTRY function |
 | jit_fallback block | `jit_fallback:` | Original function body moved here |
 | jit_dispatch block | `jit_dispatch:` | JIT-compiled function call |
-| ejit_compile_or_get call | `ejit_compile_or_get` | In jit_entry block |
-| may_const metadata | `ejit.may_const` | On marked field load instructions |
-| Function/global metadata | `ejit.metadata` | `!"ejit_entry"` / `!"ejit_period"` / ... |
+| Taskpool dispatch | `ejit_taskpool_compile_or_get` | In the wrapper miss path (generic or bound variant) |
+| period_const metadata | `!ejit.period_const` | On marked field load instructions |
+| Function/global metadata | `ejit.metadata` | `!"ejit_entry"` / `!"ejit_group"` / ... |
 | Bitcode embedding | `ejit.bitcode` | `@__ejit_bitcode` in dedicated section |
 | Auto-registration | `ejit_auto_register` | In `@llvm.global_ctors` |
 | Auto symbol reg | `ejit_register_symbol` | External symbols auto-registered |
-| Lifecycle deactivate | `ejit_deactivate` | At ejit_period_lc function entry |
-| Lifecycle activate | `ejit_activate` | At ejit_period_lc function exits |
+| Lifecycle deactivate | `ejit_deactivate` | At ejit_guard function entry |
+| Lifecycle activate | `ejit_activate` | At ejit_guard function exits |
 
 ## Architecture
 

@@ -24,27 +24,27 @@
 //===-- EJIT 属性 -----------------------------------------------------------===//
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
-  ejit_may_const uint32_t priority;
-  ejit_may_const uint32_t maxPower;
+  EJIT_PERIOD_CONST uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t priority;
+  EJIT_PERIOD_CONST uint32_t maxPower;
   uint32_t result;
 };
 
 #define N 16
-ejit_period_arr(cell) struct CellCfg g_cfg[N];
+EJIT_GROUP(cell) struct CellCfg g_cfg[N];
 
 //===-- JIT entry (简单函数，减少自身计算对测量的干扰) ----------------------===//
 
 // 场景 A: 无维度参数 (仅依赖 static)
-ejit_entry
+EJIT_ENTRY
 uint32_t simple_jit(void) {
   return 42;
 }
 
 // 场景 B: 单维度参数
-ejit_entry
+EJIT_ENTRY
 uint32_t cell_jit(
-    ejit_period_arr_ind(cell) uint8_t ci)
+    EJIT_DIM(cell) uint8_t ci)
 {
   if (g_cfg[ci].cellType == 0xFD) {
     return g_cfg[ci].maxPower * 2;
@@ -54,16 +54,16 @@ uint32_t cell_jit(
 
 // 场景 C: 双维度参数
 struct TrpCfg {
-  ejit_may_const uint32_t trpType;
+  EJIT_PERIOD_CONST uint32_t trpType;
   uint32_t status;
 };
 #define M 8
-ejit_period_arr(trp) struct TrpCfg g_trp[M];
+EJIT_GROUP(trp) struct TrpCfg g_trp[M];
 
-ejit_entry
+EJIT_ENTRY
 uint32_t multi_jit(
-    ejit_period_arr_ind(cell) uint8_t ci,
-    ejit_period_arr_ind(trp)  uint8_t ti)
+    EJIT_DIM(cell) uint8_t ci,
+    EJIT_DIM(trp)  uint8_t ti)
 {
   if (g_cfg[ci].cellType == 0xFD && g_trp[ti].trpType == 1) {
     return g_cfg[ci].maxPower * g_trp[ti].trpType;
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
 
   //=== 2. Fallback: wrapper + not active ===//
   // Explicit precondition: no time window has been activated yet,
-  // so ejit_compile_or_get returns NULL → wrapper falls through to AOT.
+  // so the wrapper falls through to AOT.
   printf("\n--- [2] Fallback: wrapper + not active (%llu iters/batch) ---\n",
          (unsigned long long)ITERS_LARGE);
   if (!ejit_is_active("cell", ci))

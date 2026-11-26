@@ -1,7 +1,7 @@
 /**
  * EJIT AArch64 inline-asm regression test.
  *
- * This covers ejit_entry functions whose IR contains InlineAsm.  On AArch64,
+ * This covers EJIT_ENTRY functions whose IR contains InlineAsm.  On AArch64,
  * ORC codegen must have the AArch64 asm parser initialized, otherwise
  * AsmPrinterInlineAsm reports that inline asm is not supported by the streamer.
  */
@@ -13,12 +13,12 @@
 #include "ejit_test_helpers.h"
 
 struct CellCfg {
-  ejit_may_const uint32_t base;
-  ejit_may_const uint32_t bonus;
+  EJIT_PERIOD_CONST uint32_t base;
+  EJIT_PERIOD_CONST uint32_t bonus;
   uint32_t noise;
 };
 
-ejit_period_arr(cell) struct CellCfg g_cellCfg[4] = {
+EJIT_GROUP(cell) struct CellCfg g_cellCfg[4] = {
     {10, 3, 100},
     {20, 5, 200},
     {30, 7, 300},
@@ -37,7 +37,7 @@ static int g_failures = 0;
     }                                                                          \
   } while (0)
 
-ejit_entry uint32_t inline_asm_add(ejit_period_arr_ind(cell) uint8_t cellIdx,
+EJIT_ENTRY uint32_t inline_asm_add(EJIT_DIM(cell) uint8_t cellIdx,
                                    uint32_t dynamic) {
   uint32_t base = g_cellCfg[cellIdx].base;
   uint32_t bonus = g_cellCfg[cellIdx].bonus;
@@ -76,7 +76,6 @@ int main(void) {
   check_one(0, 11);
   check_one(2, 13);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp;
   memset(&tp, 0, sizeof(tp));
   ejit_taskpool_get_stats(&tp);
@@ -87,16 +86,6 @@ int main(void) {
          (unsigned long long)tp.compileFailed);
   VERIFY(tp.compileFailed == 0, "compileFailed == 0 (actual %llu)",
          (unsigned long long)tp.compileFailed);
-#else
-  ejit_stats_t stats;
-  memset(&stats, 0, sizeof(stats));
-  ejit_get_stats(&stats);
-  printf("\n--- JIT Stats ---\n");
-  printf("  entries=%zu hits=%llu misses=%llu\n", stats.entryCount,
-         (unsigned long long)stats.hits, (unsigned long long)stats.misses);
-  VERIFY(stats.entryCount >= 1, "JIT entries >= 1 (actual %zu)",
-         stats.entryCount);
-#endif
 
   ejit_shutdown();
   printf("\n=== %s (%d failure(s)) ===\n", g_failures ? "FAILED" : "ALL PASSED",

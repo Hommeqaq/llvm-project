@@ -3,7 +3,7 @@
  *
  * 编译时通过 -mllvm -enable-ejit-global-ctors=false 禁用构造器。
  * ejit_init() 从 __ejit_registry_*[] 静态表加载 bitcode 和 period。
- * 验证直接调用 ejit_entry 函数能触发 JIT 编译并返回正确结果。
+ * 验证直接调用 EJIT_ENTRY 函数能触发 JIT 编译并返回正确结果。
  */
 
 #include <stdint.h>
@@ -15,16 +15,16 @@
 #include "ejit_test_helpers.h"
 
 struct CellCfg {
-  ejit_may_const uint32_t cellType;
+  EJIT_PERIOD_CONST uint32_t cellType;
   uint32_t trafficLoad;
 };
 
-ejit_period_arr(cell)
+EJIT_GROUP(cell)
 struct CellCfg g_cellCfg[4] = {{1,100},{2,200},{3,300},{4,400}};
 
-ejit_entry
+EJIT_ENTRY
 uint32_t jit_check_cell_type(
-    ejit_period_arr_ind(cell) uint8_t cellIndex)
+    EJIT_DIM(cell) uint8_t cellIndex)
 {
   if (g_cellCfg[cellIndex].cellType == 1) return 10;
   if (g_cellCfg[cellIndex].cellType == 2) return 20;
@@ -68,7 +68,6 @@ int main(int argc, char **argv) {
 
   // Verify the async path actually compiled (not silent AOT fallback).
   ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   {
     ejit_taskpool_stats_t ts; memset(&ts, 0, sizeof(ts));
     ejit_taskpool_get_stats(&ts);
@@ -77,7 +76,6 @@ int main(int argc, char **argv) {
       failures++;
     }
   }
-#endif
 
   ejit_shutdown();
   printf("OK: ejit_shutdown\n");

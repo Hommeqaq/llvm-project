@@ -20,22 +20,17 @@
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
-typedef unsigned long size_t;
 typedef _Bool bool;
 
 #define true 1
 #define false 0
 
 #define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
-#define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
+#define EJIT_GROUP(x) __attribute__((ejit_group(#x)))
 #define EJIT_DIM(x) __attribute__((ejit_dim(#x)))
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
 #define EJIT_ENTRY __attribute__((ejit_entry))
 
-#define ejit_may_const EJIT_PERIOD_CONST
-#define ejit_period_arr(x) EJIT_IN_PERIOD_ARRAY(x)
-#define ejit_period_arr_ind(x) EJIT_DIM(x)
-#define ejit_entry EJIT_ENTRY
 
 typedef enum {
   EJIT_OK = 0,
@@ -43,7 +38,7 @@ typedef enum {
 } ejit_status_t;
 
 typedef enum {
-  EJIT_COMPILE_SYNC = 0,
+  EJIT_COMPILE_OFF = 2,
   EJIT_COMPILE_ASYNC = 1,
 } ejit_compile_mode_t;
 
@@ -56,14 +51,17 @@ typedef enum {
 typedef struct {
   ejit_compile_mode_t compileMode;
   ejit_opt_level_t optLevel;
-  size_t maxCodeMemory;
-  size_t maxDataMemory;
-  size_t maxCacheEntries;
-  size_t maxCacheSize;
-  bool enableLogger;
   bool forceStaticRegistry;
   const char *dumpJITDir;
 } ejit_config_t;
+
+// Keep this standalone board declaration in step with EJitRuntime.h.
+_Static_assert(sizeof(ejit_config_t) == 24 &&
+               __builtin_offsetof(ejit_config_t, compileMode) == 0 &&
+               __builtin_offsetof(ejit_config_t, optLevel) == 4 &&
+               __builtin_offsetof(ejit_config_t, forceStaticRegistry) == 8 &&
+               __builtin_offsetof(ejit_config_t, dumpJITDir) == 16,
+               "EJIT config ABI mismatch");
 
 typedef struct {
   uint64_t cacheHits;
@@ -118,21 +116,21 @@ enum BoundPtrDemoStage {
 };
 
 struct CellRelated {
-  ejit_may_const uint32_t algorithm;
-  ejit_may_const uint32_t scale;
+  EJIT_PERIOD_CONST uint32_t algorithm;
+  EJIT_PERIOD_CONST uint32_t scale;
   uint32_t runtimeBias;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(cell)
 uint32_t g_bound_cells[8];
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(trp)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(trp)
 uint32_t g_bound_trps[8];
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_bound_ptr_demo_stage;
 EJIT_SHARED_SECTION_ATTR volatile uint64_t g_bound_ptr_demo_sink;
 
-ejit_entry uint32_t
-bound_cell_config_mc(ejit_period_arr_ind(cell) uint8_t cellIndex,
-                     ejit_period_arr_ind(trp) uint8_t trpIndex,
+EJIT_ENTRY uint32_t
+bound_cell_config_mc(EJIT_DIM(cell) uint8_t cellIndex,
+                     EJIT_DIM(trp) uint8_t trpIndex,
                      EJIT_BOUND_PTR(cell) const struct CellRelated *cellRelated,
                      uint32_t input) {
   if (cellRelated->algorithm == 7u)
@@ -346,7 +344,6 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = true;
   cfg.forceStaticRegistry = true;
 
   ejit_status_t rc = ejit_init(&cfg);

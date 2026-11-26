@@ -38,25 +38,25 @@ extern void ejit_shutdown(void);
 //===-- 数据结构 -------------------------------------------------------------===//
 
 struct DevInfo {
-    ejit_may_const uint32_t type;      // 1=BBU, 2=RRU, 3=AAU
-    ejit_may_const uint32_t maxPower;
-    ejit_may_const uint32_t channels;
+    EJIT_PERIOD_CONST uint32_t type;      // 1=BBU, 2=RRU, 3=AAU
+    EJIT_PERIOD_CONST uint32_t maxPower;
+    EJIT_PERIOD_CONST uint32_t channels;
     uint32_t uptime;
 };
 
 struct CarrCfg {
-    ejit_may_const uint32_t freqBand;
-    ejit_may_const uint32_t bandwidth;
-    ejit_may_const bool     mimo;
+    EJIT_PERIOD_CONST uint32_t freqBand;
+    EJIT_PERIOD_CONST uint32_t bandwidth;
+    EJIT_PERIOD_CONST bool     mimo;
     uint32_t txPower;
 };
 
 //===-- 全局变量 -------------------------------------------------------------===//
 
-ejit_period(static) struct DevInfo g_dev;
+EJIT_GROUP(static) struct DevInfo g_dev;
 
 #define N_CARR 8
-ejit_period_arr(carrier) struct CarrCfg g_carr[N_CARR];
+EJIT_GROUP(carrier) struct CarrCfg g_carr[N_CARR];
 
 //===-- always_inline helper (L2 内敛目标) ----------------------------------===//
 
@@ -70,11 +70,11 @@ static inline uint32_t mimo_gain(uint32_t pwr, bool mimo) {
     return mimo ? pwr + 6 : pwr;
 }
 
-//===-- ejit_entry ----------------------------------------------------------===//
+//===-- EJIT_ENTRY ----------------------------------------------------------===//
 
-ejit_entry
+EJIT_ENTRY
 uint32_t process_carr(
-    ejit_period_arr_ind(carrier) uint8_t ci)
+    EJIT_DIM(carrier) uint8_t ci)
 {
     uint32_t r = 0;
 
@@ -128,14 +128,7 @@ int main(int argc, char **argv)
 
     // Init EJIT
     ejit_config_t c; memset(&c,0,sizeof(c));
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-    // Async mode so the shared taskpool worker starts during ejit_init.
     c.compileMode=EJIT_COMPILE_ASYNC; c.optLevel=lv;
-#else
-    c.compileMode=EJIT_COMPILE_SYNC; c.optLevel=lv;
-#endif
-    c.maxCodeMemory=512*1024; c.maxDataMemory=256*1024;
-    c.maxCacheEntries=64; c.maxCacheSize=1024*1024;
     if (ejit_init(&c)!=EJIT_OK) { printf("FAIL: ejit_init\n"); return 1; }
     ejit_activate("carrier",0);
     ejit_activate("carrier",1);
@@ -159,14 +152,9 @@ int main(int argc, char **argv)
         exp += 52 + ((ci%2==0)?6:0);
 
         ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
         ejit_taskpool_stats_t s; memset(&s,0,sizeof(s));
         ejit_taskpool_get_stats(&s);
         int isJit = (s.asyncCompiles > (size_t)t) ? 1 : 0;
-#else
-        ejit_stats_t s; memset(&s,0,sizeof(s)); ejit_get_stats(&s);
-        int isJit = (s.entryCount > (size_t)t) ? 1 : 0;
-#endif
 
         printf("[Test %d] ci=%u %s  result=%u expected=%u  ",
                t+1, ci, isJit?"[JIT]":"[AOT]", res, exp);
@@ -175,7 +163,6 @@ int main(int argc, char **argv)
     }
 
     ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
     ejit_taskpool_stats_t sf; memset(&sf,0,sizeof(sf));
     ejit_taskpool_get_stats(&sf);
     printf("\nJIT: compiles=%llu hits=%llu  ",
@@ -183,13 +170,6 @@ int main(int argc, char **argv)
            (unsigned long long)sf.cacheHits);
     if (sf.asyncCompiles > 0) printf("[ACTIVE]\n");
     else { printf("[NOT ACTIVE]\n"); failures++; }
-#else
-    ejit_stats_t sf; memset(&sf,0,sizeof(sf)); ejit_get_stats(&sf);
-    printf("\nJIT: entries=%zu misses=%llu  ", sf.entryCount,
-           (unsigned long long)sf.misses);
-    if (sf.entryCount > 0) printf("[ACTIVE]\n");
-    else { printf("[NOT ACTIVE]\n"); failures++; }
-#endif
 
     ejit_shutdown();
     printf("\n=== %s: %d failures ===\n", ln, failures);

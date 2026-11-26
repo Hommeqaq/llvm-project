@@ -13,7 +13,7 @@
 //      ready", and returns.
 //   2. From three core sessions, run test_ejit_period on cores 18, 19 and 20.
 //      They attach to core 8's shared taskpool and wait at a shared gate.
-//   3. Each producer keeps calling its ejit_entry function:
+//   3. Each producer keeps calling its EJIT_ENTRY function:
 //        - indirect call through a function pointer (target mostly 0, rarely 1)
 //        - memcpy with a dynamic size (mostly 63 bytes, rarely 16)
 //        - a loop `for (i = 0; i < bound; ++i)` whose bound is 100 in ~99.2%
@@ -68,12 +68,12 @@ extern uint8_t g_ucLocalCoreID;
 static const uint32_t kProducerCores[VP_PRODUCER_COUNT] = {18u, 19u, 20u};
 
 struct VpMcCfg {
-  ejit_may_const uint32_t multiplier;
-  ejit_may_const uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t multiplier;
+  EJIT_PERIOD_CONST uint32_t mode;
   uint32_t salt;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(cell)
 struct VpMcCfg g_vp_mc_cfg[VP_PRODUCER_COUNT];
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_vp_mc_ready_mask;
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_vp_mc_done_mask;
@@ -108,19 +108,19 @@ static uint32_t vp_mc_body(uint8_t lane, uint32_t seed, uint32_t bound,
   return v;
 }
 
-ejit_entry uint32_t vp_mc_func0(ejit_period_arr_ind(cell) uint8_t cell,
+EJIT_ENTRY uint32_t vp_mc_func0(EJIT_DIM(cell) uint8_t cell,
                                 uint32_t seed, uint32_t bound,
                                 uint32_t mem_size) {
   return vp_mc_body(0, seed, bound, mem_size);
 }
 
-ejit_entry uint32_t vp_mc_func1(ejit_period_arr_ind(cell) uint8_t cell,
+EJIT_ENTRY uint32_t vp_mc_func1(EJIT_DIM(cell) uint8_t cell,
                                 uint32_t seed, uint32_t bound,
                                 uint32_t mem_size) {
   return vp_mc_body(1, seed, bound, mem_size);
 }
 
-ejit_entry uint32_t vp_mc_func2(ejit_period_arr_ind(cell) uint8_t cell,
+EJIT_ENTRY uint32_t vp_mc_func2(EJIT_DIM(cell) uint8_t cell,
                                 uint32_t seed, uint32_t bound,
                                 uint32_t mem_size) {
   return vp_mc_body(2, seed, bound, mem_size);
@@ -210,7 +210,6 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   memset(&cfg, 0, sizeof(cfg));
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = true;
   cfg.forceStaticRegistry = true;
 
   ejit_status_t rc = ejit_init_pgo(&cfg);

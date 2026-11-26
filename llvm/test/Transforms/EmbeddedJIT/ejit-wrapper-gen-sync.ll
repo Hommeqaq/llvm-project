@@ -1,7 +1,6 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 ;
-; Unified wrapper: sync and async share the same AOT wrapper. The fixed-
-; dimension fast path is now the default for <= 2 dim entries.
+; Sync and async share one generic wrapper ABI.
 
 ; CHECK: @__ejit_dimtype_cell = internal global i32 -1
 ; CHECK: @__ejit_funcidx_sync_entry = internal global i32 -1
@@ -15,7 +14,7 @@
 
 ; CHECK: jit_call:
 ; CHECK: load i32, ptr @__ejit_dimtype_cell
-; CHECK: call i32 @ejit_taskpool_compile_or_get_1d(i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 1, ptr {{.*}}, ptr {{.*}})
 ; CHECK: icmp eq
 ; CHECK: icmp ne
 ; CHECK: br {{.*}}label %jit_dispatch{{.*}}label %jit_fallback
@@ -38,5 +37,5 @@ entry:
 @data = global i32 7, !ejit.metadata !1
 
 !0 = distinct !{!{!"ejit_entry"},
-                 !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!1 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
+                 !{!"ejit_dim", !"cell", i32 0}}
+!1 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}}

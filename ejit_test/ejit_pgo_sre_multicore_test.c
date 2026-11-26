@@ -5,7 +5,7 @@
 //      starts the single shared worker, prints "worker ready", and returns.
 //   2. From three core sessions, run test_ejit_period on cores 18, 19 and 20.
 //      They attach to core 8's shared taskpool and wait at a shared start gate.
-//   3. The three cores then exercise three distinct ejit_entry functions. With
+//   3. The three cores then exercise three distinct EJIT_ENTRY functions. With
 //      EJIT_SRE_PGO_MAX_CONCURRENT_PROFILES=2, two functions profile while the
 //      third stays on AOT; it receives a slot after either Tier-2 completes.
 //
@@ -40,12 +40,12 @@ extern uint8_t g_ucLocalCoreID;
 static const uint32_t kProducerCores[PGO_PRODUCER_COUNT] = {18u, 19u, 20u};
 
 struct PgoMcCfg {
-  ejit_may_const uint32_t multiplier;
-  ejit_may_const uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t multiplier;
+  EJIT_PERIOD_CONST uint32_t mode;
   uint32_t salt;
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(cell)
 struct PgoMcCfg g_pgo_mc_cfg[PGO_PRODUCER_COUNT];
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_pgo_mc_ready_mask;
 EJIT_SHARED_SECTION_ATTR volatile uint32_t g_pgo_mc_done_mask;
@@ -64,18 +64,18 @@ EJIT_SHARED_SECTION_ATTR volatile uint64_t g_pgo_mc_sink;
     return _v;                                                                 \
   } while (0)
 
-ejit_entry uint32_t
-pgo_mc_func0(ejit_period_arr_ind(cell) uint8_t cell, uint32_t seed) {
+EJIT_ENTRY uint32_t
+pgo_mc_func0(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x101u);
 }
 
-ejit_entry uint32_t
-pgo_mc_func1(ejit_period_arr_ind(cell) uint8_t cell, uint32_t seed) {
+EJIT_ENTRY uint32_t
+pgo_mc_func1(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x202u);
 }
 
-ejit_entry uint32_t
-pgo_mc_func2(ejit_period_arr_ind(cell) uint8_t cell, uint32_t seed) {
+EJIT_ENTRY uint32_t
+pgo_mc_func2(EJIT_DIM(cell) uint8_t cell, uint32_t seed) {
   PGO_MC_BODY(cell, seed, 0x303u);
 }
 
@@ -153,7 +153,6 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   memset(&cfg, 0, sizeof(cfg));
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = true;
   cfg.forceStaticRegistry = true;
 
   ejit_status_t rc = ejit_init_pgo(&cfg);

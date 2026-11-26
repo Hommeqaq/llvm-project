@@ -1,4 +1,4 @@
-; RUN: opt -passes=ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen -S %s | FileCheck %s
 
 ; Test: Edge cases for wrapper generation:
 ;   1. 0-dim entry (static period only, no dims)
@@ -31,5 +31,5 @@ entry:
 @static_cfg = global i32 42, !ejit.metadata !90
 
 !0 = distinct !{!{!"ejit_entry"}}
-!10 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}, !{!"ejit_period_arr_ind", !"slice", i32 2}, !{!"ejit_period_arr_ind", !"carrier", i32 3}}
-!90 = distinct !{!{!"ejit_period", !"static"}}
+!10 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}, !{!"ejit_dim", !"slice", i32 2}, !{!"ejit_dim", !"carrier", i32 3}}
+!90 = distinct !{!{!"ejit_group", !"static"}}

@@ -13,25 +13,35 @@ EmbeddedJIT 的核心思想：在 `ejit_activate` 与 `ejit_deactivate` 定义�
 
 ## 2. 用户标注接口
 
-> **属性拼写约定**: 所有带字符串参数的属性（`ejit_period`/`ejit_period_arr`/`ejit_period_arr_ind`/`ejit_period_lc`）使用 `#x` 宏字符串化。用户代码通过宏使用无引号标识符（如 `ejit_period(static)`），宏展开后变为 `__attribute__((ejit_period("static")))`。代码示例中统一使用宏形式。
+> **属性拼写约定**: 所有带字符串参数的属性（`ejit_group`/`ejit_dim`/`ejit_bound_ptr`/`ejit_guard`）使用 `#x` 宏字符串化。用户代码通过宏使用无引号标识符（如 `EJIT_GROUP(static)`），宏展开后变为 `__attribute__((ejit_group("static")))`。代码示例中统一使用宏形式。
+>
+> **改名说明 (v1.9, 2026-11)**: 用户面拼写与 IR metadata 统一为现行词汇，**旧属性拼写不再接受（出现即 unknown attribute 警告并忽略）**：
+> - 属性：`ejit_period` + `ejit_period_arr` → `ejit_group`（合并为一个属性，标量/数组形式由变量类型推断）；`ejit_period_arr_ind` → `ejit_dim`；`ejit_period_lc` → `ejit_guard`；`ejit_may_const` → `EJIT_PERIOD_CONST`
+> - IR metadata：load 级 `!ejit.may_const` → `!ejit.period_const`；`!ejit.metadata` 子节点 tag `ejit_period`/`ejit_period_arr` → `ejit_group`/`ejit_group_indexed`、`ejit_period_arr_ind` → `ejit_dim`、`ejit_period_lc` → `ejit_guard`、`ejit_may_const_field` → `ejit_period_const_field`；注册段 `.ejit_period` → `.ejit_group`（`__start_ejit_group`/`__stop_ejit_group` 边界符号随段名）
+> - 宏：EJitRuntime.h 仅提供**大写**宏（`EJIT_PERIOD_CONST` / `EJIT_GROUP` / `EJIT_DIM` / `EJIT_BOUND_PTR` / `EJIT_FREE_DIM` / `EJIT_ENTRY` / `EJIT_GUARD`），小写宏与旧名宏均已删除（对外接口统一大写）
+> - 运行时 API `ejit_print_period_const_ranking`（旧调测命令 `ejit_print_mayconst_ranking` 保留为兼容别名）；opt 旗标 `-ejit-report-period-const` / `-ejit-warn-few-period-const`（原 mayconst 系列）；pass 注册名 `ejit-guard-handler` / `ejit-register-group`
+>
+> **兼容性**: 旧版编译的存量二进制与新运行时**不兼容**（嵌入 bitcode 内的旧 metadata tag 不再被识别，`ejit_config_t` 的布局也已变更）。升级时用同一版本的 Clang、运行时和头文件重编业务对象，更新产品链接脚本的 `.ejit_group` 段及边界符号，再重新链接。
 
-### 2.1 数据不变性标注：ejit_may_const
+### 2.1 数据不变性标注：EJIT_PERIOD_CONST
 
 ```c
-__attribute__((ejit_may_const))
-#define ejit_may_const __attribute__((ejit_may_const))
+__attribute__((ejit_period_const))
+#define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
 ```
 
-**语义**: 标记结构体成员在时间窗内的不变性。当全局变量属于某个时间窗且时间窗处于激活状态时，标记了 `ejit_may_const` 的成员可被视为常量。
+> **改名说明**: 属性拼写从 `ejit_may_const` 改为 `ejit_period_const`（常量性属于 period 组的时间窗）；用户宏形式统一大写为 `EJIT_PERIOD_CONST`。宏层不提供小写宏（与属性拼写同名的小写宏会和任何大写孪生构成双展开冲突，详见 EJitRuntime.h 注释）。
+
+**语义**: 标记结构体成员在时间窗内的不变性。当全局变量属于某个时间窗且时间窗处于激活状态时，标记了 `EJIT_PERIOD_CONST` 的成员可被视为常量。
 
 **示例**:
 
 ```c
 struct Sample {
-    ejit_may_const uint32_t a;
+    EJIT_PERIOD_CONST uint32_t a;
     uint32_t xx;
     struct SampleInner {
-        ejit_may_const uint32_t b;
+        EJIT_PERIOD_CONST uint32_t b;
         uint32_t xxx;
     } inner;
 };
@@ -43,11 +53,11 @@ struct Sample {
 
 ### 2.2 时间窗标注
 
-#### 2.2.1 ejit_period(name) — 标量全局变量
+#### 2.2.1 EJIT_GROUP(name) — 标量全局变量
 
 ```c
-__attribute__((ejit_period("static")))
-#define ejit_period(x) __attribute__((ejit_period(#x)))
+__attribute__((ejit_group("static")))
+#define EJIT_GROUP(x) __attribute__((ejit_group(#x)))
 ```
 
 > **拼写说明**: 参数为字符串字面量。`static` 是 C 保留关键字，必须以 `"static"` 形式传入。
@@ -58,54 +68,54 @@ __attribute__((ejit_period("static")))
 
 **内置时间窗 `static`**: 代表在 JIT 运行期不变的全局变量，永远处于生效状态，无需调用 `ejit_activate`。
 
-**自定义时间窗 [未来扩展]**: `name` 为开发者自定义的名称（非 static），表示该变量在运行期可能变化、但在业务逻辑保证的时间段内保持不变。当前版本不支持函数对自定义标量时间窗的依赖声明，仅支持 `static` 和 `ejit_period_arr`。
+**自定义时间窗 [未来扩展]**: `name` 为开发者自定义的名称（非 static），表示该变量在运行期可能变化、但在业务逻辑保证的时间段内保持不变。当前版本不支持函数对自定义标量时间窗的依赖声明，仅支持 `static` 和 `ejit_group`。
 
 ```c
 struct BoardConfig {
-    ejit_may_const boardType;
+    EJIT_PERIOD_CONST boardType;
     uint32_t xx;
 };
 
 // static 时间窗：JIT 运行期不变
-ejit_period(static) struct BoardConfig g_boardCfg;
+EJIT_GROUP(static) struct BoardConfig g_boardCfg;
 ```
 
-#### 2.2.2 ejit_period_arr(name) — 数组全局变量
+#### 2.2.2 EJIT_GROUP(name) — 数组/指针全局变量（形式由变量类型推断，与 2.2.1 为同一属性）
 
 ```c
-__attribute__((ejit_period_arr("cell")))
-#define ejit_period_arr(x) __attribute__((ejit_period_arr(#x)))
+__attribute__((ejit_group("cell")))
+#define EJIT_GROUP(x) __attribute__((ejit_group(#x)))
 ```
 
 **语义**: 定义全局变量数组所属的时间窗数组。时间窗数组管理具有相同业务概念但状态独立的多个实例，每个实例可独立控制时间窗状态。多个不同数组可使用相同的 `name`（即同一时间窗名称），此时 `ejit_activate(name, idx)` 会同时激活该名称下所有数组的第 idx 个实例。激活状态仅以时间窗名称 + 实例 index 为键，不存在数组指针维度：若多个数组共享同一时间窗名称，激活是 name 级别的（针对该 period 实例整体）。
 
 ```c
 struct CellConfig {
-    ejit_may_const cellType;
+    EJIT_PERIOD_CONST cellType;
     uint32_t xx;
 };
 
 // 每个数组元素为独立的时间窗实例
-ejit_period_arr(cell) struct CellConfig g_cellCfg[N];
+EJIT_GROUP(cell) struct CellConfig g_cellCfg[N];
 ```
 
 **约束**:
 - 数组长度 N 固定且较小 (<100)（仅数组类型；指针类型无大小约束，由用户保证越界安全）
-- 整个程序最多支持 1024 个 `ejit_period_arr` 数组
+- 整个程序最多支持 1024 个 `ejit_group` 数组
 
-**指针类型支持 (v1.6)**: `ejit_period_arr` 也支持指向结构体的指针变量：
+**指针类型支持 (v1.6)**: `ejit_group` 也支持指向结构体的指针变量：
 
 ```c
-ejit_period_arr(cell) struct CellConfig *g_cellPtr;
+EJIT_GROUP(cell) struct CellConfig *g_cellPtr;
 // g_cellPtr = malloc(N * sizeof(struct CellConfig));
-// 用户保证在 ejit_entry 调用前指针已赋值，下标不越界
+// 用户保证在 EJIT_ENTRY 调用前指针已赋值，下标不越界
 ```
 
 PASS6 在 JIT 编译期通过读取 `*(void**)&GV` 获取指针值作为数组基地址。指针必须指向结构体/类类型。
 
 ### 2.3 JIT 函数标注
 
-#### 2.3.1 ejit_entry — JIT 优化函数
+#### 2.3.1 EJIT_ENTRY — JIT 优化函数
 
 ```c
 __attribute__((ejit_entry))
@@ -117,12 +127,12 @@ __attribute__((ejit_entry))
 
 **约束**:
 - 不支持递归
-- 异步编译模式下，首次调用执行 AOT 路径（fallback），Cache 命中后执行特化版本。因此 `ejit_entry` 函数的**副作用必须是幂等的**——相同参数下多次执行的副作用效果一致。若函数包含非幂等操作（如修改全局计数器、写入硬件寄存器），应使用同步编译模式或避免标记为 `ejit_entry`
+- 异步编译模式下，首次调用执行 AOT 路径（fallback），Cache 命中后执行特化版本。因此 `EJIT_ENTRY` 函数的**副作用必须是幂等的**——相同参数下多次执行的副作用效果一致。若函数包含非幂等操作（如修改全局计数器、写入硬件寄存器），应使用同步编译模式或避免标记为 `EJIT_ENTRY`
 
-**默认依赖**: 每个 `ejit_entry` 函数自动依赖 `static` 时间窗。对 `ejit_period_arr` 时间窗的依赖通过 `ejit_period_arr_ind` 在函数参数上显式声明。
+**默认依赖**: 每个 `EJIT_ENTRY` 函数自动依赖 `static` 时间窗。对 `ejit_group` 时间窗的依赖通过 `ejit_dim` 在函数参数上显式声明。
 
 ```c
-ejit_entry void jit_entry(void)
+EJIT_ENTRY void jit_entry(void)
 {
     // JIT 优化时，g_boardCfg.boardType 被视为常量进行分支优化
     if (g_boardCfg.boardType == UBBPg) {
@@ -131,17 +141,19 @@ ejit_entry void jit_entry(void)
 }
 ```
 
-#### 2.3.2 ejit_period_arr_ind(name) — 特化维度参数
+#### 2.3.2 ejit_dim(name) — 特化维度参数
 
 ```c
-__attribute__((ejit_period_arr_ind("cell")))
-#define ejit_period_arr_ind(x) __attribute__((ejit_period_arr_ind(#x)))
+__attribute__((ejit_dim("cell")))
+#define EJIT_DIM(x) __attribute__((ejit_dim(#x)))
 ```
 
-**语义**: 标记函数参数为指定时间窗数组的下标，表明函数依赖该时间窗数组的特定实例，具体使用哪个实例由该参数值决定。仅适用于 `ejit_period_arr(name)` 数组变量。
+> 宏层统一大写：`EJIT_DIM(x)`。与属性拼写同名的小写宏会和任何大写孪生构成双展开冲突，故宏层不提供小写形式（见 EJitRuntime.h 注释）。
+
+**语义**: 标记函数参数为指定时间窗数组的下标，表明函数依赖该时间窗数组的特定实例，具体使用哪个实例由该参数值决定。仅适用于 `EJIT_GROUP(name)` 数组变量。
 
 ```c
-ejit_entry void jit_entry(ejit_period_arr_ind(cell) uint8_t cellIndex)
+EJIT_ENTRY void jit_entry(EJIT_DIM(cell) uint8_t cellIndex)
 {
     // JIT 优化时，g_cellCfg[cellIndex].cellType 被视为常量
     if (g_cellCfg[cellIndex].cellType == FDD) {
@@ -152,7 +164,7 @@ ejit_entry void jit_entry(ejit_period_arr_ind(cell) uint8_t cellIndex)
 
 **约束**:
 - 参数类型必须为整数类型
-- 单个函数最多支持 4 个 `ejit_period_arr_ind` 参数
+- 单个函数最多支持 4 个 `ejit_dim` 参数
 - 每个维度最多关联 1024 个数组
 
 **Cache Key 格式** (v2: taskpool dim-pair hash):
@@ -167,20 +179,20 @@ ejit_entry void jit_entry(ejit_period_arr_ind(cell) uint8_t cellIndex)
 > dimType 由 AOT wrapper 从 per-lifecycle global 加载，保证跨模块一致。
 > 旧格式（下图）已不再使用。
 
-#### 2.3.3 ejit_period_lc(name) — 时间窗生命周期管理函数
+#### 2.3.3 EJIT_GUARD(name) — 时间窗生命周期管理函数
 
 ```c
-__attribute__((ejit_period_lc("cell")))
-#define ejit_period_lc(x) __attribute__((ejit_period_lc(#x)))
+__attribute__((ejit_guard("cell")))
+#define EJIT_GUARD(x) __attribute__((ejit_guard(#x)))
 ```
 
 **语义**: 标记函数会修改指定时间窗内的数据。编译器将在函数入口插入 `ejit_deactivate`、函数出口插入 `ejit_activate`，确保数据一致性。
 
-**约束**: 必须与 `ejit_period_arr_ind` 配合使用，标记函数参数对应的数组下标。
+**约束**: 必须与 `ejit_dim` 配合使用，标记函数参数对应的数组下标。
 
 ```c
-ejit_period_lc(cell)
-void change_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIndex);
+EJIT_GUARD(cell)
+void change_cell_cfg(EJIT_DIM(cell) uint8_t cellIndex);
 ```
 
 ---
@@ -246,7 +258,7 @@ typedef struct {
 | `ejit_deactivate_all(period_name)` | 标记指定时间窗名称下所有数组的所有实例失效 |
 | `ejit_is_active(period_name, cell_idx)` | 检查时间窗实例是否激活 |
 
-**激活粒度（name + index only）**: 激活状态仅以时间窗/生命周期名称 + 实例 index 为键，不存在公开的数组指针维度。同一时间窗名称可关联多个 `ejit_period_arr` 数组，`ejit_activate` 按 name + index 激活该名称下所有数组的对应实例（即 name 级别）。
+**激活粒度（name + index only）**: 激活状态仅以时间窗/生命周期名称 + 实例 index 为键，不存在公开的数组指针维度。同一时间窗名称可关联多个 `ejit_group` 数组，`ejit_activate` 按 name + index 激活该名称下所有数组的对应实例（即 name 级别）。
 
 > **移除说明**: 早期版本提供的 `ejit_activate_array(period_name, array_ptr, cell_idx)` / `ejit_deactivate_array(...)`（数组级生命周期激活）已被移除，因为产品不需要数组级生命周期激活。异步 / 共享 taskpool 的热路径中激活状态以 `(lifecycle, instance)` 为键，不携带数组指针维度。若引入数组指针维度，将增加热路径复杂度、跨核同虚拟地址（same-VA）假设、测试与缓存语义的成本，收益却为零。
 
@@ -266,7 +278,7 @@ invalid → ejit_activate()   → active (可 JIT)
 void ejit_register_symbol(const char *name, void *addr);
 ```
 
-用于裸核/嵌入式场景，将外部符号（库函数、全局变量）注册到 JIT 引擎，使 JIT 编译时可以解析。PASS1 在编译期自动扫描 ejit_entry 闭包引用的外部符号并生成注册调用，用户通常无需手动调用。
+用于裸核/嵌入式场景，将外部符号（库函数、全局变量）注册到 JIT 引擎，使 JIT 编译时可以解析。PASS1 在编译期自动扫描 EJIT_ENTRY 闭包引用的外部符号并生成注册调用，用户通常无需手动调用。
 
 | 参数 | 说明 |
 |------|------|
@@ -322,8 +334,8 @@ void ejit_taskpool_release_read(uint32_t bucketIndex);
 
 编译器在 AOT 阶段需完成以下工作：
 
-1. **插桩**: 为 `ejit_entry` 函数生成 wrapper 逻辑，在函数入口插入对 `ejit_taskpool_compile_or_get` 的调用，并使用 `ejit_taskpool_release_read` 释放读令牌
-2. **Bitcode 收集**: 为 `ejit_entry` 函数生成包含必要符号的 IR，嵌入二进制文件
+1. **插桩**: 为 `EJIT_ENTRY` 函数生成 wrapper 逻辑，在函数入口插入对 `ejit_taskpool_compile_or_get` 的调用，并使用 `ejit_taskpool_release_read` 释放读令牌
+2. **Bitcode 收集**: 为 `EJIT_ENTRY` 函数生成包含必要符号的 IR，嵌入二进制文件
 3. **元数据生成**: 记录 JIT 优化所需的元数据（函数依赖的时间窗、变量、常量成员等）
 4. **结构体布局注册**: 生成结构体字段布局信息的注册代码，供运行时字段偏移计算使用
 
@@ -333,7 +345,7 @@ void ejit_taskpool_release_read(uint32_t bucketIndex);
 - JIT 失败 → 继续执行原函数逻辑（fallback）
 
 **生命周期函数插桩要求**:
-- 对标记 `ejit_period_lc` 的函数，函数入口插入 `ejit_deactivate(periodName, idx)`，函数出口插入 `ejit_activate(periodName, idx)`（name + index，无数组指针维度）
+- 对标记 `ejit_guard` 的函数，函数入口插入 `ejit_deactivate(periodName, idx)`，函数出口插入 `ejit_activate(periodName, idx)`（name + index，无数组指针维度）
 
 ### 4.2 JIT 运行期行为
 
@@ -342,8 +354,8 @@ JIT 编译的整体流程：
 1. 按需加载 Bitcode → Module
 2. 根据 Cache Key 查找 Code Cache，命中则直接返回
 3. 未命中则进入特化流程：
-   - 替换 `ejit_period_arr_ind` 参数为运行时常量
-   - 替换 `ejit_may_const` 成员 load 为运行时值（从激活实例中读取当前值）
+   - 替换 `ejit_dim` 参数为运行时常量
+   - 替换 `EJIT_PERIOD_CONST` 成员 load 为运行时值（从激活实例中读取当前值）
    - 使用结构体布局信息计算正确的字段偏移
 4. 运行可配置的 IR 优化 pipeline
 5. 生成 Machine Code，存入 Code Cache
@@ -385,64 +397,64 @@ JIT 编译的整体流程：
 
 ```c
 struct BoardConfig {
-    ejit_may_const boardType;
+    EJIT_PERIOD_CONST boardType;
     uint32_t xx;
 };
 
-ejit_period(static) struct BoardConfig g_boardCfg;
+EJIT_GROUP(static) struct BoardConfig g_boardCfg;
 
-ejit_entry void jit_entry(void);
+EJIT_ENTRY void jit_entry(void);
 ```
 
 ### 场景 2: 单时间窗依赖
 
 ```c
 struct BoardConfig {
-    ejit_may_const boardType;
+    EJIT_PERIOD_CONST boardType;
     uint32_t xx;
 };
 struct CellConfig {
-    ejit_may_const cellType;
+    EJIT_PERIOD_CONST cellType;
     uint32_t xx;
 };
 
-ejit_period(static) struct BoardConfig g_boardCfg;
-ejit_period_arr(cell) struct CellConfig g_cellCfg[N];
+EJIT_GROUP(static) struct BoardConfig g_boardCfg;
+EJIT_GROUP(cell) struct CellConfig g_cellCfg[N];
 
 // 依赖 static + cell[cellIndex]
-ejit_entry void jit_entry(ejit_period_arr_ind(cell) uint8_t cellIndex);
+EJIT_ENTRY void jit_entry(EJIT_DIM(cell) uint8_t cellIndex);
 
 // 生命周期管理
-ejit_period_lc(cell)
-void change_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIndex);
+EJIT_GUARD(cell)
+void change_cell_cfg(EJIT_DIM(cell) uint8_t cellIndex);
 ```
 
 ### 场景 3: 多时间窗依赖
 
 ```c
-struct BoardConfig  { ejit_may_const boardType; uint32_t xx; };
-struct CellConfig   { ejit_may_const cellType;  uint32_t xx; };
-struct TrpConfig    { ejit_may_const trpType;   uint32_t xx; };
+struct BoardConfig  { EJIT_PERIOD_CONST boardType; uint32_t xx; };
+struct CellConfig   { EJIT_PERIOD_CONST cellType;  uint32_t xx; };
+struct TrpConfig    { EJIT_PERIOD_CONST trpType;   uint32_t xx; };
 
-ejit_period(static) struct BoardConfig g_boardCfg;
-ejit_period_arr(cell) struct CellConfig g_cellCfg[N];
-ejit_period_arr(trp) struct TrpConfig g_trpCfg[M];
+EJIT_GROUP(static) struct BoardConfig g_boardCfg;
+EJIT_GROUP(cell) struct CellConfig g_cellCfg[N];
+EJIT_GROUP(trp) struct TrpConfig g_trpCfg[M];
 
 // 显式依赖 static + cell[cellIndex] + trp[trpIndex]
-ejit_entry void jit_entry(
-    ejit_period_arr_ind(cell) uint8_t cellIndex,
-    ejit_period_arr_ind(trp) uint8_t trpIndex);
+EJIT_ENTRY void jit_entry(
+    EJIT_DIM(cell) uint8_t cellIndex,
+    EJIT_DIM(trp) uint8_t trpIndex);
 
 // 方式一：同时变更多个时间窗
-ejit_period_lc(cell) ejit_period_lc(trp)
-void change_cfg(ejit_period_arr_ind(cell) uint8_t cellIndex,
-                ejit_period_arr_ind(trp) uint8_t trpIndex);
+EJIT_GUARD(cell) EJIT_GUARD(trp)
+void change_cfg(EJIT_DIM(cell) uint8_t cellIndex,
+                EJIT_DIM(trp) uint8_t trpIndex);
 
 // 方式二：分别变更
-ejit_period_lc(cell)
-void change_cell_cfg(ejit_period_arr_ind(cell) uint8_t cellIndex);
-ejit_period_lc(trp)
-void change_trp_cfg(ejit_period_arr_ind(trp) uint8_t trpIndex);
+EJIT_GUARD(cell)
+void change_cell_cfg(EJIT_DIM(cell) uint8_t cellIndex);
+EJIT_GUARD(trp)
+void change_trp_cfg(EJIT_DIM(trp) uint8_t trpIndex);
 ```
 
 ### 场景 4: 多时间窗隐式依赖 [未来扩展]
@@ -467,7 +479,7 @@ void change_trp_cfg(ejit_period_arr_ind(trp) uint8_t trpIndex);
 | 约束项 | 规格 |
 |--------|------|
 | 并发模型 | 主线程执行用户代码，异步编译在独立后台线程完成，使用轻量级同步机制 |
-| 外部函数 | `ejit_entry` 函数调用纯内部函数 (static) |
+| 外部函数 | `EJIT_ENTRY` 函数调用纯内部函数 (static) |
 | 函数指针 | 暂不特化函数指针调用 |
 | 编译器 | 仅支持 Clang |
 | 版本管理 | 不需要，编译时固定结构体定义 |
@@ -475,8 +487,8 @@ void change_trp_cfg(ejit_period_arr_ind(trp) uint8_t trpIndex);
 | 单函数代码量 | 需限制单个特化函数最大代码量，防止循环展开导致膨胀 |
 | Code Cache | taskpool bucket cache + shared pool lock-free cache，支持 read-token 并发安全 |
 | 数组大小 | 时间窗数组长度 <100，全局最多 1024 个数组 |
-| 特化维度 | 单函数最多 4 个 `ejit_period_arr_ind` 参数 |
-| 函数递归 | `ejit_entry` 函数不支持递归 |
+| 特化维度 | 单函数最多 4 个 `ejit_dim` 参数 |
+| 函数递归 | `EJIT_ENTRY` 函数不支持递归 |
 
 ---
 
@@ -498,35 +510,35 @@ void change_trp_cfg(ejit_period_arr_ind(trp) uint8_t trpIndex);
 
 ### 9.1 全局变量归属冲突检测
 
-检查同一变量是否被多个 `ejit_period` 或 `ejit_period_arr` 标记。**错误级别**，阻止编译。
+检查同一变量是否被多个 `ejit_group` 标记。**错误级别**，阻止编译。
 
 ```c
 // 错误：同一变量被多个时间窗标记
-ejit_period(cell) struct CellConfig g_cellCfg;
-ejit_period(trp)  struct CellConfig g_cellCfg;
+EJIT_GROUP(cell) struct CellConfig g_cellCfg;
+EJIT_GROUP(trp)  struct CellConfig g_cellCfg;
 ```
 
 ### 9.2 时间窗修改点检测
 
-检查修改 `ejit_may_const` 成员但未标记生命周期管理函数的情况。**警告级别**，不阻止编译。
+检查修改 `EJIT_PERIOD_CONST` 成员但未标记生命周期管理函数的情况。**警告级别**，不阻止编译。
 
 ```c
 void unsafe_function(void) {
-    g_cellCfg.cellType = TDD;  // 警告：未标记 ejit_period_lc
+    g_cellCfg.cellType = TDD;  // 警告：未标记 ejit_guard
 }
 ```
 
 ### 9.3 生命周期调用链检测 [暂不支持]
 
-检查 `ejit_entry` 函数调用了生命周期管理函数但未正确处理的情况。**警告级别**。
+检查 `EJIT_ENTRY` 函数调用了生命周期管理函数但未正确处理的情况。**警告级别**。
 
 ### 9.4 元数据一致性检测
 
 检查标注声明与实际使用是否一致。**警告级别**，不阻止编译。
 
 ```c
-ejit_period(cell) struct CellConfig g_cellCfg[N];
-ejit_entry void jit_entry(ejit_period_arr_ind(trp) uint8_t trpIndex) {
+EJIT_GROUP(cell) struct CellConfig g_cellCfg[N];
+EJIT_ENTRY void jit_entry(EJIT_DIM(trp) uint8_t trpIndex) {
     // 警告：标记依赖 trp 但实际使用 cell 数据
     use_cell_data(trpIndex);
 }
@@ -574,7 +586,7 @@ ejit_entry void jit_entry(ejit_period_arr_ind(trp) uint8_t trpIndex) {
 
 ## 13. 未来扩展 [暂不实现]
 
-- 自定义 `ejit_period(name)` 标量变量的函数依赖声明机制
+- 自定义 `EJIT_GROUP(name)` 标量变量的函数依赖声明机制
 - 多时间窗隐式依赖
 - 函数指针特化
 - 源码级调试功能

@@ -1,5 +1,5 @@
-; RUN: opt -passes=ejit-wrapper-gen,ejit-wrapper-gen -S %s | FileCheck %s
-; RUN: opt -passes=ejit-aot-module,ejit-aot-module -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-wrapper-gen,ejit-wrapper-gen -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-aot-module,ejit-aot-module -S %s | FileCheck %s
 
 ; Idempotency coverage. PASS3 can be invoked more than once on the same module
 ; (e.g. EJitAotModulePass running in both an O1 and an O2 pipeline). The
@@ -16,8 +16,8 @@ entry:
 
 @data = global i32 0, !ejit.metadata !1
 
-!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}}
-!1 = distinct !{!{!"ejit_period_arr", !"cell", i32 16}}
+!0 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}}
+!1 = distinct !{!{!"ejit_group_indexed", !"cell", i32 16}}
 
 ; IDEMPOTENCY: after one or two PASS3 runs the function must contain EXACTLY ONE
 ; wrapper prologue. The unified wrapper uses the taskpool API.

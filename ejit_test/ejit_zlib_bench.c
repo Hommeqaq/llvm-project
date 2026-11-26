@@ -6,9 +6,9 @@
 // a system library on virtually every platform — no extra dependencies.
 //
 // Design:
-//   - Compression level (1-9) and strategy are ejit_may_const fields in
-//     a global struct marked ejit_period(static).
-//   - The compress() function is ejit_entry — JIT specializes it for the
+//   - Compression level (1-9) and strategy are EJIT_PERIOD_CONST fields in
+//     a global struct marked EJIT_GROUP(static).
+//   - The compress() function is EJIT_ENTRY — JIT specializes it for the
 //     current parameters.
 //   - After JIT compilation, constant-parameter branches are eliminated.
 //
@@ -21,22 +21,22 @@
 #include <time.h>
 #include <zlib.h>
 
-#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "ejit_test_helpers.h"
 
 //===--- EJIT-annotated compression parameters ----------------------------===//
 
 typedef struct {
-  int ejit_may_const level;         // 1..9
-  int ejit_may_const strategy;      // Z_DEFAULT_STRATEGY, Z_FILTERED, etc.
-  int ejit_may_const memLevel;      // 1..9
-  int ejit_may_const windowBits;    // 9..15
+  int EJIT_PERIOD_CONST level;         // 1..9
+  int EJIT_PERIOD_CONST strategy;      // Z_DEFAULT_STRATEGY, Z_FILTERED, etc.
+  int EJIT_PERIOD_CONST memLevel;      // 1..9
+  int EJIT_PERIOD_CONST windowBits;    // 9..15
 } CompressCfg;
 
-ejit_period(static) CompressCfg g_cfg;
+EJIT_GROUP(static) CompressCfg g_cfg;
 
 //===--- EJIT entry: compress with specialized parameters -----------------===//
 
-ejit_entry int compress_specialized(
+EJIT_ENTRY int compress_specialized(
     const unsigned char *src, size_t srcLen,
     unsigned char *dst, size_t *dstLen)
 {
@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
 
   ejit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-  cfg.compileMode = EJIT_COMPILE_SYNC;
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
   CHECK(ejit_init(&cfg) == EJIT_OK, "ejit_init");
 
@@ -162,6 +162,8 @@ int main(int argc, char **argv) {
       int r1 = compress_specialized(src, srcSize, dst_jit, &jitLen);
       double t2 = now_ms();
 
+      CHECK(ejit_drain_taskpool_bounded(EJIT_DRAIN_SPIN_BUDGET),
+            "async compile drained before measuring warm call");
       // Second call: should hit JIT cache
       double t3 = now_ms();
       int r2 = compress_specialized(src, srcSize, dst_jit, &jitLen);

@@ -5,13 +5,13 @@
 #include <unistd.h>
 
 struct SlotConfig {
-  ejit_may_const unsigned char enabled;
+  EJIT_PERIOD_CONST unsigned char enabled;
   unsigned char live;
 };
 struct CellConfig {
   struct SlotConfig slots[10];
 };
-ejit_period_arr(cell) struct CellConfig *automatic_cells;
+EJIT_GROUP(cell) struct CellConfig *automatic_cells;
 
 // A synthetic allocator record. A board adapter would query its common
 // allocator's records here, without knowing any period-global names.
@@ -26,24 +26,20 @@ static uint64_t allocation_size(const void *base, void *context) {
   return base == allocation_base ? allocation_bytes : 0;
 }
 
-ejit_entry unsigned probe_automatic(ejit_period_arr_ind(cell) unsigned char cell,
-                                    ejit_free_dim unsigned short slot) {
+EJIT_ENTRY unsigned probe_automatic(EJIT_DIM(cell) unsigned char cell,
+                                    EJIT_FREE_DIM unsigned short slot) {
   struct SlotConfig *selected = &automatic_cells[cell].slots[slot % 10];
   ++selected->live;
   return selected->enabled ? 11 : 7;
 }
 
 static int wait_for_compilation(void) {
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   for (unsigned attempt = 0; attempt < 5000; ++attempt) {
     if (!ejit_taskpool_pending_count())
       return 1;
     usleep(1000);
   }
   return 0;
-#else
-  return 1;
-#endif
 }
 
 int main(void) {
@@ -87,13 +83,11 @@ int main(void) {
     printf("FAIL: allocator lookup was never queried\n");
     return 1;
   }
-#ifdef EJIT_SRE_TASKPOOL
   ejit_taskpool_stats_t stats;
   memset(&stats, 0, sizeof(stats));
   ejit_taskpool_get_stats(&stats);
   if (stats.readyEntries < 2)
     return 1;
-#endif
   ejit_shutdown();
   free(automatic_cells);
   printf("PASS: automatic pointer-period bounds and live slot stores\n");

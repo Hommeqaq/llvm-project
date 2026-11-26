@@ -1,11 +1,11 @@
-; RUN: opt -passes=ejit-aot-module -S %s | FileCheck %s
+; RUN: opt -ejit-inline-cache=false -passes=ejit-aot-module -S %s | FileCheck %s
 
 ; Test: Full AOT pipeline on a comprehensive module.
 
 ; CHECK: @llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @ejit_auto_register, ptr null }]
 
 ; Per-lifecycle dimType globals for the two lifecycles the entry functions use
-; (slice is declared but never referenced by an ejit_period_arr_ind, so it gets
+; (slice is declared but never referenced by an ejit_dim, so it gets
 ; no global). The wrapper loads these slots instead of baking constants.
 ; CHECK: @__ejit_dimtype_cell = internal global i32 -1
 ; CHECK: @__ejit_dimtype_trp = internal global i32 -1
@@ -22,12 +22,12 @@
 ; CHECK: jit_call:
 ; CHECK: load i32, ptr @__ejit_dimtype_cell
 ; CHECK: load i32, ptr @__ejit_dimtype_trp
-; CHECK: call i32 @ejit_taskpool_compile_or_get_2d(i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr {{.*}}, i32 2, ptr {{.*}}, ptr {{.*}})
 
 ; CHECK: define{{.*}}@process_static
 ; CHECK: jit_entry:
 ; CHECK: load i32, ptr @__ejit_funcidx_process_static
-; CHECK: call i32 @ejit_taskpool_compile_or_get_0d(i32 {{.*}}, ptr {{.*}}, ptr {{.*}})
+; CHECK: call i32 @ejit_taskpool_compile_or_get(i32 {{.*}}, ptr null, i32 0, ptr {{.*}}, ptr {{.*}})
 
 ; CHECK: define{{.*}}@update_config
 ; CHECK: call void @ejit_deactivate
@@ -78,11 +78,11 @@ entry:
   ret void
 }
 
-!10 = distinct !{!{!"ejit_period_arr", !"cell", i32 10}}
-!11 = distinct !{!{!"ejit_period_arr", !"trp", i32 8}}
-!12 = distinct !{!{!"ejit_period_arr", !"slice", i32 4}}
-!13 = distinct !{!{!"ejit_period", !"static"}}
-!14 = distinct !{!{!"ejit_period", !"static"}}
-!20 = distinct !{!{!"ejit_entry"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
+!10 = distinct !{!{!"ejit_group_indexed", !"cell", i32 10}}
+!11 = distinct !{!{!"ejit_group_indexed", !"trp", i32 8}}
+!12 = distinct !{!{!"ejit_group_indexed", !"slice", i32 4}}
+!13 = distinct !{!{!"ejit_group", !"static"}}
+!14 = distinct !{!{!"ejit_group", !"static"}}
+!20 = distinct !{!{!"ejit_entry"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}}
 !21 = distinct !{!{!"ejit_entry"}}
-!30 = distinct !{!{!"ejit_period_lc", !"cell"}, !{!"ejit_period_lc", !"trp"}, !{!"ejit_period_arr_ind", !"cell", i32 0}, !{!"ejit_period_arr_ind", !"trp", i32 1}}
+!30 = distinct !{!{!"ejit_guard", !"cell"}, !{!"ejit_guard", !"trp"}, !{!"ejit_dim", !"cell", i32 0}, !{!"ejit_dim", !"trp", i32 1}}

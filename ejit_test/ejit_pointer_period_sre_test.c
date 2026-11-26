@@ -8,10 +8,10 @@
 #ifndef __has_attribute
 #define __has_attribute(x) 0
 #endif
-#if !__has_attribute(ejit_entry) || !__has_attribute(ejit_dim) ||              \
+#if !__has_attribute(EJIT_ENTRY) || !__has_attribute(ejit_dim) ||              \
     !__has_attribute(ejit_period_const) ||                                     \
-    !__has_attribute(ejit_in_period_array) ||                                  \
-    !__has_attribute(ejit_bound_ptr) || !__has_attribute(ejit_free_dim)
+    !__has_attribute(ejit_group) ||                                  \
+    !__has_attribute(ejit_bound_ptr) || !__has_attribute(EJIT_FREE_DIM)
 #error "Use the matching EJIT Clang; unknown annotations are not a valid test"
 #endif
 #ifdef EJIT_DISABLE
@@ -19,7 +19,7 @@
 #endif
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 
-_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 56 &&
+_Static_assert(sizeof(void *) == 8 && sizeof(ejit_config_t) == 24 &&
                    sizeof(ejit_taskpool_stats_t) == 88,
                "Use the matching 64-bit spec5 runtime header");
 extern void SRE_printf(const char *, ...);
@@ -39,19 +39,19 @@ extern uint8_t g_ucLocalCoreID;
 #define PP_PHASES 6u
 
 struct PointerSlot {
-  ejit_may_const uint32_t mode;
+  EJIT_PERIOD_CONST uint32_t mode;
   uint32_t payload;
 };
 struct PointerCell {
   struct PointerSlot slot[PP_SLOTS];
 };
 struct BoundCell {
-  ejit_may_const uint32_t count;
-  ejit_may_const uint32_t weights[4];
+  EJIT_PERIOD_CONST uint32_t count;
+  EJIT_PERIOD_CONST uint32_t weights[4];
   uint32_t payload[PP_SLOTS];
 };
 PP_SHARED struct PointerCell g_pr251_cells[2];
-PP_SHARED ejit_period_arr(cell)
+PP_SHARED EJIT_GROUP(cell)
 struct PointerCell *g_pr251_pointer = g_pr251_cells;
 PP_SHARED struct BoundCell g_pr251_bound[2];
 PP_SHARED uint32_t g_pr251_lookup_queries;
@@ -65,21 +65,21 @@ static uint64_t pp_allocation_size(const void *base, void *context) {
   return base == (const void *)g_pr251_cells ? sizeof(g_pr251_cells) : 0u;
 }
 
-ejit_entry uint32_t pr251_pointer_slots(ejit_period_arr_ind(cell) uint8_t cell,
-                                        ejit_free_dim uint16_t slot) {
+EJIT_ENTRY uint32_t pr251_pointer_slots(EJIT_DIM(cell) uint8_t cell,
+                                        EJIT_FREE_DIM uint16_t slot) {
   const struct PointerCell *p = &g_pr251_pointer[cell];
   return (p->slot[slot % 5u].mode + p->slot[slot % 10u].mode) * 100u +
          p->slot[slot % 10u].payload;
 }
 
-ejit_entry uint32_t pr251_pointer_constant(ejit_period_arr_ind(cell)
+EJIT_ENTRY uint32_t pr251_pointer_constant(EJIT_DIM(cell)
                                                uint8_t cell,
                                            uint16_t slot) {
   const struct PointerCell *p = &g_pr251_pointer[cell];
   return p->slot[3].mode * 100u + p->slot[slot % 10u].payload;
 }
 
-ejit_entry uint32_t pr251_bound_loop(ejit_period_arr_ind(cell) uint8_t cell,
+EJIT_ENTRY uint32_t pr251_bound_loop(EJIT_DIM(cell) uint8_t cell,
                                      uint16_t slot,
                                      EJIT_BOUND_PTR(cell)
                                          const struct BoundCell *p) {
@@ -346,7 +346,7 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = cfg.forceStaticRegistry = true;
+  cfg.forceStaticRegistry = true;
   if (ejit_init_pgo(&cfg) != EJIT_OK)
     return pp_fail("online PGO init failed");
   if (ejit_taskpool_get_worker_core() != 6u)

@@ -1,10 +1,6 @@
 //===-- EJitRuntimeTest.cpp - EmbeddedJIT Runtime Unit Tests
 //---------------===//
 //
-// NOTE: To call the C API functions, we need to include the C runtime header
-// which is in the non-canonical include path. We declare the symbols we need
-// via extern "C" declarations instead, since they're provided by libLLVMEJIT.
-//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -16,20 +12,15 @@
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitFuncRegistry.h"
 #include "llvm/ExecutionEngine/EJIT/EJitLifecycleRegistry.h"
-#include "llvm/ExecutionEngine/EJIT/EJitLogger.h"
 #include "llvm/ExecutionEngine/EJIT/EJitModuleLoader.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptions.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRegistrationStore.h"
+#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntimeState.h"
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
-#endif
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
-#ifdef EJIT_SRE_TASKPOOL
-#include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h"
-#endif
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -47,6 +38,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Testing/Support/SupportHelpers.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "gtest/gtest.h"
 #include <algorithm>
@@ -65,6 +57,7 @@
 using namespace llvm;
 using namespace llvm::ejit;
 
+#ifdef EJIT_DUMP_SUPPORT
 TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
   LLVMContext Ctx;
   Module M("dump_selective", Ctx);
@@ -92,8 +85,19 @@ TEST(EJitDump, FunctionAndModuleViewsHaveDifferentScopes) {
   EXPECT_NE(Output.find("define internal"), std::string::npos) << Output;
   EXPECT_NE(Output.find("@dump_helper("), std::string::npos) << Output;
 }
+#endif
 
-TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
+TEST(EJitOrcEngine, DefaultConstructedEngineHasNoOptimizerResults) {
+  EJitOrcEngine Engine;
+  EXPECT_TRUE(Engine.getLastCounterNames().empty());
+  EXPECT_TRUE(Engine.getLastVpFunctions().empty());
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
+  EXPECT_TRUE(Engine.getLastPeriodConstLoadSites().empty());
+#endif
+  EXPECT_FALSE(Engine.printPeriodConstRanking());
+}
+
+TEST(EJitDump, FilteredCaptureMatchesBuildConfiguration) {
   std::string Bitcode;
   {
     LLVMContext Ctx;
@@ -121,6 +125,14 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
 
   EJitRuntimeState State;
   Config Cfg;
+  unittest::TempDir Dir("ejit-dump", /*Unique=*/true);
+  ASSERT_FALSE(Dir.path().empty());
+  Cfg.dumpJITDir = Dir.path().str();
+#ifdef EJIT_DUMP_SUPPORT
+  constexpr bool ExpectDump = true;
+#else
+  constexpr bool ExpectDump = false;
+#endif
   // Direct engine creation owns target registration just like the shared
   // worker-owner path; callers and producer-only EJit instances do not.
   auto EngineOrErr = EJitOrcEngine::Create(Cfg, State.getRegistry(), State);
@@ -134,20 +146,27 @@ TEST(EJitDump, DumpAllKeepsEachIndependentlyCompiledEntry) {
     SpecializationContext Ctx;
     Ctx.fnName = Name;
     Ctx.cacheKey = Key;
+    // Exercise capture after an actual final-tier materialization as well.
+    if (StringRef(Name) == "dump_c")
+      Ctx.tier = CompileTier::PGOUse;
     Engine->setActiveContext(&Ctx);
     ASSERT_FALSE(errorToBool(Engine->loadBitcodeModule(Bitcode, Key, Name)));
     auto FnOrErr = Engine->lookup(Key, Name);
     ASSERT_TRUE(static_cast<bool>(FnOrErr));
+    std::string Stem = std::string(Name) + "_" + std::to_string(Key);
+    for (const char *Suffix : {"_pre.ll", "_opt.ll"})
+      EXPECT_EQ(ExpectDump, sys::fs::exists(Dir.path(Stem + Suffix)));
   }
   Engine->setActiveContext(nullptr);
   setDumpFuncFilter("");
 
   for (const char *Name : {"dump_a", "dump_b", "dump_c"}) {
-    EXPECT_TRUE(printDumped(Name)) << Name;
-    EXPECT_TRUE(printDumpedModule(Name)) << Name;
+    EXPECT_EQ(ExpectDump, printDumped(Name)) << Name;
+    EXPECT_EQ(ExpectDump, printDumpedModule(Name)) << Name;
   }
 }
 
+#ifdef EJIT_DUMP_SUPPORT
 TEST(EJitDump, SkipsTemporaryPgoTier1Capture) {
   EXPECT_FALSE(llvm::ejit::detail::shouldCaptureDump(
       CompileTier::Instrumented, "*", "dump_temporary_tier1"));
@@ -161,6 +180,7 @@ TEST(EJitDump, SkipsTemporaryPgoTier1Capture) {
   EXPECT_FALSE(llvm::ejit::detail::shouldCaptureDump(
       CompileTier::PGOUse, "other", "dump_temporary_tier1"));
 }
+#endif
 
 static int nestedEntryWrapper(int X) { return X + 100; }
 static int wrongNestedEntryWrapper(int X) { return X + 1000; }
@@ -256,25 +276,18 @@ struct EJitOptimizerTestAccess : EJitOptimizer {
   // Isolated pass tests without a specialization supply an empty context;
   // production callers must carry the actual entry and bound-pointer views.
   void runStructFieldPass(Module &M) {
-    EJitOptimizer::runStructFieldPass(M, SpecializationContext{});
+    EJitOptimizer::runStructFieldPass(M, SpecializationContext{}, {});
   }
   void runOptimizationPipeline(Module &M, OptimizationLevel Level,
                                CompileTier Tier) {
     SpecializationContext Context;
     Context.optLevel = Level;
     Context.tier = Tier;
-    EJitOptimizer::runOptimizationPipeline(M, Context, Tier);
+    EJitOptimizer::runOptimizationPipeline(M, Context, Tier, {});
   }
 };
 } // namespace ejit
 } // namespace llvm
-
-// ejit_status_t values mirrored locally. EJitError::code is a plain int that
-// stores ejit_status_t codes (see EJitRuntime.h). The C header is not included
-// here because it conflicts with the local extern "C" test declarations further
-// down (which intentionally use a private signature for the C API).
-static constexpr int kEjitStatusOk = 0;             // EJIT_OK
-static constexpr int kEjitStatusCompileFailed = -3; // EJIT_ERR_COMPILE_FAILED
 
 //===----------------------------------------------------------------------===//
 // EJitRegistrationStore tests (T3-08)
@@ -471,7 +484,7 @@ TEST(EJitModuleLoader, CachesBoundPointerFormalIndices) {
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_bound_ptr", !"cell", i32 0, i64 8}
     !2 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8}
-    !3 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !3 = !{!"ejit_dim", !"cell", i32 0}
   )",
                                Err, Ctx);
   ASSERT_TRUE(M) << Err.getMessage().str();
@@ -720,71 +733,11 @@ TEST(EJitRuntimeState, ThreadSafety) {
 #endif // EJIT_FREESTANDING
 
 //===----------------------------------------------------------------------===//
-// EJitLogger tests (T3-12)
-//===----------------------------------------------------------------------===//
-
-#ifndef EJIT_FREESTANDING
-TEST(EJitLogger, LogAndGetLastError) {
-  EJitLogger logger;
-  logger.log(kEjitStatusCompileFailed, "test error", "myfunc", "mykey");
-
-  const EJitError *err = logger.getLastError();
-  ASSERT_NE(err, nullptr);
-  EXPECT_EQ(err->code, kEjitStatusCompileFailed);
-  EXPECT_EQ(err->message, "test error");
-  EXPECT_EQ(err->funcName, "myfunc");
-  EXPECT_EQ(err->cacheKey, "mykey");
-}
-
-TEST(EJitLogger, GetLastErrorEmpty) {
-  EJitLogger logger;
-  EXPECT_EQ(logger.getLastError(), nullptr);
-}
-
-TEST(EJitLogger, RingBufferWrap) {
-  EJitLogger logger;
-
-  // Write more than kMaxErrors entries
-  for (size_t i = 0; i < EJitLogger::kMaxErrors + 10; ++i) {
-    logger.log(kEjitStatusOk, "msg" + std::to_string(i));
-  }
-
-  const EJitError *last = logger.getLastError();
-  ASSERT_NE(last, nullptr);
-  EXPECT_EQ(last->message, "msg" + std::to_string(EJitLogger::kMaxErrors + 9));
-}
-
-TEST(EJitLogger, GetErrors) {
-  EJitLogger logger;
-
-  for (size_t i = 0; i < 5; ++i)
-    logger.log(kEjitStatusOk, "msg" + std::to_string(i));
-
-  auto errors = logger.getErrors(3);
-  EXPECT_EQ(errors.size(), 3u);
-  EXPECT_EQ(errors[0].message, "msg0");
-  EXPECT_EQ(errors[1].message, "msg1");
-  EXPECT_EQ(errors[2].message, "msg2");
-}
-
-TEST(EJitLogger, Clear) {
-  EJitLogger logger;
-  logger.log(kEjitStatusOk, "test");
-  logger.clear();
-  EXPECT_EQ(logger.getLastError(), nullptr);
-}
-
-#endif // EJIT_FREESTANDING
-
-//===----------------------------------------------------------------------===//
 // EJit end-to-end construction test (T3-20)
 //===----------------------------------------------------------------------===//
 
 TEST(EJit, ConstructionAndBasicOps) {
   Config config;
-  config.compileMode = CompileMode::Sync;
-  config.maxCacheEntries = 64;
-  config.maxCacheSize = 1024 * 1024;
 
   // Register the period array BEFORE construction (staged) so this works in
   // both builds — a taskpool build freezes registration after construction.
@@ -835,24 +788,6 @@ TEST(EJit, CacheOperations) {
   ejit.invalidateByPeriod("test", 0);
 }
 
-TEST(EJit, CompileMode) {
-  // Default is Async (background worker handles compilation).
-  EJit ejit(Config{});
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-  ASSERT_NE(ejit.taskPool(), nullptr);
-
-  // Switch to sync: compile inline on calling thread.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Sync));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Sync);
-
-  // Switch to off: no JIT, always AOT fallback.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Off));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
-
-  // Back to async.
-  EXPECT_TRUE(ejit.setCompileMode(CompileMode::Async));
-  EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-}
 
 TEST(EJit, OptimizationLevel) {
   EJit ejit(Config{});
@@ -862,15 +797,17 @@ TEST(EJit, OptimizationLevel) {
   EXPECT_EQ(ejit.getOptimizationLevel(), llvm::ejit::OptimizationLevel::L3);
 }
 
-#ifdef EJIT_SRE_TASKPOOL
 TEST(EJitTaskpoolInit, OffModeSucceedsWithoutWorker) {
   Config config;
   config.compileMode = CompileMode::Off;
   EJit ejit(config);
   EXPECT_FALSE(ejit.initFailed());
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Off);
-  ASSERT_NE(ejit.taskPool(), nullptr);
-  EXPECT_FALSE(ejit.taskPool()->isWorkerRunning());
+  ASSERT_NE(ejit.sharedTaskPool(), nullptr);
+  EXPECT_EQ(ejit.sharedTaskPool()->state(), nullptr);
+  EXPECT_FALSE(ejit.sharedTaskPool()->asyncServiceAvailable());
+  EXPECT_EQ(ejit.sharedTaskPool()->compileOrGet(1, nullptr, 0, nullptr).status,
+            EJitCompileOrGetStatus::OffMode);
 }
 
 TEST(EJitTaskpoolInit, DefaultAsyncInitSucceeds) {
@@ -878,7 +815,7 @@ TEST(EJitTaskpoolInit, DefaultAsyncInitSucceeds) {
   // ORC engine is always created; async init succeeds.
   EXPECT_FALSE(ejit.initFailed());
   EXPECT_EQ(ejit.getCompileMode(), CompileMode::Async);
-  ASSERT_NE(ejit.taskPool(), nullptr);
+  ASSERT_NE(ejit.sharedTaskPool()->state(), nullptr);
 }
 
 // Finding (二): a constructed taskpool EJit freezes registration once its
@@ -898,88 +835,25 @@ TEST(EJit, TaskpoolRegistrationFrozenAfterConstruction) {
   // Nothing was registered: the registry is unchanged.
   EXPECT_EQ(ejit.getRegistry().getArrays("frozen_period"), nullptr);
 }
-#endif // EJIT_SRE_TASKPOOL
 
 //===----------------------------------------------------------------------===//
 // C API tests with runtime-dynamic cellIdx (T3-21)
 //===----------------------------------------------------------------------===//
 
+constexpr auto EJIT_OK_C = EJIT_OK;
+
+// Generated AOT registration hooks, not part of EJitRuntime.h.
 extern "C" {
-typedef enum { EJIT_OK_C = 0 } ejit_status_test_t;
-typedef struct {
-  uint32_t dimType;
-  uint32_t instanceId;
-} ejit_dim_pair_test_t;
-typedef struct {
-  uint64_t count;
-  uint64_t total;
-  uint64_t min;
-  uint64_t max;
-  uint64_t wrapper_total;
-  uint64_t wrapper_min;
-  uint64_t wrapper_max;
-  uint64_t overhead_total;
-  uint64_t overhead_min;
-  uint64_t overhead_max;
-} ejit_function_body_cycles_test_t;
-extern ejit_status_test_t ejit_init(const void *config);
-extern void ejit_shutdown(void);
-extern ejit_status_test_t ejit_activate(const char *, uint32_t);
-extern ejit_status_test_t ejit_deactivate(const char *, uint32_t);
-extern bool ejit_is_active(const char *, uint32_t);
-extern void ejit_invalidate(const char *, uint32_t);
-extern void ejit_clear_cache(void);
-extern void ejit_register_period_array(const char *, const char *, void *,
-                                       uint64_t);
-extern void ejit_register_bitcode(const char *, const uint8_t *, uint64_t);
-extern void ejit_register_static_var(const char *, void *);
-extern void ejit_register_lifecycle(const char *, uint32_t *);
-// Icache slot registration: name-keyed (resolved against the SAME registry
-// funcIndex ejit_register_funcindex assigns), 4th arg is the sentinel MissFn
-// for branchless-probe slots (null keeps the guarded form's 0 semantics).
-extern void ejit_register_funcindex(const char *, uint32_t *);
-extern void ejit_register_icache_slot(const char *, void *, uint32_t, void *);
-extern int ejit_taskpool_compile_or_get_bound(uint32_t,
-                                              const ejit_dim_pair_test_t *,
-                                              uint32_t, const void *, uint32_t,
-                                              uint32_t, void **, uint32_t *);
-extern void ejit_set_log_level(int level);
-extern int ejit_get_log_level(void);
-extern void ejit_print_registry(void);
-extern void ejit_print_func_meta(const char *funcName);
-// P0 diagnostics: code pool stats + active period map. Declared returning int
-// (the real ejit_status_t) with literal status values (0=OK, -1=INVALID_PARAM,
-// -2=NOT_ACTIVE, -9=DISABLED) so the test need not include the C API header.
-extern int ejit_get_code_pool_stats(void *out);
-extern int ejit_get_code_pool_stats_v2(void *out);
-extern void ejit_print_code_pool_stats(void);
-extern void ejit_print_mayconst_ranking(void);
-extern void ejit_print_active(void);
-extern void ejit_print_version(void);
-extern void ejit_function_body_cycles_record(const char *, uint32_t, uint64_t,
-                                             uint64_t, uint64_t, uint64_t);
-extern unsigned
-ejit_function_body_cycles_get(const char *, uint32_t,
-                              ejit_function_body_cycles_test_t *);
-extern void ejit_function_body_cycles_reset(void);
+void ejit_register_period_array(const char *, const char *, void *, uint64_t);
+void ejit_register_bitcode(const char *, const uint8_t *, uint64_t);
+void ejit_register_static_var(const char *, void *);
 }
 
-static constexpr uint32_t kEjitFunctionBodyAot = 0;
-static constexpr uint32_t kEjitFunctionBodyJit = 1;
-
-// The "runtime-dynamic cellIdx" C-API tests below exercise the LEGACY model:
-// dynamic period-array registration AFTER ejit_init, then period-name activate.
-// In a taskpool build that model is intentionally replaced — registration is
-// frozen after init and activate is keyed on registered lifecycles — so these
-// tests run only in the non-taskpool build. Taskpool-mode equivalents (freeze,
-// lifecycle activate, array sync) live in the EJitCApiTaskpool section.
-#ifndef EJIT_SRE_TASKPOOL
-
 TEST(EJitCApi, ActivateWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   // Per-array activation model: register an array for the period first.
   int arr[256];
   ejit_register_period_array("dynamic", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t idx = 42;
   EXPECT_EQ(ejit_activate("dynamic", idx), EJIT_OK_C);
   EXPECT_TRUE(ejit_is_active("dynamic", idx));
@@ -989,9 +863,9 @@ TEST(EJitCApi, ActivateWithDynamicCellIdx) {
 }
 
 TEST(EJitCApi, LoopWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("loop", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   for (uint8_t i = 0; i < 10; i++)
     EXPECT_EQ(ejit_activate("loop", i), EJIT_OK_C);
   for (uint8_t i = 0; i < 10; i++)
@@ -1008,9 +882,9 @@ static uint8_t computeCellIdx(int x, int y) {
 }
 
 TEST(EJitCApi, ActivateWithComputedCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("compute", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t idx = computeCellIdx(100, 55);
   EXPECT_EQ(idx, 155);
   EXPECT_EQ(ejit_activate("compute", idx), EJIT_OK_C);
@@ -1024,9 +898,9 @@ TEST(EJitCApi, ActivateWithComputedCellIdx) {
 }
 
 TEST(EJitCApi, DynamicCellIdxBoundaries) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("bound", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   EXPECT_EQ(ejit_activate("bound", (uint8_t)0), EJIT_OK_C);
   EXPECT_TRUE(ejit_is_active("bound", (uint8_t)0));
   EXPECT_EQ(ejit_activate("bound", (uint8_t)255), EJIT_OK_C);
@@ -1049,10 +923,10 @@ TEST(EJitCApi, DynamicCellIdxBoundaries) {
 }
 
 TEST(EJitCApi, MultiPeriodDynamicIndices) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int cellArr[256], trpArr[256];
   ejit_register_period_array("cell", "cellArr", cellArr, 256);
   ejit_register_period_array("trp", "trpArr", trpArr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t indices[] = {3, 7, 15, 31, 63};
   for (size_t i = 0; i < sizeof(indices) / sizeof(indices[0]); i++) {
     EXPECT_EQ(ejit_activate("cell", indices[i]), EJIT_OK_C);
@@ -1072,9 +946,9 @@ TEST(EJitCApi, MultiPeriodDynamicIndices) {
 }
 
 TEST(EJitCApi, InvalidateWithDynamicCellIdx) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("inv", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   for (uint8_t i = 0; i < 5; i++)
     ejit_activate("inv", i);
   for (uint8_t i = 0; i < 5; i++)
@@ -1087,9 +961,9 @@ TEST(EJitCApi, InvalidateWithDynamicCellIdx) {
 }
 
 TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
-  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   int arr[256];
   ejit_register_period_array("cycle", "arr", arr, 256);
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
   uint8_t workload[] = {10, 20, 30, 40, 50};
   for (size_t cycle = 0; cycle < 3; cycle++) {
     for (size_t i = 0; i < sizeof(workload) / sizeof(workload[0]); i++)
@@ -1104,9 +978,7 @@ TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
   ejit_shutdown();
 }
 
-#endif // !EJIT_SRE_TASKPOOL
 
-#ifdef EJIT_SRE_TASKPOOL
 //===----------------------------------------------------------------------===//
 // Taskpool-mode C-API: registration freeze (finding 二) + name/array control
 // plane synced to the SwitchController (findings 一/五).
@@ -1114,51 +986,6 @@ TEST(EJitCApi, ActivationCycleWithRuntimeIndex) {
 
 namespace {
 
-TEST(EJitFunctionBodyCyclesTest, AggregatesAotAndJitIndependently) {
-  ejit_function_body_cycles_reset();
-
-  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyAot, 90, 100,
-                                   130, 140);
-  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyAot, 180, 200,
-                                   250, 270);
-  ejit_function_body_cycles_record("body_cost", kEjitFunctionBodyJit, 290, 300,
-                                   311, 321);
-
-  ejit_function_body_cycles_test_t Aot{};
-  ASSERT_EQ(
-      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyAot, &Aot),
-      1u);
-  EXPECT_EQ(Aot.count, 2u);
-  EXPECT_EQ(Aot.total, 80u);
-  EXPECT_EQ(Aot.min, 30u);
-  EXPECT_EQ(Aot.max, 50u);
-  EXPECT_EQ(Aot.wrapper_total, 140u);
-  EXPECT_EQ(Aot.wrapper_min, 50u);
-  EXPECT_EQ(Aot.wrapper_max, 90u);
-  EXPECT_EQ(Aot.overhead_total, 60u);
-  EXPECT_EQ(Aot.overhead_min, 20u);
-  EXPECT_EQ(Aot.overhead_max, 40u);
-
-  ejit_function_body_cycles_test_t Jit{};
-  ASSERT_EQ(
-      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyJit, &Jit),
-      1u);
-  EXPECT_EQ(Jit.count, 1u);
-  EXPECT_EQ(Jit.total, 11u);
-  EXPECT_EQ(Jit.min, 11u);
-  EXPECT_EQ(Jit.max, 11u);
-  EXPECT_EQ(Jit.wrapper_total, 31u);
-  EXPECT_EQ(Jit.wrapper_min, 31u);
-  EXPECT_EQ(Jit.wrapper_max, 31u);
-  EXPECT_EQ(Jit.overhead_total, 20u);
-  EXPECT_EQ(Jit.overhead_min, 20u);
-  EXPECT_EQ(Jit.overhead_max, 20u);
-
-  ejit_function_body_cycles_reset();
-  EXPECT_EQ(
-      ejit_function_body_cycles_get("body_cost", kEjitFunctionBodyAot, &Aot),
-      0u);
-}
 // Reset process-global registration state so each taskpool test starts clean:
 // no live gEJIT, no staged data, no staged error, empty name registries. This
 // is essential because the C ABI / registries are process singletons that leak
@@ -1193,6 +1020,55 @@ TEST(EJitCApiTaskpool, SingleBoundRejectsEmptyObject) {
             -1);
   EXPECT_EQ(Fn, nullptr);
   EXPECT_EQ(Bucket, 0u);
+  ejit_shutdown();
+}
+
+TEST(EJitCApiTaskpool, OptionalOutputsAndValidationPrecedence) {
+  resetTaskpoolRegState();
+  auto resolve = ejit_taskpool_compile_or_get_bound_v;
+  void *fn = reinterpret_cast<void *>(1);
+  uint32_t bucket = 19;
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 1, &fn, nullptr), -2);
+  EXPECT_EQ(fn, nullptr);
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 1, nullptr, &bucket), -2);
+  EXPECT_EQ(bucket, 0u);
+  ejit_taskpool_release_read(0);
+
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
+  ejit_dim_pair_t dim{0, 0};
+  EXPECT_EQ(resolve(0, &dim, UINT32_MAX, nullptr, 0, nullptr, nullptr), -1);
+  EXPECT_EQ(resolve(0, nullptr, 1, nullptr, 0, nullptr, nullptr), -1);
+  EXPECT_EQ(resolve(0, nullptr, 0, nullptr, UINT32_MAX, nullptr, nullptr), -1);
+  ejit_bound_ptr_t b{nullptr, 4, 0};
+  EXPECT_EQ(resolve(0, nullptr, 0, &b, 1, nullptr, nullptr), -1);
+  dim.instanceId = UINT32_MAX;
+  EXPECT_EQ(resolve(0, &dim, 1, nullptr, 0, nullptr, nullptr), -1);
+  dim = {UINT32_MAX, 0};
+  EXPECT_EQ(resolve(0, &dim, 1, nullptr, 0, nullptr, nullptr), -1);
+  // Zero counts skip both lists; the otherwise invalid entries are not read.
+  EXPECT_NE(resolve(0, &dim, 0, &b, 0, &fn, &bucket), -1);
+  if (fn)
+    ejit_taskpool_release_read(bucket);
+  ejit_shutdown();
+  ejit_taskpool_release_read(0);
+  ejit_taskpool_release_read(UINT32_MAX);
+}
+
+TEST(EJitCApiTaskpool, MissingRegistrationFixupsAreSkipped) {
+  resetTaskpoolRegState();
+  auto check = [] {
+    uint32_t slot = 37;
+    ejit_register_lifecycle(nullptr, &slot);
+    ejit_register_funcindex(nullptr, &slot);
+    EXPECT_EQ(slot, 37u);
+    ejit_register_lifecycle("skipped", nullptr);
+    ejit_register_funcindex("skipped", nullptr);
+    ejit_register_icache_slot("skipped", nullptr, 0, nullptr);
+    EXPECT_FALSE(llvm::ejit::EJitRegistrationStore::instance().hasError());
+  };
+  check();
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK_C);
+  check(); // Missing inputs do not become frozen-registration errors.
   ejit_shutdown();
 }
 
@@ -1245,7 +1121,6 @@ TEST(EJitCApiTaskpool, PreInitLifecycleActivateAndArraySync) {
   ejit_shutdown();
 }
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
 // The C ABI's ejit_register_icache_slot gained a 4th argument: the sentinel
 // MissFn the branchless wrapper's cell table is DEFINED pre-filled with. The
 // registration must carry it into the slot registry, so a drain triggered
@@ -1314,7 +1189,6 @@ TEST(EJitCApiTaskpool, IcacheSlotRegistrationCarriesTheSentinel) {
   EXPECT_EQ(guardedCells[3], 0u)
       << "a guarded (null-missFn) slot must keep the historical 0";
 }
-#endif // EJIT_SRE_SHARED_TASKPOOL
 
 // Finding (一): name-level activate/deactivate through the PUBLIC EJit API
 // syncs the time-window state AND the taskpool SwitchController; the version
@@ -1329,45 +1203,31 @@ TEST(EJitTaskpoolArray, NameLevelSyncsSwitchController) {
   ejit_register_period_array("cell", "cellArr", cellArr, 16); // staged
   EJit ejit(Config{});
   ASSERT_FALSE(ejit.initFailed());
-  EJitTaskPool *tp = ejit.taskPool();
-  ASSERT_NE(tp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
   ASSERT_NE(dt, kEJitInvalidDimType);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
-  // Shared build: deactivate/activate writes the shared pool's switch
-  // controller, which is separate from the per-instance EJitTaskPool switch.
-  // Check enabled state via the shared pool (instanceVersion is private).
-  // initSharedStorage defaults all instances to disabled — enable explicitly.
+  // The shared state starts inactive. Activate explicitly for this test.
   EJitSharedTaskPool *sp = ejit.sharedTaskPool();
   ASSERT_NE(sp, nullptr);
   EXPECT_TRUE(sp->setInstanceEnabled(dt, 5, true));
   auto instanceEnabled = [&]() { return sp->isInstanceActive(dt, 5); };
-#else
-  EJitSwitchController &sw = tp->switchController();
-  auto instanceEnabled = [&]() { return sw.isInstanceEnabled(dt, 5); };
-  auto instanceVer = [&]() { return sw.getInstanceVersion(dt, 5); };
+  auto instanceVer = [&]() { return sp->state()->version[dt][5].loadAcquire(); };
   uint32_t v0 = instanceVer();
-#endif
 
   EXPECT_TRUE(instanceEnabled()); // defaults enabled
   // deactivate.
   EXPECT_TRUE(ejit.deactivate("cell", 5));
   EXPECT_FALSE(ejit.isActive("cell", 5));
   EXPECT_FALSE(instanceEnabled());
-#ifndef EJIT_SRE_SHARED_TASKPOOL
   EXPECT_EQ(instanceVer(), v0 + 1);
-#endif
   // activate.
   EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_TRUE(ejit.isActive("cell", 5));
   EXPECT_TRUE(instanceEnabled());
-#ifndef EJIT_SRE_SHARED_TASKPOOL
   EXPECT_EQ(instanceVer(), v0 + 2);
   // Redundant activate: no flip.
   EXPECT_TRUE(ejit.activate("cell", 5));
   EXPECT_EQ(instanceVer(), v0 + 2);
-#endif
   resetTaskpoolRegState();
 }
 
@@ -1382,16 +1242,16 @@ TEST(EJitTaskpoolArray, UnknownPeriodCleanReject) {
   ejit_register_period_array("cell", "cellArr", cellArr, 16);
   EJit ejit(Config{});
   ASSERT_FALSE(ejit.initFailed());
-  EJitTaskPool *tp = ejit.taskPool();
-  ASSERT_NE(tp, nullptr);
+  auto *sp = ejit.sharedTaskPool();
+  ASSERT_NE(sp, nullptr);
   uint32_t dt = EJitLifecycleRegistry::instance().lookup("cell");
-  EJitSwitchController &sw = tp->switchController();
-
-  uint32_t v0 = sw.getInstanceVersion(dt, 2);
+  ASSERT_NE(dt, kEJitInvalidDimType);
+  ASSERT_TRUE(ejit.activate("cell", 2));
+  uint32_t v0 = sp->state()->version[dt][2].loadAcquire();
   EXPECT_FALSE(ejit.activate("wrong", 2));   // unknown lifecycle -> reject
   EXPECT_FALSE(ejit.deactivate("wrong", 2));
-  EXPECT_TRUE(sw.isInstanceEnabled(dt, 2));
-  EXPECT_EQ(sw.getInstanceVersion(dt, 2), v0);
+  EXPECT_TRUE(sp->isInstanceActive(dt, 2));
+  EXPECT_EQ(sp->state()->version[dt][2].loadAcquire(), v0);
   EXPECT_FALSE(ejit.isActive("wrong", 2));
   resetTaskpoolRegState();
 }
@@ -1420,8 +1280,8 @@ TEST(EJitTaskpoolInit, InitFailureSetsFailedAndStopsWorker) {
   const uint8_t bc[] = {1, 2, 3};
   EXPECT_FALSE(ejit.registerBitcode("x", bc, sizeof(bc)));
   // The worker was never started on a failed init.
-  if (EJitTaskPool *tp = ejit.taskPool())
-    EXPECT_FALSE(tp->isWorkerRunning());
+  ASSERT_NE(ejit.sharedTaskPool(), nullptr);
+  EXPECT_FALSE(ejit.sharedTaskPool()->asyncServiceAvailable());
   resetTaskpoolRegState();
 }
 
@@ -1442,7 +1302,6 @@ TEST(EJitCApiTaskpool, InitFailsAndDestroysOnRegistrationError) {
   ejit_shutdown();                              // safe no-op
   resetTaskpoolRegState();
 }
-#endif // EJIT_SRE_TASKPOOL
 
 //===----------------------------------------------------------------------===//
 // PeriodArrayRegistry::getArrayByBaseAddr tests
@@ -1512,9 +1371,9 @@ static Function *createPeriodIndFunc(LLVMContext &Ctx, Module &M,
 
   // Attach !ejit.metadata with a sub-node for period-array-index:
   //   !ejit.metadata = !{!0}
-  //   !0 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+  //   !0 = !{!"ejit_dim", !"cell", i32 0}
   Metadata *MDOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+      MDString::get(Ctx, TAG_EJIT_DIM),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(B.getInt32Ty(), 0)),
   };
@@ -2017,7 +1876,7 @@ TEST(EJitOptimizer, FullPipelineEndToEnd) {
 
 /// Verify the optimization pipeline folds llvm.expect-guarded constant
 /// branches and DCEs the dead calls they guard. The AOT IR carries
-/// __builtin_expect / LIKELY hints on top of may_const conditions; once
+/// __builtin_expect / LIKELY hints on top of period_const conditions; once
 /// specialization turns the condition into a constant, the expect intrinsic
 /// blocks InstCombine/SCCP from folding the branch unless LowerExpectIntrinsic
 /// runs first. Without it the dead block (and its calls) survive ADCE and the
@@ -2093,7 +1952,7 @@ TEST(EJitOptimizer, FoldsExpectGuardedConstantBranch) {
 //===----------------------------------------------------------------------===//
 
 /// Create a function with a GEP + load from a global array (simulating
-/// a period array access marked with !ejit.may_const).
+/// a period array access marked with !ejit.period_const).
 /// The GEP index is a constant so the pass can compute the offset.
 /// Also adds !ejit.metadata to the global to identify it as a period array.
 static Function *createStructFieldFunc(LLVMContext &Ctx, Module &M,
@@ -2106,9 +1965,9 @@ static Function *createStructFieldFunc(LLVMContext &Ctx, Module &M,
   auto *GVar = new GlobalVariable(M, ArrTy, false, GlobalValue::InternalLinkage,
                                   ConstantAggregateZero::get(ArrTy), "g_arr");
 
-  // Add !ejit.metadata to GVar: !g_arr = !{!"ejit_period_arr", !"cell", i32 4}
+  // Add !ejit.metadata to GVar: !g_arr = !{!"ejit_group_indexed", !"cell", i32 4}
   Metadata *ArrMDOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
@@ -2127,15 +1986,15 @@ static Function *createStructFieldFunc(LLVMContext &Ctx, Module &M,
   auto *GEP = B.CreateInBoundsGEP(ArrTy, GVar, IdxList, "gep");
   auto *Load = B.CreateLoad(Int32Ty, GEP, "load");
 
-  // Add !ejit.may_const metadata to the load
-  Load->setMetadata("ejit.may_const",
+  // Add !ejit.period_const metadata to the load
+  Load->setMetadata("ejit.period_const",
                     MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
 
   B.CreateRet(Load);
   return F;
 }
 
-TEST(EJitStructFieldPass, MayConstLoadSubstitution) {
+TEST(EJitStructFieldPass, PeriodConstLoadSubstitution) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_struct", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -2155,7 +2014,7 @@ TEST(EJitStructFieldPass, MayConstLoadSubstitution) {
   EJitStructFieldPass structPass(reg);
   structPass.initFromModule(*M);
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
-  auto AuditSites = structPass.collectMayConstLoadSites(*M);
+  auto AuditSites = structPass.collectPeriodConstLoadSites(*M);
   ASSERT_EQ(AuditSites.size(), 1u);
   EXPECT_EQ(AuditSites.front().functionName, F->getName().str());
   EXPECT_EQ(AuditSites.front().globalName, "g_arr");
@@ -2177,7 +2036,7 @@ TEST(EJitStructFieldPass, MayConstLoadSubstitution) {
   // read mockArr + 8 = mockArr[2] = 30, and replace the load.
   EXPECT_FALSE(PA.areAllPreserved());
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
-  EXPECT_TRUE(structPass.collectMayConstLoadSites(*M).empty());
+  EXPECT_TRUE(structPass.collectPeriodConstLoadSites(*M).empty());
 #endif
 
   // Verify the load was replaced: the ret should now use a ConstantInt(30)
@@ -2197,9 +2056,9 @@ TEST(EJitStructFieldPass, MayConstLoadSubstitution) {
 }
 
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
-TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
+TEST(EJitStructFieldPass, InstrumentsRuntimePeriodConstHitsBeforeReplacement) {
   LLVMContext Ctx;
-  Module M("test_mayconst_hits", Ctx);
+  Module M("test_period_const_hits", Ctx);
   M.setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
   Function *F = createStructFieldFunc(Ctx, M, 2);
 
@@ -2209,11 +2068,11 @@ TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
   EJitStructFieldPass Pass(Reg);
   Pass.initFromModule(M);
 
-  auto Sites = Pass.instrumentMayConstLoadSites(M);
+  auto Sites = Pass.instrumentPeriodConstLoadSites(M);
   ASSERT_EQ(Sites.size(), 1u);
   EXPECT_EQ(Sites[0].siteId, 1u);
   auto *Counters = M.getGlobalVariable(
-      EJitStructFieldPass::MayConstCounterName);
+      EJitStructFieldPass::PeriodConstCounterName);
   ASSERT_NE(Counters, nullptr);
   auto *CounterArray = dyn_cast<ArrayType>(Counters->getValueType());
   ASSERT_NE(CounterArray, nullptr);
@@ -2228,10 +2087,10 @@ TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
     }
   EXPECT_EQ(AtomicAdds, 1u);
 
-  EJitStructFieldPass::removeMayConstLoadInstrumentation(M);
-  EXPECT_EQ(M.getGlobalVariable(EJitStructFieldPass::MayConstCounterName),
+  EJitStructFieldPass::removePeriodConstLoadInstrumentation(M);
+  EXPECT_EQ(M.getGlobalVariable(EJitStructFieldPass::PeriodConstCounterName),
             nullptr);
-  auto SurvivingSites = Pass.collectMayConstLoadSites(M);
+  auto SurvivingSites = Pass.collectPeriodConstLoadSites(M);
   ASSERT_EQ(SurvivingSites.size(), 1u);
   EXPECT_EQ(SurvivingSites[0].siteId, 1u);
   AtomicAdds = 0;
@@ -2241,7 +2100,90 @@ TEST(EJitStructFieldPass, InstrumentsRuntimeMayConstHitsBeforeReplacement) {
 }
 #endif
 
-TEST(EJitStructFieldPass, NoMayConstNoChange) {
+#if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE) && \
+    GTEST_HAS_STREAM_REDIRECTION
+TEST(EJitOptimizer, AuditEndpointsAcrossTierExits) {
+  PeriodArrayRegistry Registry;
+  EJitOptimizer Opt(Registry);
+  SpecializationContext Spec;
+  Spec.fnName = "audit_entry";
+  std::vector<EJitPeriodConstLoadSite> Sampled;
+  for (unsigned Case = 0; Case != 5; ++Case) {
+    SCOPED_TRACE(Case);
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    auto M = parseAssemblyString(R"(
+      target triple = "aarch64-unknown-linux-gnu"
+      define i32 @audit_entry(ptr %p, ptr %q, ptr %r) !ejit.metadata !0 {
+        %dead = load i32, ptr %p, !ejit.period_const !2
+        %excluded = load volatile i32, ptr %r, !ejit.period_const !2
+        %live = load i32, ptr %q, !ejit.period_const !2
+        ret i32 %live
+      }
+      !0 = !{!1}
+      !1 = !{!"ejit_entry"}
+      !2 = !{}
+    )", Err, Ctx);
+    ASSERT_TRUE(M) << Err.getMessage().str();
+    Spec.tier = Case == 0 || Case == 4 ? CompileTier::Baseline
+                          : Case == 1 ? CompileTier::Instrumented
+                                      : CompileTier::PGOUse;
+    Spec.profileAuditOnly = Case == 2;
+    Spec.periodConstLoadSites = Sampled;
+    if (Case == 4) {
+      // Baseline with a supplied snapshot uses that inventory, even when the
+      // optimized module has more sites. Preserve the signed net difference.
+      Spec.periodConstLoadSites.resize(1);
+      auto &BB = M->getFunction("audit_entry")->getEntryBlock();
+      auto *Ret = cast<ReturnInst>(BB.getTerminator());
+      IRBuilder<> B(Ret);
+      Ret->setOperand(0, B.CreateAdd(&BB.front(), Ret->getReturnValue()));
+    }
+    const auto OldLevel = ejit_get_log_level();
+    ejit_set_log_level(EJIT_LOG_DEBUG);
+    testing::internal::CaptureStdout();
+    Opt.runPipeline(*M, Spec);
+    std::string Output = testing::internal::GetCapturedStdout();
+    ejit_set_log_level(OldLevel);
+    ASSERT_FALSE(verifyModule(*M, &errs()));
+    if (Case == 1) {
+      EXPECT_EQ(Output.find("period_const-audit entry="), std::string::npos);
+      EXPECT_EQ(Output.find("period_const-site entry="), std::string::npos);
+      EXPECT_NE(M->getGlobalVariable(EJitStructFieldPass::PeriodConstCounterName),
+                nullptr);
+      auto Sites = Opt.getLastPeriodConstLoadSites();
+      ASSERT_EQ(Sites.size(), 2u);
+      Sampled.assign(Sites.begin(), Sites.end());
+      EXPECT_EQ(Sampled[0].siteId, 1u);
+      EXPECT_EQ(Sampled[1].siteId, 2u);
+      Sampled[0].runtimeHits = 17;
+      Sampled[1].runtimeHits = 11;
+      continue;
+    }
+    EXPECT_TRUE(Opt.getLastPeriodConstLoadSites().empty());
+    EXPECT_NE(Output.find("versions=1 period_const="), std::string::npos);
+    EXPECT_EQ(M->getGlobalVariable(EJitStructFieldPass::PeriodConstCounterName),
+              nullptr);
+    if (Case == 4) {
+      EXPECT_NE(Output.find("period_const=1/na/2 removed=-1"), std::string::npos)
+          << Output;
+      continue;
+    }
+    if (Case != 0) {
+      EXPECT_NE(Output.find("offset=unknown hits=17"), std::string::npos);
+      EXPECT_NE(Output.find("offset=unknown hits=11"), std::string::npos);
+    }
+    EXPECT_NE(Output.find("period_const=2/na/1 removed=1 direct=na pipeline=na"),
+              std::string::npos) << Output;
+    EXPECT_NE(Output.find(Case == 0
+                              ? "runtime_hits=0 hit_sites=0 removed_runtime_hits=0"
+                              : "runtime_hits=28 hit_sites=2 removed_runtime_hits=17"),
+              std::string::npos) << Output;
+  }
+}
+#endif
+
+TEST(EJitStructFieldPass, NoPeriodConstNoChange) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_nochange", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -2292,7 +2234,7 @@ TEST(EJitStructFieldPass, BoundPointerReadsBorrowedObject) {
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 12, !4}
     !4 = !{i64 0, i64 8}
   )",
@@ -2338,7 +2280,7 @@ TEST(EJitStructFieldPass, PointerConstantUsesTargetWidthAndEndian) {
         ret ptr %value
       }
       !0 = !{!1}
-      !1 = !{!"ejit_period", !"period_ptr"}
+      !1 = !{!"ejit_group", !"period_ptr"}
     )",
                                  Err, Ctx);
     ASSERT_TRUE(M) << Err.getMessage().str();
@@ -2401,27 +2343,27 @@ TEST(EJitStructFieldPass, BoundPointerPropagatesThroughDirectHelpers) {
         !ejit.metadata !7 {
     entry:
       %mode.ptr = getelementptr %Cfg, ptr %cfg, i32 0, i32 1
-      %mode = load i32, ptr %mode.ptr, !ejit.may_const !10
+      %mode = load i32, ptr %mode.ptr, !ejit.period_const !10
       %tail = call i32 @bound_helper3(ptr %mode.ptr)
       %result = add i32 %mode, %tail
       ret i32 %result
     }
     define internal i32 @bound_helper3(ptr %mode.ptr) noinline {
     entry:
-      %mode = load i32, ptr %mode.ptr, !ejit.may_const !10
+      %mode = load i32, ptr %mode.ptr, !ejit.period_const !10
       ret i32 %mode
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !5}
     !4 = distinct !{!8, !9, !12}
     !5 = !{i64 4, i64 4}
     !7 = distinct !{!8, !10, !11, !12}
     !8 = !{!"ejit_entry"}
-    !9 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !9 = !{!"ejit_dim", !"cell", i32 0}
     !10 = !{!"ejit"}
-    !11 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !11 = !{!"ejit_dim", !"cell", i32 0}
     !12 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !5}
   )",
                                Err, Ctx);
@@ -2475,17 +2417,17 @@ TEST(EJitStructFieldPass, AmbiguousHelperPointerIsNotSpecialized) {
     define i32 @shared_helper(i8 %cell, ptr %cfg) noinline
         !ejit.metadata !4 {
     entry:
-      %value = load i32, ptr %cfg, !ejit.may_const !8
+      %value = load i32, ptr %cfg, !ejit.period_const !8
       ret i32 %value
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
     !4 = distinct !{!6, !7, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
-    !7 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !7 = !{!"ejit_dim", !"cell", i32 0}
     !8 = !{!"ejit"}
     !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
@@ -2523,17 +2465,17 @@ TEST(EJitStructFieldPass, IndirectAddressTakenHelperIsNotSpecialized) {
     define i32 @bound_helper(i8 %cell, ptr %cfg) noinline
         !ejit.metadata !4 {
     entry:
-      %value = load i32, ptr %cfg, !ejit.may_const !8
+      %value = load i32, ptr %cfg, !ejit.period_const !8
       ret i32 %value
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
     !4 = distinct !{!6, !7, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
-    !7 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !7 = !{!"ejit_dim", !"cell", i32 0}
     !8 = !{!"ejit"}
     !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
@@ -2571,12 +2513,12 @@ TEST(EJitStructFieldPass, EntryDimensionWithoutBoundPointerIsNotSpecialized) {
     define i32 @unannotated_helper(i8 %cell, ptr %cfg) noinline
         !ejit.metadata !6 {
     entry:
-      %value = load i32, ptr %cfg, !ejit.may_const !4
+      %value = load i32, ptr %cfg, !ejit.period_const !4
       ret i32 %value
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
     !4 = !{!"ejit"}
     !5 = !{i64 0, i64 4}
@@ -2615,18 +2557,18 @@ TEST(EJitStructFieldPass, MismatchedHelperDimensionIsNotSpecialized) {
     define i32 @wrong_dimension_helper(i8 %cell, ptr %cfg) noinline
         !ejit.metadata !4 {
     entry:
-      %value = load i32, ptr %cfg, !ejit.may_const !7
+      %value = load i32, ptr %cfg, !ejit.period_const !7
       ret i32 %value
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
     !4 = distinct !{!6, !8, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
-    !8 = !{!"ejit_period_arr_ind", !"other", i32 0}
+    !8 = !{!"ejit_dim", !"other", i32 0}
     !9 = !{!"ejit_bound_ptr", !"other", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
@@ -2664,18 +2606,18 @@ TEST(EJitStructFieldPass, HelperOtherCellIsNotSpecialized) {
     define i32 @bound_helper(i8 %cell, ptr %cfg) noinline
         !ejit.metadata !4 {
     entry:
-      %value = load i32, ptr %cfg, !ejit.may_const !7
+      %value = load i32, ptr %cfg, !ejit.period_const !7
       ret i32 %value
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
     !4 = distinct !{!6, !8, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
-    !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !8 = !{!"ejit_dim", !"cell", i32 0}
     !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
@@ -2712,18 +2654,18 @@ TEST(EJitStructFieldPass, HelperDifferentSpecializedConstantIsNotSpecialized) {
     define i32 @bound_helper(i8 %cell, ptr %cfg) noinline
         !ejit.metadata !4 {
     entry:
-      %value = load i32, ptr %cfg, !ejit.may_const !7
+      %value = load i32, ptr %cfg, !ejit.period_const !7
       ret i32 %value
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
     !4 = distinct !{!6, !8, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
-    !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !8 = !{!"ejit_dim", !"cell", i32 0}
     !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
@@ -2769,18 +2711,18 @@ TEST(EJitStructFieldPass, InconsistentHelperDimensionSourcesAreNotSpecialized) {
     define i32 @bound_helper(i8 %cell, ptr %cfg) noinline
         !ejit.metadata !4 {
     entry:
-      %value = load i32, ptr %cfg, !ejit.may_const !7
+      %value = load i32, ptr %cfg, !ejit.period_const !7
       ret i32 %value
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
     !4 = distinct !{!6, !8, !9}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
-    !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !8 = !{!"ejit_dim", !"cell", i32 0}
     !9 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 4, !5}
   )",
                                Err, Ctx);
@@ -2804,6 +2746,52 @@ TEST(EJitStructFieldPass, InconsistentHelperDimensionSourcesAreNotSpecialized) {
       << "all callsites must agree on the helper cell identity";
 }
 
+TEST(EJitOptimizer, ResolvesBoundPeriodAgainForEachModule) {
+  PeriodArrayRegistry Registry;
+  EJitOptimizer Opt(Registry);
+  SpecializationContext Spec;
+  Spec.fnName = "root";
+  Spec.dimensions = {{"cell", 2}, {"trp", 7}};
+  int32_t Object = 42;
+  Spec.boundPointers.push_back(
+      {reinterpret_cast<const uint8_t *>(&Object), sizeof(Object), 1});
+  for (StringRef Period : {"cell", "trp", "cell"}) {
+    LLVMContext Ctx;
+    SMDiagnostic Err;
+    // Identical symbols, argument index and context; only the module's
+    // contract changes. The call matches cell instance 2, never trp 7.
+    std::string IR = R"(
+      define i32 @root(i8 %d, ptr %p) !ejit.metadata !0 {
+        %r = call i32 @helper(i8 2, ptr %p)
+        ret i32 %r
+      }
+      define i32 @helper(i8 %d, ptr %p) noinline !ejit.metadata !0 {
+        %v = load i32, ptr %p, !ejit.period_const !5
+        ret i32 %v
+      }
+      !0 = !{!1, !2, !3}
+      !1 = !{!"ejit_entry"}
+      !2 = !{!"ejit_dim", !")" + Period.str() + R"(", i32 0}
+      !3 = !{!"ejit_bound_ptr", !")" + Period.str() + R"(", i32 1, i64 4, !4}
+      !4 = !{i64 0, i64 4}
+      !5 = !{}
+    )";
+    auto M = parseAssemblyString(IR, Err, Ctx);
+    ASSERT_TRUE(M) << Err.getMessage().str();
+    Opt.runPipeline(*M, Spec);
+    Function *Helper = M->getFunction("helper");
+    ASSERT_NE(Helper, nullptr);
+    auto *Ret = cast<ReturnInst>(Helper->getEntryBlock().getTerminator());
+    if (Period == "cell") {
+      auto *C = dyn_cast<ConstantInt>(Ret->getReturnValue());
+      ASSERT_NE(C, nullptr);
+      EXPECT_EQ(C->getSExtValue(), Object);
+    } else {
+      EXPECT_TRUE(isa<LoadInst>(Ret->getReturnValue()));
+    }
+  }
+}
+
 TEST(EJitStructFieldPass, BoundPointerHelperSupportsMultipleCellVersions) {
   constexpr const char *IR = R"(
     %Cfg = type { i32 }
@@ -2815,19 +2803,19 @@ TEST(EJitStructFieldPass, BoundPointerHelperSupportsMultipleCellVersions) {
     define i32 @bound_helper(i8 %cell, i8 %trp, ptr %cfg) noinline
         !ejit.metadata !4 {
     entry:
-      %value = load i32, ptr %cfg, !ejit.may_const !7
+      %value = load i32, ptr %cfg, !ejit.period_const !7
       ret i32 %value
     }
     !0 = distinct !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
-    !2 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
     !3 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
     !4 = distinct !{!6, !8, !9, !10}
     !5 = !{i64 0, i64 4}
     !6 = !{!"ejit_entry"}
     !7 = !{!"ejit"}
-    !8 = !{!"ejit_period_arr_ind", !"cell", i32 0}
-    !9 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !8 = !{!"ejit_dim", !"cell", i32 0}
+    !9 = !{!"ejit_dim", !"trp", i32 1}
     !10 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !5}
   )";
 
@@ -2879,16 +2867,16 @@ TEST(EJitStructFieldPass, BoundPointerHelperPropagatesCellAndTrpPointers) {
     define i32 @bound_helper(i8 %cell, i8 %trp, ptr %cellCfg, ptr %trpCfg)
         noinline !ejit.metadata !1 {
     entry:
-      %cellValue = load i32, ptr %cellCfg, !ejit.may_const !8
-      %trpValue = load i32, ptr %trpCfg, !ejit.may_const !8
+      %cellValue = load i32, ptr %cellCfg, !ejit.period_const !8
+      %trpValue = load i32, ptr %trpCfg, !ejit.period_const !8
       %sum = add i32 %cellValue, %trpValue
       ret i32 %sum
     }
     !0 = distinct !{!2, !3, !4, !5, !6}
     !1 = distinct !{!2, !3, !4, !5, !6}
     !2 = !{!"ejit_entry"}
-    !3 = !{!"ejit_period_arr_ind", !"cell", i32 0}
-    !4 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !3 = !{!"ejit_dim", !"cell", i32 0}
+    !4 = !{!"ejit_dim", !"trp", i32 1}
     !5 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 4, !7}
     !6 = !{!"ejit_bound_ptr", !"trp", i32 3, i64 4, !7}
     !7 = !{i64 0, i64 4}
@@ -2941,8 +2929,8 @@ TEST(EJitStructFieldPass, FreeDimCombinesWithTwoStrictBoundPointers) {
       %slotmod = urem i32 %slot, 5
       %cellPtr = getelementptr [5 x i32], ptr %cellCfg, i32 0, i32 %slotmod
       %trpPtr = getelementptr [5 x i32], ptr %trpCfg, i32 0, i32 %slotmod
-      %cellValue = load i32, ptr %cellPtr, !ejit.may_const !13
-      %trpValue = load i32, ptr %trpPtr, !ejit.may_const !13
+      %cellValue = load i32, ptr %cellPtr, !ejit.period_const !13
+      %trpValue = load i32, ptr %trpPtr, !ejit.period_const !13
       %sum = add i32 %cellValue, %trpValue
       %live = add i32 %sum, %slot
       ret i32 %live
@@ -2950,8 +2938,8 @@ TEST(EJitStructFieldPass, FreeDimCombinesWithTwoStrictBoundPointers) {
     !0 = distinct !{!2, !3, !4, !5, !6, !7}
     !1 = distinct !{!2, !3, !4, !5, !6, !7}
     !2 = !{!"ejit_entry"}
-    !3 = !{!"ejit_period_arr_ind", !"cell", i32 0}
-    !4 = !{!"ejit_period_arr_ind", !"trp", i32 1}
+    !3 = !{!"ejit_dim", !"cell", i32 0}
+    !4 = !{!"ejit_dim", !"trp", i32 1}
     !5 = !{!"ejit_free_dim", !"", i32 2}
     !6 = !{!"ejit_bound_ptr", !"cell", i32 3, i64 20,
             !8, !9, !10, !11, !12}
@@ -3011,9 +2999,9 @@ static Function *createMultiFieldFunc(LLVMContext &Ctx, Module &M) {
   auto *GVar = new GlobalVariable(M, ArrTy, false, GlobalValue::InternalLinkage,
                                   ConstantAggregateZero::get(ArrTy), "g_arr");
 
-  // !ejit.metadata = !{!"ejit_period_arr", !"cell", i32 4}
+  // !ejit.metadata = !{!"ejit_group_indexed", !"cell", i32 4}
   Metadata *ArrOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
@@ -3031,14 +3019,14 @@ static Function *createMultiFieldFunc(LLVMContext &Ctx, Module &M) {
   Value *I1[] = {B.getInt32(0), B.getInt64(1)};
   auto *GEP1 = B.CreateInBoundsGEP(ArrTy, GVar, I1, "elem1");
   auto *Load1 = B.CreateLoad(Int32Ty, GEP1, "val1");
-  Load1->setMetadata("ejit.may_const",
+  Load1->setMetadata("ejit.period_const",
                      MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
 
   // Load from g_arr[3] (offset 12)
   Value *I3[] = {B.getInt32(0), B.getInt64(3)};
   auto *GEP3 = B.CreateInBoundsGEP(ArrTy, GVar, I3, "elem3");
   auto *Load3 = B.CreateLoad(Int32Ty, GEP3, "val3");
-  Load3->setMetadata("ejit.may_const",
+  Load3->setMetadata("ejit.period_const",
                      MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
 
   auto *Sum = B.CreateAdd(Load1, Load3, "sum");
@@ -3058,7 +3046,7 @@ static Function *createMultiFieldFunc(LLVMContext &Ctx, Module &M) {
 ///     %idx  = add i32 15, (urem i32 %slot, 5)   ; 15 == a folded unitIdx*5
 ///     %gep  = getelementptr [20 x i32], ptr @g_arr, i32 0, i32 %idx
 ///     store i32 99, ptr %gep                    ; shares the address
-///     %v    = load i32, ptr %gep, !ejit.may_const
+///     %v    = load i32, ptr %gep, !ejit.period_const
 ///     ret i32 %v
 ///
 /// \p WithFreeDim controls whether the free-dim metadata node is attached, so
@@ -3080,7 +3068,7 @@ static Function *createFreeDimFunc(LLVMContext &Ctx, Module &M,
   auto *GVar = new GlobalVariable(M, ArrTy, false, GlobalValue::InternalLinkage,
                                   ConstantAggregateZero::get(ArrTy), "g_arr");
   Metadata *ArrMDOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "trp"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 20)),
   };
@@ -3126,7 +3114,7 @@ static Function *createFreeDimFunc(LLVMContext &Ctx, Module &M,
   B.CreateStore(B.getInt32(99), GEP);
 
   auto *Load = B.CreateLoad(Int32Ty, GEP, "val");
-  Load->setMetadata(MD_EJIT_MAY_CONST,
+  Load->setMetadata(MD_EJIT_PERIOD_CONST,
                     MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
   B.CreateRet(Load);
 
@@ -3180,7 +3168,7 @@ TEST(EJitStructFieldPass, FreeDimFoldsNonConstantIndex) {
   auto *Ret = dyn_cast_or_null<ReturnInst>(&F->back().back());
   ASSERT_NE(Ret, nullptr);
   auto *RetVal = dyn_cast<ConstantInt>(Ret->getReturnValue());
-  ASSERT_NE(RetVal, nullptr) << "may_const load was not folded";
+  ASSERT_NE(RetVal, nullptr) << "period_const load was not folded";
   EXPECT_EQ(RetVal->getSExtValue(), 115) << "expected g_arr[15 + 0 % 5]";
 }
 
@@ -3238,7 +3226,7 @@ TEST(EJitStructFieldPass, FreeDimAbsentDoesNotFold) {
   for (BasicBlock &BB : *F)
     for (Instruction &I : BB)
       if (auto *LI = dyn_cast<LoadInst>(&I))
-        LoadSurvives |= LI->hasMetadata(MD_EJIT_MAY_CONST);
+        LoadSurvives |= LI->hasMetadata(MD_EJIT_PERIOD_CONST);
   EXPECT_TRUE(LoadSurvives) << "folded without an ejit_free_dim annotation";
 }
 
@@ -3250,16 +3238,16 @@ TEST(EJitStructFieldPass, FreeDimDoesNotFoldVolatileOrAtomicLoads) {
     define i32 @free_ordered(i32 %cell, i32 %slot) !ejit.metadata !3 {
     entry:
       %ptr = getelementptr [5 x i32], ptr @g_arr, i32 0, i32 %slot
-      %volatile = load volatile i32, ptr %ptr, !ejit.may_const !7
-      %atomic = load atomic i32, ptr %ptr monotonic, align 4, !ejit.may_const !7
+      %volatile = load volatile i32, ptr %ptr, !ejit.period_const !7
+      %atomic = load atomic i32, ptr %ptr monotonic, align 4, !ejit.period_const !7
       %sum = add i32 %volatile, %atomic
       ret i32 %sum
     }
     !0 = !{!1}
-    !1 = !{!"ejit_period_arr", !"cell", i32 5}
+    !1 = !{!"ejit_group_indexed", !"cell", i32 5}
     !3 = distinct !{!4, !5, !6}
     !4 = !{!"ejit_entry"}
-    !5 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !5 = !{!"ejit_dim", !"cell", i32 0}
     !6 = !{!"ejit_free_dim", !"", i32 1}
     !7 = !{!"ejit"}
   )",
@@ -3294,14 +3282,14 @@ TEST(EJitStructFieldPass, FreeDimDoesNotPropagateToUnannotatedHelper) {
     define i32 @plain_helper(i32 %slot) noinline {
     entry:
       %ptr = getelementptr [5 x i32], ptr @g_arr, i32 0, i32 %slot
-      %value = load i32, ptr %ptr, !ejit.may_const !7
+      %value = load i32, ptr %ptr, !ejit.period_const !7
       ret i32 %value
     }
     !0 = !{!1}
-    !1 = !{!"ejit_period_arr", !"cell", i32 5}
+    !1 = !{!"ejit_group_indexed", !"cell", i32 5}
     !3 = distinct !{!4, !5, !6}
     !4 = !{!"ejit_entry"}
-    !5 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !5 = !{!"ejit_dim", !"cell", i32 0}
     !6 = !{!"ejit_free_dim", !"", i32 1}
     !7 = !{!"ejit"}
   )",
@@ -3366,12 +3354,12 @@ TEST(EJitStructFieldPass, FreeDimEvaluatorBailsOnOpaqueIndex) {
   Pass.initFromModule(M);
   runStructFieldOn(*F, Pass);
 
-  bool MayConstSurvives = false;
+  bool PeriodConstSurvives = false;
   for (BasicBlock &BB : *F)
     for (Instruction &I : BB)
       if (auto *LI = dyn_cast<LoadInst>(&I))
-        MayConstSurvives |= LI->hasMetadata(MD_EJIT_MAY_CONST);
-  EXPECT_TRUE(MayConstSurvives)
+        PeriodConstSurvives |= LI->hasMetadata(MD_EJIT_PERIOD_CONST);
+  EXPECT_TRUE(PeriodConstSurvives)
       << "an unevaluable index was folded to some address anyway";
 }
 
@@ -3384,14 +3372,14 @@ TEST(EJitStructFieldPass, FreeDimRejectsUnknownIndirectExtent) {
     entry:
       %base = load ptr, ptr @g_ptr
       %ptr = getelementptr i32, ptr %base, i32 %slot
-      %value = load i32, ptr %ptr, !ejit.may_const !7
+      %value = load i32, ptr %ptr, !ejit.period_const !7
       ret i32 %value
     }
     !0 = !{!1}
-    !1 = !{!"ejit_period_arr", !"cell", i32 1}
+    !1 = !{!"ejit_group_indexed", !"cell", i32 1}
     !3 = distinct !{!4, !5, !6}
     !4 = !{!"ejit_entry"}
-    !5 = !{!"ejit_period_arr_ind", !"cell", i32 0}
+    !5 = !{!"ejit_dim", !"cell", i32 0}
     !6 = !{!"ejit_free_dim", !"", i32 1}
     !7 = !{!"ejit"}
   )",
@@ -3409,11 +3397,11 @@ TEST(EJitStructFieldPass, FreeDimRejectsUnknownIndirectExtent) {
   ASSERT_NE(F, nullptr);
   Pass.run(*F, FAM);
 
-  bool MayConstSurvives = false;
+  bool PeriodConstSurvives = false;
   for (Instruction &I : instructions(*F))
     if (auto *LI = dyn_cast<LoadInst>(&I))
-      MayConstSurvives |= LI->hasMetadata(MD_EJIT_MAY_CONST);
-  EXPECT_TRUE(MayConstSurvives)
+      PeriodConstSurvives |= LI->hasMetadata(MD_EJIT_PERIOD_CONST);
+  EXPECT_TRUE(PeriodConstSurvives)
       << "used a witness where the pointed-to object extent is unknown";
 }
 
@@ -3443,14 +3431,14 @@ static std::unique_ptr<Module> foldTwoHop(LLVMContext &Ctx,
       %slot = getelementptr inbounds i8, ptr %outer, i64 16
       %inner = load ptr, ptr %slot)";
   if (MarkInnerPointer)
-    IR += ", !ejit.may_const !2";
+    IR += ", !ejit.period_const !2";
   IR += R"(
       %field = getelementptr inbounds i8, ptr %inner, i64 4
-      %d = load i32, ptr %field, !ejit.may_const !2
+      %d = load i32, ptr %field, !ejit.period_const !2
       ret i32 %d
     }
     !0 = !{!1}
-    !1 = !{!"ejit_period_arr", !"cell", i32 3}
+    !1 = !{!"ejit_group_indexed", !"cell", i32 3}
     !2 = !{}
   )";
   SMDiagnostic Err;
@@ -3469,15 +3457,15 @@ static std::unique_ptr<Module> foldTwoHop(LLVMContext &Ctx,
   return M;
 }
 
-static bool hasMayConstLoad(Function &F) {
+static bool hasPeriodConstLoad(Function &F) {
   for (Instruction &I : instructions(F))
     if (auto *LI = dyn_cast<LoadInst>(&I))
-      if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+      if (LI->hasMetadata(MD_EJIT_PERIOD_CONST))
         return true;
   return false;
 }
 
-TEST(EJitStructFieldPass, IndirectFoldsThroughMayConstPointerField) {
+TEST(EJitStructFieldPass, IndirectFoldsThroughPeriodConstPointerField) {
   LLVMContext Ctx;
   TwoHopInner Inner = {0, 7};
   TwoHopOuter Outer = {0, {nullptr, &Inner}};
@@ -3485,7 +3473,7 @@ TEST(EJitStructFieldPass, IndirectFoldsThroughMayConstPointerField) {
   ASSERT_TRUE(M);
   Function *F = M->getFunction("two_hop");
   // A single run resolves both hops.
-  EXPECT_FALSE(hasMayConstLoad(*F));
+  EXPECT_FALSE(hasPeriodConstLoad(*F));
   auto *Ret = cast<ReturnInst>(F->getEntryBlock().getTerminator());
   auto *Value = dyn_cast<ConstantInt>(Ret->getReturnValue());
   ASSERT_NE(Value, nullptr);
@@ -3498,19 +3486,19 @@ TEST(EJitStructFieldPass, IndirectDoesNotFollowUnmarkedPointerField) {
   TwoHopOuter Outer = {0, {nullptr, &Inner}};
   auto M = foldTwoHop(Ctx, /*MarkInnerPointer=*/false, Outer);
   ASSERT_TRUE(M);
-  EXPECT_TRUE(hasMayConstLoad(*M->getFunction("two_hop")))
+  EXPECT_TRUE(hasPeriodConstLoad(*M->getFunction("two_hop")))
       << "b[1] may change within the period; d must not be read through it";
 }
 
-TEST(EJitStructFieldPass, IndirectStopsAtNullMayConstPointer) {
+TEST(EJitStructFieldPass, IndirectStopsAtNullPeriodConstPointer) {
   LLVMContext Ctx;
   TwoHopOuter Outer = {0, {nullptr, nullptr}};
   auto M = foldTwoHop(Ctx, /*MarkInnerPointer=*/true, Outer);
   ASSERT_TRUE(M);
-  EXPECT_TRUE(hasMayConstLoad(*M->getFunction("two_hop")));
+  EXPECT_TRUE(hasPeriodConstLoad(*M->getFunction("two_hop")));
 }
 
-/// Build `g_arr[<idx expr>]` with a may_const load, where the index expression
+/// Build `g_arr[<idx expr>]` with a period_const load, where the index expression
 /// is supplied by \p MakeIndex. Used for the witness-validity and
 /// poison-flag cases, which both turn on what the index evaluates to.
 static Function *createFreeDimIndexFunc(
@@ -3523,7 +3511,7 @@ static Function *createFreeDimIndexFunc(
   auto *GVar = new GlobalVariable(M, ArrTy, false, GlobalValue::InternalLinkage,
                                   ConstantAggregateZero::get(ArrTy), "g_arr");
   Metadata *ArrMDOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "trp"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, NumElems)),
   };
@@ -3540,7 +3528,7 @@ static Function *createFreeDimIndexFunc(
   Value *IdxList[] = {B.getInt32(0), MakeIndex(B, Slot)};
   auto *GEP = B.CreateInBoundsGEP(ArrTy, GVar, IdxList, "gep");
   auto *Load = B.CreateLoad(Int32Ty, GEP, "val");
-  Load->setMetadata(MD_EJIT_MAY_CONST,
+  Load->setMetadata(MD_EJIT_PERIOD_CONST,
                     MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
   B.CreateRet(Load);
 
@@ -3556,7 +3544,7 @@ static Function *createFreeDimIndexFunc(
   return F;
 }
 
-/// Returns whether the may_const load survived the pass.
+/// Returns whether the period_const load survived the pass.
 static bool freeDimLoadSurvives(Module &M, Function &F,
                                 PeriodArrayRegistry &Reg) {
   EJitStructFieldPass Pass(Reg);
@@ -3565,7 +3553,7 @@ static bool freeDimLoadSurvives(Module &M, Function &F,
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
       if (auto *LI = dyn_cast<LoadInst>(&I))
-        if (LI->hasMetadata(MD_EJIT_MAY_CONST))
+        if (LI->hasMetadata(MD_EJIT_PERIOD_CONST))
           return true;
   return false;
 }
@@ -3735,7 +3723,7 @@ TEST(EJitOptimizer, PreReplaceDoesNotSubstituteFreeDim) {
       << "a free dim was substituted into the IR";
 }
 
-TEST(EJitStructFieldPass, MayConstLoadSubstitutionMultipleFields) {
+TEST(EJitStructFieldPass, PeriodConstLoadSubstitutionMultipleFields) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_multifield", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -3786,7 +3774,7 @@ static Function *createNestedStructFunc(LLVMContext &Ctx, Module &M,
                                   ConstantAggregateZero::get(ArrTy), "g_data");
 
   Metadata *ArrOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
@@ -3803,13 +3791,13 @@ static Function *createNestedStructFunc(LLVMContext &Ctx, Module &M,
   Value *Indices[] = {B.getInt32(0), B.getInt64(arrIdx)};
   auto *GEP = B.CreateInBoundsGEP(ArrTy, GVar, Indices, "gep");
   auto *Load = B.CreateLoad(Int32Ty, GEP, "val");
-  Load->setMetadata("ejit.may_const",
+  Load->setMetadata("ejit.period_const",
                     MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
   B.CreateRet(Load);
   return F;
 }
 
-TEST(EJitStructFieldPass, MayConstLoadSubstitutionNestedStruct) {
+TEST(EJitStructFieldPass, PeriodConstLoadSubstitutionNestedStruct) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_nested", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -3859,17 +3847,17 @@ static Function *createMultiArrayFunc(LLVMContext &Ctx, Module &M) {
       new GlobalVariable(M, ArrTy, false, GlobalValue::InternalLinkage,
                          ConstantAggregateZero::get(ArrTy), "g_trps");
 
-  // g_cells metadata: ejit_period_arr "cell" size 4
+  // g_cells metadata: ejit_group_indexed "cell" size 4
   Metadata *CellOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
   GVar1->setMetadata(MD_EJIT_METADATA,
                      MDNode::get(Ctx, {MDNode::get(Ctx, CellOps)}));
-  // g_trps metadata: ejit_period_arr "trp" size 4
+  // g_trps metadata: ejit_group_indexed "trp" size 4
   Metadata *TrpOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "trp"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
@@ -3886,14 +3874,14 @@ static Function *createMultiArrayFunc(LLVMContext &Ctx, Module &M) {
   Value *CIdx[] = {B.getInt32(0), B.getInt64(2)};
   auto *GEP1 = B.CreateInBoundsGEP(ArrTy, GVar1, CIdx, "cell_gep");
   auto *Load1 = B.CreateLoad(Int32Ty, GEP1, "cell_val");
-  Load1->setMetadata("ejit.may_const",
+  Load1->setMetadata("ejit.period_const",
                      MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
 
   // Load from g_trps[3] -> trp array, index 3
   Value *TIdx[] = {B.getInt32(0), B.getInt64(3)};
   auto *GEP2 = B.CreateInBoundsGEP(ArrTy, GVar2, TIdx, "trp_gep");
   auto *Load2 = B.CreateLoad(Int32Ty, GEP2, "trp_val");
-  Load2->setMetadata("ejit.may_const",
+  Load2->setMetadata("ejit.period_const",
                      MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
 
   auto *Mul = B.CreateMul(Load1, Load2, "product");
@@ -3901,7 +3889,7 @@ static Function *createMultiArrayFunc(LLVMContext &Ctx, Module &M) {
   return F;
 }
 
-TEST(EJitStructFieldPass, MayConstLoadSubstitutionMultipleArrays) {
+TEST(EJitStructFieldPass, PeriodConstLoadSubstitutionMultipleArrays) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_multi_arr", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -3939,7 +3927,7 @@ TEST(EJitStructFieldPass, MayConstLoadSubstitutionMultipleArrays) {
   EXPECT_EQ(RetVal->getSExtValue(), 56); // 7 * 8 = 56
 }
 
-/// Create a function with may_const loads of different types (int + float)
+/// Create a function with period_const loads of different types (int + float)
 /// from separate array globals. Tests mixed-type substitution.
 static Function *createMixedTypeFunc(LLVMContext &Ctx, Module &M) {
   IRBuilder<> B(Ctx);
@@ -3957,14 +3945,14 @@ static Function *createMixedTypeFunc(LLVMContext &Ctx, Module &M) {
                          ConstantAggregateZero::get(FltArrTy), "g_floats");
 
   Metadata *IntOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "ints"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
   GInt->setMetadata(MD_EJIT_METADATA,
                     MDNode::get(Ctx, {MDNode::get(Ctx, IntOps)}));
   Metadata *FltOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "floats"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
@@ -3982,14 +3970,14 @@ static Function *createMixedTypeFunc(LLVMContext &Ctx, Module &M) {
   Value *II[] = {B.getInt32(0), B.getInt64(0)};
   auto *GEP_i = B.CreateInBoundsGEP(IntArrTy, GInt, II, "int_elem");
   auto *LoadI = B.CreateLoad(Int32Ty, GEP_i, "int_val");
-  LoadI->setMetadata("ejit.may_const",
+  LoadI->setMetadata("ejit.period_const",
                      MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
 
   // Load float from g_floats[0]
   Value *FI[] = {B.getInt32(0), B.getInt64(0)};
   auto *GEP_f = B.CreateInBoundsGEP(FltArrTy, GFlt, FI, "flt_elem");
   auto *LoadF = B.CreateLoad(FloatTy, GEP_f, "flt_val");
-  LoadF->setMetadata("ejit.may_const",
+  LoadF->setMetadata("ejit.period_const",
                      MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
 
   auto *FToI = B.CreateFPToSI(LoadF, Int32Ty, "ftoi");
@@ -3998,7 +3986,7 @@ static Function *createMixedTypeFunc(LLVMContext &Ctx, Module &M) {
   return F;
 }
 
-TEST(EJitStructFieldPass, MayConstLoadSubstitutionIntFloat) {
+TEST(EJitStructFieldPass, PeriodConstLoadSubstitutionIntFloat) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_mixed", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -4054,7 +4042,7 @@ static Function *createMultiDimArrayFunc(LLVMContext &Ctx, Module &M) {
                          ConstantAggregateZero::get(OuterTy), "g_2d");
 
   Metadata *ArrOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
@@ -4071,13 +4059,13 @@ static Function *createMultiDimArrayFunc(LLVMContext &Ctx, Module &M) {
   Value *Indices[] = {B.getInt32(0), B.getInt64(1), B.getInt64(2)};
   auto *GEP = B.CreateInBoundsGEP(OuterTy, GVar, Indices, "gep_2d");
   auto *Load = B.CreateLoad(Int32Ty, GEP, "val_2d");
-  Load->setMetadata("ejit.may_const",
+  Load->setMetadata("ejit.period_const",
                     MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
   B.CreateRet(Load);
   return F;
 }
 
-TEST(EJitStructFieldPass, MayConstLoadSubstitutionMultiDimArray) {
+TEST(EJitStructFieldPass, PeriodConstLoadSubstitutionMultiDimArray) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_2d", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -4120,12 +4108,12 @@ TEST(EJitStructFieldPass, MayConstLoadSubstitutionMultiDimArray) {
 }
 
 //===----------------------------------------------------------------------===//
-// EJitStructFieldPass robustness tests (may_const metadata edge cases)
+// EJitStructFieldPass robustness tests (period_const metadata edge cases)
 //
 // These cover the cross-cutting behaviours flagged in the SPEC audit:
-//   1. spurious per-load !ejit.may_const on a non-period global is NOT replaced
+//   1. spurious per-load !ejit.period_const on a non-period global is NOT replaced
 //   2. a load missing per-load metadata is still replaced via the GV-level
-//      ejit_may_const_field offset fallback (PASS1-drop recovery)
+//      ejit_period_const_field offset fallback (PASS1-drop recovery)
 //   3. a load missing metadata whose offset is NOT in the GV offset list is
 //      cleanly left alone (safe fallback, no mis-replacement)
 //   4. multiple loads of the same field are all replaced with the same value
@@ -4162,7 +4150,7 @@ static unsigned countLoads(Function &F) {
 
 } // anonymous namespace
 
-// 1. A load tagged !ejit.may_const whose pointer roots at a global that is NOT
+// 1. A load tagged !ejit.period_const whose pointer roots at a global that is NOT
 //    a registered period variable must be left untouched. This guards against
 //    a stray/incorrect annotation silently reading unrelated memory.
 TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
@@ -4186,8 +4174,8 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   Value *Idx[] = {B.getInt32(0), B.getInt64(2)};
   auto *GEP = B.CreateInBoundsGEP(ArrTy, GVar, Idx, "gep");
   auto *Load = B.CreateLoad(Int32Ty, GEP, "load");
-  // Empty metadata node, matching Clang's actual !ejit.may_const !{} emission.
-  Load->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  // Empty metadata node, matching Clang's actual !ejit.period_const !{} emission.
+  Load->setMetadata(MD_EJIT_PERIOD_CONST, MDNode::get(Ctx, {}));
   B.CreateRet(Load);
 
   int32_t mockArr[4] = {10, 20, 30, 40};
@@ -4199,9 +4187,9 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   StructFieldHarness H;
   sp.initFromModule(*M);
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
-  auto AuditSites = sp.collectMayConstLoadSites(*M);
+  auto AuditSites = sp.collectPeriodConstLoadSites(*M);
   ASSERT_EQ(AuditSites.size(), 1u)
-      << "audit must recognize metadata-marked may_const loads";
+      << "audit must recognize metadata-marked period_const loads";
   EXPECT_EQ(AuditSites.front().globalName, "g_plain");
   EXPECT_TRUE(AuditSites.front().hasFieldOffset);
 #endif
@@ -4212,8 +4200,8 @@ TEST(EJitStructFieldPass, SpuriousMetadataOnNonPeriodGVNoReplace) {
   EXPECT_TRUE(PA.areAllPreserved());
 }
 
-// 2. A load WITHOUT per-load !ejit.may_const is still specialized when its byte
-//    offset appears in the GV-level ejit_may_const_field list. This is the
+// 2. A load WITHOUT per-load !ejit.period_const is still specialized when its byte
+//    offset appears in the GV-level ejit_period_const_field list. This is the
 //    fallback path that recovers metadata dropped by AOT optimization.
 TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
   LLVMContext Ctx;
@@ -4222,24 +4210,24 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
 
   IRBuilder<> B(Ctx);
   Type *Int32Ty = B.getInt32Ty();
-  // clang records ejit_may_const_field offsets ELEMENT-RELATIVE: the frontend
+  // clang records ejit_period_const_field offsets ELEMENT-RELATIVE: the frontend
   // strips one array layer before collecting field offsets (CGEJIT.cpp), and
   // the fallback matches the field coordinate via `Off % ElemSize`
   // (EJitCommon.h). Model the clang-shaped input: struct S { i32 a, b, c, d; }
-  // g_arr[4] with may_const on S::c, 8 bytes into each 16-byte element.
+  // g_arr[4] with period_const on S::c, 8 bytes into each 16-byte element.
   auto *ElemTy =
       StructType::create(Ctx, {Int32Ty, Int32Ty, Int32Ty, Int32Ty}, "S");
   auto *ArrTy = ArrayType::get(ElemTy, 4);
   auto *GVar =
       new GlobalVariable(*M, ArrTy, false, GlobalValue::InternalLinkage,
                          ConstantAggregateZero::get(ArrTy), "g_arr");
-  // GV metadata: ejit_period_arr "cell" size 4 + ejit_may_const_field offset 8
+  // GV metadata: ejit_group_indexed "cell" size 4 + ejit_period_const_field offset 8
   // (element-relative: S::c is 8 bytes into each 16-byte element).
-  Metadata *ArrOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+  Metadata *ArrOps[] = {MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
                         MDString::get(Ctx, "cell"),
                         ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4))};
   Metadata *FieldOps[] = {
-      MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+      MDString::get(Ctx, TAG_EJIT_PERIOD_CONST_FIELD),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 8))};
   GVar->setMetadata(
       MD_EJIT_METADATA,
@@ -4256,7 +4244,7 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
   auto *FieldGEP =
       B.CreateInBoundsGEP(ElemTy, ElemGEP, {B.getInt32(0), B.getInt32(2)},
                           "field");
-  // NOTE: deliberately NO per-load !ejit.may_const metadata here.
+  // NOTE: deliberately NO per-load !ejit.period_const metadata here.
   auto *Load = B.CreateLoad(Int32Ty, FieldGEP, "load");
   B.CreateRet(Load);
 
@@ -4272,7 +4260,7 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
   StructFieldHarness H;
   sp.initFromModule(*M);
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
-  auto AuditSites = sp.collectMayConstLoadSites(*M);
+  auto AuditSites = sp.collectPeriodConstLoadSites(*M);
   ASSERT_EQ(AuditSites.size(), 1u)
       << "audit must use the same GV-offset fallback as replacement";
   EXPECT_EQ(AuditSites.front().globalName, "g_arr");
@@ -4290,11 +4278,11 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataGVOffsetFallback) {
 }
 
 // A pointer-form period array is registered by the address of its pointer
-// slot. The root pointer load has no !ejit.may_const marker: only the nested
+// slot. The root pointer load has no !ejit.period_const marker: only the nested
 // BBB field does. Specializing the root address is nevertheless required when
 // the field access sits behind a non-inlined helper, because the field pass
 // cannot otherwise trace the helper argument back to @aaa.
-TEST(EJitStructFieldPass, PointerPeriodRootFeedsNestedMayConstHelper) {
+TEST(EJitStructFieldPass, PointerPeriodRootFeedsNestedPeriodConstHelper) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("pointer_period_nested", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -4311,12 +4299,12 @@ TEST(EJitStructFieldPass, PointerPeriodRootFeedsNestedMayConstHelper) {
       *M, B.getPtrTy(), false, GlobalValue::ExternalLinkage,
       ConstantPointerNull::get(B.getPtrTy()), "aaa");
   Metadata *PeriodOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR), MDString::get(Ctx, "xxx"),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED), MDString::get(Ctx, "xxx"),
       ConstantAsMetadata::get(ConstantInt::get(I32Ty, 0))};
-  // Offset zero belongs to BBB::mayConstValue. AAA and AAA::bbb themselves are
-  // deliberately not may_const.
+  // Offset zero belongs to BBB::periodConstValue. AAA and AAA::bbb themselves are
+  // deliberately not period_const.
   Metadata *FieldOps[] = {
-      MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+      MDString::get(Ctx, TAG_EJIT_PERIOD_CONST_FIELD),
       ConstantAsMetadata::get(ConstantInt::get(I32Ty, 0))};
   AAA->setMetadata(
       MD_EJIT_METADATA,
@@ -4325,15 +4313,15 @@ TEST(EJitStructFieldPass, PointerPeriodRootFeedsNestedMayConstHelper) {
 
   auto *HelperTy = FunctionType::get(I32Ty, {B.getPtrTy()}, false);
   auto *Helper = Function::Create(HelperTy, GlobalValue::InternalLinkage,
-                                  "read_bbb_may_const", M.get());
+                                  "read_bbb_period_const", M.get());
   Helper->addFnAttr(Attribute::NoInline);
   BasicBlock *HelperEntry = BasicBlock::Create(Ctx, "entry", Helper);
   B.SetInsertPoint(HelperEntry);
   Value *NestedField = B.CreateStructGEP(AAATy, Helper->getArg(0), 0,
                                          "bbb");
-  NestedField = B.CreateStructGEP(BBBTy, NestedField, 0, "may_const");
+  NestedField = B.CreateStructGEP(BBBTy, NestedField, 0, "period_const");
   auto *NestedLoad = B.CreateLoad(I32Ty, NestedField, "value");
-  NestedLoad->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  NestedLoad->setMetadata(MD_EJIT_PERIOD_CONST, MDNode::get(Ctx, {}));
   B.CreateRet(NestedLoad);
 
   auto *EntryTy = FunctionType::get(I32Ty, {}, false);
@@ -4349,14 +4337,14 @@ TEST(EJitStructFieldPass, PointerPeriodRootFeedsNestedMayConstHelper) {
                      MDNode::get(Ctx, {MDNode::get(Ctx, EntryOps)}));
   BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Entry);
   B.SetInsertPoint(EntryBB);
-  // This load has no may_const metadata. It is the address root that must be
+  // This load has no period_const metadata. It is the address root that must be
   // materialized before interprocedural propagation can expose the field GEP.
   Value *Base = B.CreateLoad(B.getPtrTy(), AAA, "aaa.base");
   B.CreateRet(B.CreateCall(Helper, {Base}));
 
   struct MockAAA {
     struct {
-      int32_t mayConstValue;
+      int32_t periodConstValue;
       int32_t mutableValue;
     } bbb;
     struct {
@@ -4380,7 +4368,7 @@ TEST(EJitStructFieldPass, PointerPeriodRootFeedsNestedMayConstHelper) {
   Opt.runInstCombine(*M);
 
   EXPECT_EQ(countLoads(*Helper), 0u)
-      << "the nested BBB may_const load should be specialized";
+      << "the nested BBB period_const load should be specialized";
   auto *Ret = dyn_cast_or_null<ReturnInst>(&Helper->back().back());
   ASSERT_NE(Ret, nullptr);
   auto *RetValue = dyn_cast<ConstantInt>(Ret->getReturnValue());
@@ -4398,20 +4386,20 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataWrongOffsetNoReplace) {
   IRBuilder<> B(Ctx);
   Type *Int32Ty = B.getInt32Ty();
   // Same element-relative shape as MissingPerLoadMetadataGVOffsetFallback:
-  // struct S { i32 a, b, c, d; } g_arr[4], may_const on S::a only.
+  // struct S { i32 a, b, c, d; } g_arr[4], period_const on S::a only.
   auto *ElemTy =
       StructType::create(Ctx, {Int32Ty, Int32Ty, Int32Ty, Int32Ty}, "S");
   auto *ArrTy = ArrayType::get(ElemTy, 4);
   auto *GVar =
       new GlobalVariable(*M, ArrTy, false, GlobalValue::InternalLinkage,
                          ConstantAggregateZero::get(ArrTy), "g_arr");
-  // may_const_field offset list contains only 0 (S::a); the load below reads
+  // period_const_field offset list contains only 0 (S::a); the load below reads
   // S::c, 8 bytes into the element, which is not in the list.
-  Metadata *ArrOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+  Metadata *ArrOps[] = {MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
                         MDString::get(Ctx, "cell"),
                         ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4))};
   Metadata *FieldOps[] = {
-      MDString::get(Ctx, TAG_EJIT_MAY_CONST_FIELD),
+      MDString::get(Ctx, TAG_EJIT_PERIOD_CONST_FIELD),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 0))};
   GVar->setMetadata(
       MD_EJIT_METADATA,
@@ -4439,13 +4427,13 @@ TEST(EJitStructFieldPass, MissingPerLoadMetadataWrongOffsetNoReplace) {
   sp.initFromModule(*M);
   auto PA = sp.run(*F, H.FAM);
 
-  // Offset 8 is not a may_const field → load stays, AOT value is read at
+  // Offset 8 is not a period_const field → load stays, AOT value is read at
   // runtime.
   EXPECT_EQ(countLoads(*F), 1u);
   EXPECT_TRUE(PA.areAllPreserved());
 }
 
-// 4. Two loads of the same may_const field are each replaced with the same
+// 4. Two loads of the same period_const field are each replaced with the same
 //    runtime constant (the optimizer later CSEs them, but the pass must handle
 //    repeated loads without leaving one behind).
 TEST(EJitStructFieldPass, MultipleLoadsSameFieldAllReplaced) {
@@ -4459,7 +4447,7 @@ TEST(EJitStructFieldPass, MultipleLoadsSameFieldAllReplaced) {
   auto *GVar =
       new GlobalVariable(*M, ArrTy, false, GlobalValue::InternalLinkage,
                          ConstantAggregateZero::get(ArrTy), "g_arr");
-  Metadata *ArrOps[] = {MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+  Metadata *ArrOps[] = {MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
                         MDString::get(Ctx, "cell"),
                         ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4))};
   GVar->setMetadata(MD_EJIT_METADATA,
@@ -4471,14 +4459,14 @@ TEST(EJitStructFieldPass, MultipleLoadsSameFieldAllReplaced) {
   BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
   B.SetInsertPoint(BB);
 
-  // Two independent loads of g_arr[1] (offset 4), both annotated may_const.
+  // Two independent loads of g_arr[1] (offset 4), both annotated period_const.
   Value *Idx[] = {B.getInt32(0), B.getInt64(1)};
   auto *GEP1 = B.CreateInBoundsGEP(ArrTy, GVar, Idx, "gep1");
   auto *L1 = B.CreateLoad(Int32Ty, GEP1, "v1");
-  L1->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  L1->setMetadata(MD_EJIT_PERIOD_CONST, MDNode::get(Ctx, {}));
   auto *GEP2 = B.CreateInBoundsGEP(ArrTy, GVar, Idx, "gep2");
   auto *L2 = B.CreateLoad(Int32Ty, GEP2, "v2");
-  L2->setMetadata(MD_EJIT_MAY_CONST, MDNode::get(Ctx, {}));
+  L2->setMetadata(MD_EJIT_PERIOD_CONST, MDNode::get(Ctx, {}));
   B.CreateRet(B.CreateAdd(L1, L2, "sum"));
 
   int32_t mockArr[4] = {10, 55, 30, 40}; // g_arr[1] = 55
@@ -4519,13 +4507,13 @@ static Function *createMultiDimFunc(LLVMContext &Ctx, Module &M) {
 
   // Metadata for cell dimension (param 0)
   Metadata *CellOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+      MDString::get(Ctx, TAG_EJIT_DIM),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 0)),
   };
   // Metadata for trp dimension (param 1)
   Metadata *TrpOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+      MDString::get(Ctx, TAG_EJIT_DIM),
       MDString::get(Ctx, "trp"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 1)),
   };
@@ -4780,9 +4768,9 @@ TEST(EJitOptimizer, OptimizationFoldsConstantLoopAtAllLevels) {
 // End-to-end tests
 //===----------------------------------------------------------------------===//
 
-/// Create IR with a branch that depends on a may_const field.
+/// Create IR with a branch that depends on a period_const field.
 /// After full pipeline (StructField + L2), the branch should be folded.
-static Function *createBranchOnMayConstFunc(LLVMContext &Ctx, Module &M) {
+static Function *createBranchOnPeriodConstFunc(LLVMContext &Ctx, Module &M) {
   IRBuilder<> B(Ctx);
   auto *Int32Ty = B.getInt32Ty();
   auto *STy = StructType::create(Ctx, {Int32Ty}, "BranchCfg");
@@ -4791,7 +4779,7 @@ static Function *createBranchOnMayConstFunc(LLVMContext &Ctx, Module &M) {
       M, STy, false, GlobalValue::InternalLinkage,
       ConstantStruct::get(STy, ConstantInt::get(Int32Ty, 0)), "g_branch_cfg");
   Metadata *PeriodOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD),
+      MDString::get(Ctx, TAG_EJIT_GROUP),
       MDString::get(Ctx, "static"),
   };
   GVar->setMetadata(MD_EJIT_METADATA,
@@ -4809,7 +4797,7 @@ static Function *createBranchOnMayConstFunc(LLVMContext &Ctx, Module &M) {
   Value *I0[] = {B.getInt32(0), B.getInt32(0)};
   auto *GEP = B.CreateInBoundsGEP(STy, GVar, I0, "cfg_gep");
   auto *Load = B.CreateLoad(Int32Ty, GEP, "cfg_val");
-  Load->setMetadata("ejit.may_const",
+  Load->setMetadata("ejit.period_const",
                     MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
   auto *Cmp = B.CreateICmpNE(Load, B.getInt32(0), "is_set");
   B.CreateCondBr(Cmp, ThenBB, ElseBB);
@@ -4831,7 +4819,7 @@ TEST(EJitEndToEnd, BranchFolding) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("test_branch", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
-  Function *F = createBranchOnMayConstFunc(Ctx, *M);
+  Function *F = createBranchOnPeriodConstFunc(Ctx, *M);
   ASSERT_NE(F, nullptr);
 
   // Mock memory: field value = 1 (non-zero, so "then" branch taken)
@@ -4873,7 +4861,7 @@ TEST(EJitEndToEnd, BranchFolding) {
   EXPECT_EQ(RetVal->getSExtValue(), 100);
 }
 
-// Second collapse-proof, on a different function shape: a may_const field
+// Second collapse-proof, on a different function shape: a period_const field
 // driving a branch (not a loop). Specialize it through the full pipeline at L1,
 // L2, and L3 and confirm the output IR is byte-identical (level does not change
 // the pipeline) and fully folded (branch resolved to the constant 100).
@@ -4881,7 +4869,7 @@ static std::string specializeBranchAt(llvm::ejit::OptimizationLevel lvl) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("branch_equiv", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
-  createBranchOnMayConstFunc(Ctx, *M);
+  createBranchOnPeriodConstFunc(Ctx, *M);
 
   struct MockCfg {
     int32_t val;
@@ -4900,20 +4888,20 @@ static std::string specializeBranchAt(llvm::ejit::OptimizationLevel lvl) {
   return Out;
 }
 
-TEST(EJitEndToEnd, PipelineFoldsMayConstBranchAtAllLevels) {
+TEST(EJitEndToEnd, PipelineFoldsPeriodConstBranchAtAllLevels) {
   std::string L1 = specializeBranchAt(llvm::ejit::OptimizationLevel::L1);
   std::string L2 = specializeBranchAt(llvm::ejit::OptimizationLevel::L2);
   std::string L3 = specializeBranchAt(llvm::ejit::OptimizationLevel::L3);
 
-  // No-regression: each tier (L1->O1, L2->O2, L3->O3) folds the may_const
+  // No-regression: each tier (L1->O1, L2->O2, L3->O3) folds the period_const
   // branch to the constant 100. Tiers are now distinct O1/O2/O3 pipelines;
   // byte-identical IR across tiers is no longer asserted.
   EXPECT_NE(L1.find("ret i32 100"), std::string::npos)
-      << "L1 (O1) did not fold the may_const branch";
+      << "L1 (O1) did not fold the period_const branch";
   EXPECT_NE(L2.find("ret i32 100"), std::string::npos)
-      << "L2 (O2) did not fold the may_const branch";
+      << "L2 (O2) did not fold the period_const branch";
   EXPECT_NE(L3.find("ret i32 100"), std::string::npos)
-      << "L3 (O3) did not fold the may_const branch";
+      << "L3 (O3) did not fold the period_const branch";
 }
 
 //===----------------------------------------------------------------------===//
@@ -4925,13 +4913,13 @@ TEST(EJitEndToEnd, PipelineFoldsMayConstBranchAtAllLevels) {
 // dims arrive at the callee as ordinary constant arguments, but the callee
 // body still indexes the period array with a runtime value and re-tests
 // guards. These tests pin phase 1d (internalize + IPSCCP): the constants
-// cross the edge, the callee's may_const load becomes substitutable, and the
+// cross the edge, the callee's period_const load becomes substitutable, and the
 // callee folds to a constant return like the entry does.
 namespace {
 
 /// Entry (has ejit_entry metadata) calls a callee with a constant cell index
 /// — the shape phase 1a leaves behind. The callee loads field 1 of
-/// g_ipcfg[cell] (may_const) and branches on it.
+/// g_ipcfg[cell] (period_const) and branches on it.
 std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
   SMDiagnostic Err;
   auto M = parseAssemblyString(R"(
@@ -4942,7 +4930,7 @@ std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
     define i32 @ip_callee(i8 noundef %cell) {
       %idx = zext i8 %cell to i64
       %gep = getelementptr inbounds [4 x %S], ptr @g_ipcfg, i64 0, i64 %idx, i32 1
-      %v = load i32, ptr %gep, align 4, !ejit.may_const !2
+      %v = load i32, ptr %gep, align 4, !ejit.period_const !2
       %c = icmp eq i32 %v, 7
       br i1 %c, label %then, label %else
     then:
@@ -4957,7 +4945,7 @@ std::unique_ptr<Module> parseInterprocModule(LLVMContext &Ctx) {
     }
 
     !0 = !{!1}
-    !1 = !{!"ejit_period_arr", !"cell", i32 4}
+    !1 = !{!"ejit_group_indexed", !"cell", i32 4}
     !2 = !{}
     !3 = !{!4}
     !4 = !{!"ejit_entry"}
@@ -5009,7 +4997,7 @@ TEST(EJitInterprocedural, ConstantsStopAtCallEdgeWithoutIPSCCP) {
 }
 
 // With phase 1d in its pipeline position (after 1c, before the 1e/1f
-// re-fold), the constant argument crosses the edge, the callee's may_const
+// re-fold), the constant argument crosses the edge, the callee's period_const
 // load folds against cell 2's runtime value, and the guard collapses: the
 // callee body becomes `ret i32 100`.
 TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
@@ -5043,7 +5031,7 @@ TEST(EJitInterprocedural, IPSCCPPropagatesDimsIntoCallee) {
   EXPECT_FALSE(Entry->hasLocalLinkage());
 
   // The callee's period load and guard folded to the constant return.
-  EXPECT_EQ(countLoadsIn(*Callee), 0u) << "callee may_const load survived";
+  EXPECT_EQ(countLoadsIn(*Callee), 0u) << "callee period_const load survived";
   ASSERT_EQ(Callee->size(), 1u) << "callee guard branch survived";
   auto *Ret = dyn_cast<ReturnInst>(Callee->getEntryBlock().getTerminator());
   ASSERT_NE(Ret, nullptr);
@@ -5158,7 +5146,7 @@ static Function *createBranchOnFieldFunc(LLVMContext &Ctx, Module &M) {
                                              ConstantInt::get(Int32Ty, 0)),
                          "g_cfg");
   Metadata *PeriodOps[] = {
-      MDString::get(Ctx, "ejit_period"),
+      MDString::get(Ctx, "ejit_group"),
       MDString::get(Ctx, "static"),
   };
   GV->setMetadata(MD_EJIT_METADATA,
@@ -5177,7 +5165,7 @@ static Function *createBranchOnFieldFunc(LLVMContext &Ctx, Module &M) {
   Value *I0[] = {B.getInt32(0), B.getInt32(0)};
   auto *GEP_f0 = B.CreateInBoundsGEP(STy, GV, I0, "field0");
   auto *Load = B.CreateLoad(Int32Ty, GEP_f0, "load_field0");
-  Load->setMetadata("ejit.may_const",
+  Load->setMetadata("ejit.period_const",
                     MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
   auto *Cmp = B.CreateICmpEQ(Load, B.getInt32(1), "cmp");
   B.CreateCondBr(Cmp, ThenBB, ElseBB);
@@ -5199,7 +5187,7 @@ static Function *createBranchOnFieldFunc(LLVMContext &Ctx, Module &M) {
   return F;
 }
 
-TEST(EJitPipelineIR, BranchFoldingOnMayConst) {
+TEST(EJitPipelineIR, BranchFoldingOnPeriodConst) {
   LLVMContext Ctx;
   auto M = std::make_unique<Module>("branch_fold", Ctx);
   M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -5243,13 +5231,13 @@ TEST(EJitPipelineIR, BranchFoldingOnMayConst) {
   opt.runInstCombine(*M);
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
-  // After full pipeline: no loads should remain (all may_const replaced)
+  // After full pipeline: no loads should remain (all period_const replaced)
   int loadCount = 0;
   for (auto &BB : *F)
     for (auto &I : BB)
       if (isa<LoadInst>(&I))
         ++loadCount;
-  EXPECT_EQ(loadCount, 0) << "All may_const loads should be replaced";
+  EXPECT_EQ(loadCount, 0) << "All period_const loads should be replaced";
 
   // The branch on field0 == 1 should be folded (single conditional branch gone)
   // May still have unconditional branches for block transitions
@@ -5274,22 +5262,22 @@ static Function *createCellProcessFunc(LLVMContext &Ctx, Module &M) {
   auto *GV = new GlobalVariable(M, ArrTy, false, GlobalValue::InternalLinkage,
                                 ConstantAggregateZero::get(ArrTy), "g_cells");
   Metadata *ArrOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR),
+      MDString::get(Ctx, TAG_EJIT_GROUP_INDEXED),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 4)),
   };
   GV->setMetadata(MD_EJIT_METADATA,
                   MDNode::get(Ctx, {MDNode::get(Ctx, ArrOps)}));
 
-  // Function: void process_cell(i32 cell_idx) — ejit_period_arr_ind on arg 0
+  // Function: void process_cell(i32 cell_idx) — ejit_dim on arg 0
   FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {Int32Ty}, false);
   auto *F =
       Function::Create(FT, GlobalValue::ExternalLinkage, "process_cell", &M);
   F->getArg(0)->setName("cell_idx");
 
-  // Attach ejit_period_arr_ind metadata on arg 0
+  // Attach ejit_dim metadata on arg 0
   Metadata *IndOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+      MDString::get(Ctx, TAG_EJIT_DIM),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 0)),
   };
@@ -5307,7 +5295,7 @@ static Function *createCellProcessFunc(LLVMContext &Ctx, Module &M) {
   Value *Idx_f0[] = {B.getInt32(0), F->getArg(0), B.getInt32(0)};
   auto *GEP_f0 = B.CreateInBoundsGEP(ArrTy, GV, Idx_f0, "cell_f0");
   auto *Load = B.CreateLoad(Int32Ty, GEP_f0, "load_f0");
-  Load->setMetadata("ejit.may_const",
+  Load->setMetadata("ejit.period_const",
                     MDNode::get(Ctx, MDString::get(Ctx, "ejit")));
   auto *Cmp = B.CreateICmpEQ(Load, B.getInt32(253), "cmp"); // 0xFD = 253
   B.CreateCondBr(Cmp, ThenBB, ElseBB);
@@ -5361,7 +5349,7 @@ TEST(EJitPipelineIR, CellProcessBranchFolding) {
   // 2. Fold constant chains + Promote
   opt.runInstCombine(*M);
 
-  // 3. StructField: replace may_const loads
+  // 3. StructField: replace period_const loads
   EJitStructFieldPass sfp(reg);
   sfp.initFromModule(*M);
   FunctionAnalysisManager FAM;
@@ -5380,14 +5368,14 @@ TEST(EJitPipelineIR, CellProcessBranchFolding) {
   opt.runInstCombine(*M);
   opt.runOptimizationPipeline(*M, llvm::ejit::OptimizationLevel::L2, CompileTier::Baseline);
 
-  // All may_const loads should be gone
-  int mayConstLoads = 0;
+  // All period_const loads should be gone
+  int periodConstLoads = 0;
   for (auto &BB : *F)
     for (auto &I : BB)
       if (auto *LI = dyn_cast<LoadInst>(&I))
-        if (LI->hasMetadata("ejit.may_const"))
-          ++mayConstLoads;
-  EXPECT_EQ(mayConstLoads, 0);
+        if (LI->hasMetadata("ejit.period_const"))
+          ++periodConstLoads;
+  EXPECT_EQ(periodConstLoads, 0);
 
   // Conditional branch should be eliminated
   int condBr = 0;
@@ -5397,7 +5385,7 @@ TEST(EJitPipelineIR, CellProcessBranchFolding) {
       ++condBr;
   }
   EXPECT_EQ(condBr, 0)
-      << "Conditional branch on may_const field should be folded";
+      << "Conditional branch on period_const field should be folded";
 }
 
 /// Verify InstCombine runs correctly after period index replacement
@@ -5417,7 +5405,7 @@ TEST(EJitPipelineIR, PeriodIndexReplacementAndFold) {
   F->getArg(0)->setName("period_idx");
 
   Metadata *IndOps[] = {
-      MDString::get(Ctx, TAG_EJIT_PERIOD_ARR_IND),
+      MDString::get(Ctx, TAG_EJIT_DIM),
       MDString::get(Ctx, "cell"),
       ConstantAsMetadata::get(ConstantInt::get(Int32Ty, 0)),
   };
@@ -5459,23 +5447,23 @@ TEST(EJitPipelineIR, PeriodIndexReplacementAndFold) {
 TEST(EJitDiagLogLevel, SetAndGet) {
   // Default level is INFO (1).
   EXPECT_EQ(ejit_get_log_level(), 1);
-  ejit_set_log_level(3); // DEBUG
+  ejit_set_log_level(EJIT_LOG_DEBUG);
   EXPECT_EQ(ejit_get_log_level(), 3);
-  ejit_set_log_level(0); // OFF
+  ejit_set_log_level(EJIT_LOG_OFF);
   EXPECT_EQ(ejit_get_log_level(), 0);
-  ejit_set_log_level(2); // VERBOSE
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
   EXPECT_EQ(ejit_get_log_level(), 2);
   // Restore the default so subsequent tests are unaffected.
-  ejit_set_log_level(1);
+  ejit_set_log_level(EJIT_LOG_INFO);
   EXPECT_EQ(ejit_get_log_level(), 1);
 }
 
 TEST(EJitDiagLogLevel, ClampsOutOfRange) {
-  ejit_set_log_level(-5);
+  ejit_set_log_level(static_cast<ejit_log_level_t>(-5));
   EXPECT_EQ(ejit_get_log_level(), 0);
-  ejit_set_log_level(99);
+  ejit_set_log_level(static_cast<ejit_log_level_t>(99));
   EXPECT_EQ(ejit_get_log_level(), 3);
-  ejit_set_log_level(1); // restore
+  ejit_set_log_level(EJIT_LOG_INFO);
 }
 
 // Registry / func-meta prints must not crash on an uninitialized runtime and on
@@ -5504,17 +5492,21 @@ TEST(EJitDiagnostics, CodePoolStatsNullOutRejected) {
 // without EJIT_SRE_CODE_POOL). It must not crash and must not return a
 // positive value.
 TEST(EJitDiagnostics, CodePoolStatsNoCrash) {
-  int dummy = -1;
-  int rv = ejit_get_code_pool_stats(&dummy);
-  EXPECT_TRUE(rv == 0 || rv == -2 || rv == -9);
+  ejit_code_pool_stats_t Stats = {};
+  ejit_code_pool_stats_v2_t Tiered = {};
+  const auto Status = ejit_get_code_pool_stats(&Stats);
+  EXPECT_TRUE(Status == EJIT_OK || Status == EJIT_ERR_NOT_ACTIVE ||
+              Status == EJIT_ERR_DISABLED);
+  EXPECT_EQ(ejit_get_code_pool_stats_v2(&Tiered), Status);
 }
 
 TEST(EJitDiagnostics, PrintCodePoolStatsNoCrash) {
   ejit_print_code_pool_stats(); // uninitialized or no pool: prints a notice
 }
 
-TEST(EJitDiagnostics, PrintMayConstRankingNoCrash) {
-  ejit_print_mayconst_ranking(); // uninitialized: prints a notice
+TEST(EJitDiagnostics, PrintPeriodConstRankingNoCrash) {
+  ejit_print_period_const_ranking(); // uninitialized: prints a notice
+  ejit_print_mayconst_ranking();
 }
 
 // ejitDiagPermille() drives the code-pool usage percentage: integer-only
@@ -5593,7 +5585,7 @@ createIR01FreeDimModule(LLVMContext &Ctx, uintptr_t Base, unsigned Modulus,
         "i64 0, i32 1\n"
         "  %live_value = zext i16 %slot to i64\n"
         "  store i64 %live_value, ptr %live, align 8\n"
-        "  %word = load i64, ptr %selected, align 8, !ejit.may_const !7\n"
+        "  %word = load i64, ptr %selected, align 8, !ejit.period_const !7\n"
         "  %masked = and i64 %word, 4096\n"
         "  %condition = icmp ne i64 %masked, 0\n"
         "  br i1 %condition, label %yes, label %no\n"
@@ -5605,7 +5597,7 @@ createIR01FreeDimModule(LLVMContext &Ctx, uintptr_t Base, unsigned Modulus,
         "  ret i64 0\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4";
   if (!IsStatic)
     IR << ", !5";
@@ -5613,10 +5605,10 @@ createIR01FreeDimModule(LLVMContext &Ctx, uintptr_t Base, unsigned Modulus,
     IR << ", !6";
   IR << "}\n!4 = !{!\"ejit_entry\"}\n";
   if (IsStatic)
-    IR << "!1 = !{!\"ejit_period\", !\"static\"}\n";
+    IR << "!1 = !{!\"ejit_group\", !\"static\"}\n";
   else
-    IR << "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 " << Modulus
-       << "}\n!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n";
+    IR << "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 " << Modulus
+       << "}\n!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n";
   if (WithFreeDim)
     IR << "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n";
   IR << "!7 = !{}\n";
@@ -5761,7 +5753,7 @@ TEST(EJitStructFieldPass,
             "entry:\n"
             "  %v = load i64, ptr inttoptr (i64 "
          << reinterpret_cast<uintptr_t>(&Data)
-         << " to ptr), align 8, !ejit.may_const !7\n"
+         << " to ptr), align 8, !ejit.period_const !7\n"
             "  ret i64 %v\n"
             "}\n";
       if (InHelper)
@@ -5771,11 +5763,11 @@ TEST(EJitStructFieldPass,
               "  ret i64 %v\n"
               "}\n";
       IR << "!0 = !{!1, !2}\n!1 = !{!\""
-         << (IsStatic ? "ejit_period\", !\"static\"" :
-                         "ejit_period_arr\", !\"cell\", i32 1")
-         << "}\n!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+         << (IsStatic ? "ejit_group\", !\"static\"" :
+                         "ejit_group_indexed\", !\"cell\", i32 1")
+         << "}\n!2 = !{!\"ejit_period_const_field\", i64 0}\n"
             "!3 = distinct !{!4, !5}\n!4 = !{!\"ejit_entry\"}\n"
-            "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+            "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
             "!7 = !{}\n";
 
       LLVMContext Ctx;
@@ -5816,12 +5808,12 @@ TEST(EJitStructFieldPass, AbsoluteAddressRejectsCrossFieldSupportedWidth) {
         "entry:\n"
         "  %v = load i64, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data)
-     << " to ptr), align 8, !ejit.may_const !7\n"
+     << " to ptr), align 8, !ejit.period_const !7\n"
         "  ret i64 %v\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period\", !\"static\"}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group\", !\"static\"}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n"
         "!7 = !{}\n";
 
@@ -5851,16 +5843,16 @@ TEST(EJitStructFieldPass, AbsoluteAddressRejectsVolatileAndAtomicLoads) {
         "entry:\n"
         "  %v = load volatile i64, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data)
-     << " to ptr), align 8, !ejit.may_const !7\n"
+     << " to ptr), align 8, !ejit.period_const !7\n"
         "  %a = load atomic i64, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data)
-     << " to ptr) monotonic, align 8, !ejit.may_const !7\n"
+     << " to ptr) monotonic, align 8, !ejit.period_const !7\n"
         "  %sum = add i64 %v, %a\n"
         "  ret i64 %sum\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period\", !\"static\"}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group\", !\"static\"}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n"
         "!7 = !{}\n";
 
@@ -5893,22 +5885,22 @@ TEST(EJitStructFieldPass, AbsoluteAddressRejectsOverlappingRegistrations) {
         "entry:\n"
         "  %v = load i64, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(Data)
-     << " to ptr), align 8, !ejit.may_const !14\n"
+     << " to ptr), align 8, !ejit.period_const !14\n"
         "  ret i64 %v\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 1}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 1}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = !{!4, !2}\n"
-        "!4 = !{!\"ejit_period_arr\", !\"trp\", i32 1}\n"
+        "!4 = !{!\"ejit_group_indexed\", !\"trp\", i32 1}\n"
         "!6 = !{!7, !8}\n"
-        "!7 = !{!\"ejit_period_arr\", !\"other\", i32 2}\n"
-        "!8 = !{!\"ejit_may_const_field\", i64 8}\n"
+        "!7 = !{!\"ejit_group_indexed\", !\"other\", i32 2}\n"
+        "!8 = !{!\"ejit_period_const_field\", i64 8}\n"
         "!13 = distinct !{!9, !10, !11, !12}\n"
         "!9 = !{!\"ejit_entry\"}\n"
-        "!10 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
-        "!11 = !{!\"ejit_period_arr_ind\", !\"trp\", i32 1}\n"
-        "!12 = !{!\"ejit_period_arr_ind\", !\"other\", i32 2}\n"
+        "!10 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
+        "!11 = !{!\"ejit_dim\", !\"trp\", i32 1}\n"
+        "!12 = !{!\"ejit_dim\", !\"other\", i32 2}\n"
         "!14 = !{}\n";
 
   LLVMContext Ctx;
@@ -5943,25 +5935,25 @@ createIR01OverlapModule(LLVMContext &Ctx, uintptr_t Base,
         "entry:\n"
         "  %v = load i64, ptr inttoptr (i64 "
      << static_cast<uint64_t>(Base)
-     << " to ptr), align 8, !ejit.may_const !7\n"
+     << " to ptr), align 8, !ejit.period_const !7\n"
         "  ret i64 %v\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 1}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n";
+        "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 1}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n";
   if (HasSecond) {
     IR << "!3 = !{!4, !5}\n"
-       << "!4 = !{!\"ejit_period_arr\", !\"trp\", i32 1}\n"
-       << "!5 = !{!\"ejit_may_const_field\", i64 "
+       << "!4 = !{!\"ejit_group_indexed\", !\"trp\", i32 1}\n"
+       << "!5 = !{!\"ejit_period_const_field\", i64 "
        << (SecondAuthorizes ? 0 : 8) << "}\n";
   }
   IR << "!6 = distinct !{!8, !9";
   if (SecondAuthorizes)
     IR << ", !10";
   IR << "}\n!8 = !{!\"ejit_entry\"}\n"
-        "!9 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n";
+        "!9 = !{!\"ejit_dim\", !\"cell\", i32 0}\n";
   if (SecondAuthorizes)
-    IR << "!10 = !{!\"ejit_period_arr_ind\", !\"trp\", i32 1}\n";
+    IR << "!10 = !{!\"ejit_dim\", !\"trp\", i32 1}\n";
   IR << "!7 = !{}\n";
   return parseIR01TestModule(Ctx, IR.str());
 }
@@ -6040,12 +6032,12 @@ TEST(EJitStructFieldPass, AbsoluteAddressRejectsNonDefaultAddressSpace) {
         "entry:\n"
         "  %v = load i64, ptr addrspace(1) inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data)
-     << " to ptr addrspace(1)), align 8, !ejit.may_const !7\n"
+     << " to ptr addrspace(1)), align 8, !ejit.period_const !7\n"
         "  ret i64 %v\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period\", !\"static\"}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group\", !\"static\"}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n"
         "!7 = !{}\n";
 
@@ -6076,19 +6068,19 @@ TEST(EJitStructFieldPass, AbsoluteAddressRejectsIntermediateAddressSpaceCast) {
         "  %p_valid = getelementptr inbounds nuw i64, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data)
      << " to ptr), i64 0\n"
-        "  %valid = load i64, ptr %p_valid, align 8, !ejit.may_const !7\n"
+        "  %valid = load i64, ptr %p_valid, align 8, !ejit.period_const !7\n"
         "  %p_step = getelementptr inbounds nuw i64, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data)
      << " to ptr), i64 0\n"
         "  %as1 = addrspacecast ptr %p_step to ptr addrspace(1)\n"
         "  %as0 = addrspacecast ptr addrspace(1) %as1 to ptr\n"
-        "  %casted = load i64, ptr %as0, align 8, !ejit.may_const !7\n"
+        "  %casted = load i64, ptr %as0, align 8, !ejit.period_const !7\n"
         "  %sum = add i64 %valid, %casted\n"
         "  ret i64 %sum\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period\", !\"static\"}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group\", !\"static\"}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4}\n!4 = !{!\"ejit_entry\"}\n"
         "!7 = !{}\n";
 
@@ -6126,20 +6118,20 @@ TEST(EJitStructFieldPass, AbsoluteAddressRejectsGEPIndexStrideOverflow) {
         "entry:\n"
         "  %p_valid = getelementptr inbounds nuw [2 x i64], ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(Data) << " to ptr), i64 0, i64 0\n"
-        "  %valid = load i64, ptr %p_valid, align 8, !ejit.may_const !7\n"
+        "  %valid = load i64, ptr %p_valid, align 8, !ejit.period_const !7\n"
         "  %p_overflow = getelementptr inbounds nuw [2 x i64], ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(Data) << " to ptr), i64 0, i64 "
      << HugeIndex
      << "\n"
-        "  %overflow = load i64, ptr %p_overflow, align 8, !ejit.may_const !7\n"
+        "  %overflow = load i64, ptr %p_overflow, align 8, !ejit.period_const !7\n"
         "  %sum = add i64 %valid, %overflow\n"
         "  ret i64 %sum\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 2}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 2}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4, !5}\n!4 = !{!\"ejit_entry\"}\n"
-        "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
         "!7 = !{}\n";
 
   LLVMContext Ctx;
@@ -6175,22 +6167,22 @@ TEST(EJitStructFieldPass, AbsoluteAddressRejectsWitnessPoison) {
         "  %wrapped = and i64 %bad, 3\n"
         "  %p_bad = getelementptr inbounds nuw i64, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(Data) << " to ptr), i64 %wrapped\n"
-        "  %bad_value = load i64, ptr %p_bad, align 8, !ejit.may_const !7\n"
+        "  %bad_value = load i64, ptr %p_bad, align 8, !ejit.period_const !7\n"
         "  %good = sub i64 %slot, 1\n"
         "  %good_wrapped = and i64 %good, 3\n"
         "  %p_valid = getelementptr inbounds nuw i64, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(Data)
      << " to ptr), i64 %good_wrapped\n"
-        "  %valid = load i64, ptr %p_valid, align 8, !ejit.may_const !7\n"
+        "  %valid = load i64, ptr %p_valid, align 8, !ejit.period_const !7\n"
         "  %sum = add i64 %bad_value, %valid\n"
         "  ret i64 %sum\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 4}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 4}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4, !5, !6}\n"
         "!4 = !{!\"ejit_entry\"}\n"
-        "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
         "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n"
         "!7 = !{}\n";
 
@@ -6232,15 +6224,15 @@ static void checkIR01GEPWitness(bool IntermediateInbounds, bool Flagged) {
     IR << "  %last = getelementptr i64, ptr %step, i64 1\n";
   IR << "  %word = load i64, ptr %"
      << (IntermediateInbounds ? "last" : "step")
-     << ", align 8, !ejit.may_const !7\n"
+     << ", align 8, !ejit.period_const !7\n"
         "  ret i64 %word\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 3}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 3}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4, !5, !6}\n"
         "!4 = !{!\"ejit_entry\"}\n"
-        "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
         "!6 = !{!\"ejit_free_dim\", !\"\", i32 1}\n"
         "!7 = !{}\n";
 
@@ -6296,7 +6288,7 @@ TEST(EJitStructFieldPass, AbsoluteAddressDirectI8StaticFoldsNoFreeDim) {
         "entry:\n"
         "  %value = load i8, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data)
-     << " to ptr), align 1, !ejit.may_const !7\n"
+     << " to ptr), align 1, !ejit.period_const !7\n"
         "  %is_expected = icmp eq i8 %value, 7\n"
         "  br i1 %is_expected, label %yes, label %no\n"
         "yes:\n"
@@ -6305,8 +6297,8 @@ TEST(EJitStructFieldPass, AbsoluteAddressDirectI8StaticFoldsNoFreeDim) {
         "  ret i8 0\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period\", !\"static\"}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group\", !\"static\"}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4}\n"
         "!4 = !{!\"ejit_entry\"}\n"
         "!7 = !{}\n";
@@ -6347,7 +6339,7 @@ TEST(EJitStructFieldPass,
         "entry:\n"
         "  %value = load i8, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(Data)
-     << " to ptr), align 1, !ejit.may_const !7\n"
+     << " to ptr), align 1, !ejit.period_const !7\n"
         "  %is_expected = icmp eq i8 %value, 7\n"
         "  br i1 %is_expected, label %yes, label %no\n"
         "yes:\n"
@@ -6356,11 +6348,11 @@ TEST(EJitStructFieldPass,
         "  ret i8 0\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period_arr\", !\"cell\", i32 4}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 0}\n"
+        "!1 = !{!\"ejit_group_indexed\", !\"cell\", i32 4}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 0}\n"
         "!3 = distinct !{!4, !5}\n"
         "!4 = !{!\"ejit_entry\"}\n"
-        "!5 = !{!\"ejit_period_arr_ind\", !\"cell\", i32 0}\n"
+        "!5 = !{!\"ejit_dim\", !\"cell\", i32 0}\n"
         "!7 = !{}\n";
 
   LLVMContext Ctx;
@@ -6405,10 +6397,10 @@ TEST(EJitStructFieldPass,
         "entry:\n"
         "  %frozen = load i8, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data.Frozen)
-     << " to ptr), align 1, !ejit.may_const !7\n"
+     << " to ptr), align 1, !ejit.period_const !7\n"
         "  %bool_byte = load i8, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data.BoolByte)
-     << " to ptr), align 1, !ejit.may_const !8, !range !9\n"
+     << " to ptr), align 1, !ejit.period_const !8, !range !9\n"
         "  %bool = trunc i8 %bool_byte to i1\n"
         "  %live = load i8, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data.Live)
@@ -6422,10 +6414,10 @@ TEST(EJitStructFieldPass,
         "  ret i8 0\n"
         "}\n"
         "!0 = !{!1, !2, !3}\n"
-        "!1 = !{!\"ejit_period\", !\"static\"}\n"
-        "!2 = !{!\"ejit_may_const_field\", i64 "
+        "!1 = !{!\"ejit_group\", !\"static\"}\n"
+        "!2 = !{!\"ejit_period_const_field\", i64 "
      << FrozenOffset << "}\n"
-        "!3 = !{!\"ejit_may_const_field\", i64 "
+        "!3 = !{!\"ejit_period_const_field\", i64 "
      << BoolOffset << "}\n"
         "!4 = distinct !{!5}\n"
         "!5 = !{!\"ejit_entry\"}\n"
@@ -6469,15 +6461,15 @@ static void expectIR01BControl(IR01BControl Case) {
         "entry:\n"
         "  %value = load i8, ptr inttoptr (i64 "
      << reinterpret_cast<uintptr_t>(&Data)
-     << " to ptr), align 1, !ejit.may_const !7\n"
+     << " to ptr), align 1, !ejit.period_const !7\n"
         "  ret i8 %value\n"
         "}\n"
         "!0 = !{!1, !2}\n"
-        "!1 = !{!\"ejit_period\", !\"static\"}\n";
+        "!1 = !{!\"ejit_group\", !\"static\"}\n";
   if (Case == IR01BControl::MissingField)
     IR << "!2 = !{}\n";
   else
-    IR << "!2 = !{!\"ejit_may_const_field\", i64 0}\n";
+    IR << "!2 = !{!\"ejit_period_const_field\", i64 0}\n";
   if (Case == IR01BControl::MissingLifecycle)
     IR << "!3 = distinct !{}\n";
   else

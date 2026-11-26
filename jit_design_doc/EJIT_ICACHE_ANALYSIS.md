@@ -15,7 +15,7 @@ JIT 特化函数体通过 `FIXED_CODE_POOL` 部署在单独的 `.text.ejit` 段�
 
 ## 2. 执行模型：替换关系而非交替关系
 
-JIT 特化后，`ejit_entry` 函数的 AOT 版本不再被执行：
+JIT 特化后，`EJIT_ENTRY` 函数的 AOT 版本不再被执行：
 
 ```
 无 JIT：  caller → AOT(entry) → AOT(helper1) → AOT(helper2) → return
@@ -102,7 +102,7 @@ perf stat -e L1I_CACHE_REFILL,L1I_CACHE,L2D_CACHE_REFILL \
 
 JIT 特化对 D-cache 的影响更值得关注：
 
-- **收益**：`ejit_may_const` load 被替换为常量，减少全局变量 D-cache 访问
+- **收益**：`EJIT_PERIOD_CONST` load 被替换为常量，减少全局变量 D-cache 访问
 - **风险**：循环展开等优化可能导致栈帧变大、寄存器溢出增多
 
 ### 5.3 分支预测
@@ -139,7 +139,7 @@ JIT 特化对 D-cache 的影响更值得关注：
 
 ### 7.1 Inline Cache Dispatcher 的特点
 
-开启 `-ejit-inline-cache` 后，`ejit_entry` 函数变身为一个极小的分发器：
+开启 `-ejit-inline-cache` 后，`EJIT_ENTRY` 函数变身为一个极小的分发器：
 
 ```asm
 ; 0-dim dispatcher（约 4 条指令，~16 字节）
@@ -161,7 +161,7 @@ jit_entry:
 | 4-dim | ~12 | ~48 bytes |
 
 - 单个 cache line（64 B）可容纳 1-4 个 dispatcher
-- 所有 dispatcher 体积之和（假设 50 个 ejit_entry 函数，平均 2-dim）：50 × 32 B = **1.6 KB**
+- 所有 dispatcher 体积之和（假设 50 个 EJIT_ENTRY 函数，平均 2-dim）：50 × 32 B = **1.6 KB**
 
 ### 7.2 聚类方案的 Cache 收益分析
 
@@ -170,11 +170,11 @@ jit_entry:
 **时序场景分析**：
 
 ```
-场景 A：频繁切换不同 ejit_entry 函数
+场景 A：频繁切换不同 EJIT_ENTRY 函数
   时刻 T1: call funcA → 加载 cache line [funcA, funcB, funcC]
   时刻 T2: call funcB → 已在 L1 I-cache 中！(空间局部性命中)
 
-场景 B：反复调用同一个 ejit_entry 函数（最常见）
+场景 B：反复调用同一个 EJIT_ENTRY 函数（最常见）
   时刻 T1: call funcA → 加载 cache line [funcA, funcB, funcC]
   时刻 T2: call funcA → 已在 L1 I-cache 中 (时间局部性命中，无论是否聚类)
   聚类无额外收益，但无损失
@@ -210,13 +210,13 @@ jit_entry:
 
 - **额外的段跳转**：dispatcher → JIT 特化函数（`.text.ejit`）和 dispatcher → `_miss`（`.text`）的跳转距离可能增大。需验证 ±128 MiB 约束仍满足
 - **链接脚本复杂度**：增加一个段的管理负担
-- **收益与场景强相关**：频繁切换 `ejit_entry` 的调用模式下收益才明显；如果大部分时间只调用 1-2 个 entry 函数，聚类收益微乎其微
+- **收益与场景强相关**：频繁切换 `EJIT_ENTRY` 的调用模式下收益才明显；如果大部分时间只调用 1-2 个 entry 函数，聚类收益微乎其微
 
 ### 7.5 决策建议
 
 | 条件 | 建议 |
 |------|------|
-| 只有 1-3 个 `ejit_entry` 函数 | 不值得做——收益可忽略 |
+| 只有 1-3 个 `EJIT_ENTRY` 函数 | 不值得做——收益可忽略 |
 | 有 10+ 个且存在频繁切换场景 | 值得做——实现成本低，收益可测量 |
 | 不确定 | **先跑 PMU perf stat**，看 I-cache refill 率的绝对数值，<2% 则优先级低 |
 

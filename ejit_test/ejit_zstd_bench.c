@@ -3,9 +3,9 @@
 // Validates EJIT with a real-world C library (zstd).
 //
 // Design:
-//   - Compression parameters (level, windowLog, etc.) are ejit_may_const
-//     fields in a global struct marked ejit_period(static).
-//   - The compress() function is ejit_entry — JIT specializes it for the
+//   - Compression parameters (level, windowLog, etc.) are EJIT_PERIOD_CONST
+//     fields in a global struct marked EJIT_GROUP(static).
+//   - The compress() function is EJIT_ENTRY — JIT specializes it for the
 //     current parameter values, replacing loads with constants.
 //   - After InstCombine + Inline, the constant values propagate into
 //     zstd's internal code, eliminating dead branches.
@@ -24,23 +24,23 @@
 #include <string.h>
 #include <time.h>
 
-#include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
+#include "ejit_test_helpers.h"
 #include "zstd.h"
 
 //===--- EJIT-annotated compression parameters ----------------------------===//
 
 typedef struct {
-  int ejit_may_const compressionLevel;   // 1..22
-  int ejit_may_const windowLog;          // 10..31
-  int ejit_may_const chainLog;           // 6..30
-  int ejit_may_const hashLog;            // 6..30
-  int ejit_may_const searchLog;          // 1..10
-  int ejit_may_const minMatch;           // 3..7
-  int ejit_may_const targetLength;       // 0..large
-  int ejit_may_const strategy;           // ZSTD_fast..ZSTD_btultra2
+  int EJIT_PERIOD_CONST compressionLevel;   // 1..22
+  int EJIT_PERIOD_CONST windowLog;          // 10..31
+  int EJIT_PERIOD_CONST chainLog;           // 6..30
+  int EJIT_PERIOD_CONST hashLog;            // 6..30
+  int EJIT_PERIOD_CONST searchLog;          // 1..10
+  int EJIT_PERIOD_CONST minMatch;           // 3..7
+  int EJIT_PERIOD_CONST targetLength;       // 0..large
+  int EJIT_PERIOD_CONST strategy;           // ZSTD_fast..ZSTD_btultra2
 } CompressCfg;
 
-ejit_period(static) CompressCfg g_cfg;
+EJIT_GROUP(static) CompressCfg g_cfg;
 
 // Pre-allocated compression context (reused across calls).
 // Not annotated — this is runtime mutable state.
@@ -48,7 +48,7 @@ static ZSTD_CCtx *g_cctx = NULL;
 
 //===--- EJIT entry: compress with specialized parameters -----------------===//
 
-ejit_entry size_t compress_specialized(
+EJIT_ENTRY size_t compress_specialized(
     const void *src, size_t srcSize,
     void *dst, size_t dstCapacity)
 {
@@ -144,7 +144,7 @@ int main(int argc, char **argv) {
   // Init EJIT
   ejit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-  cfg.compileMode = EJIT_COMPILE_SYNC;
+  cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
 
   ejit_status_t st = ejit_init(&cfg);
@@ -184,6 +184,8 @@ int main(int argc, char **argv) {
       double t2 = now_ms();
       double jit_time = t2 - t1;
 
+      CHECK(ejit_drain_taskpool_bounded(EJIT_DRAIN_SPIN_BUDGET),
+            "async compile drained before measuring warm call");
       // --- EJIT path: second call should hit the JIT cache ---
       double t3 = now_ms();
       size_t r2 = compress_specialized(src, srcSize, dst_jit, dstCap);

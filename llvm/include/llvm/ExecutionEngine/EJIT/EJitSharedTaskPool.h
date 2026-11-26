@@ -20,8 +20,8 @@
 //     core waits — bounded, yielding — for the designated core to initialize,
 //     then attaches.
 //   * the producer path compileOrGet() operating purely on shared state.
-//   * the consumer path pollOne()/pollBudget() (the worker, or a test, drives
-//     it) with the two version checkpoints and the commit-gated cache publish.
+//   * the consumer path pollOne(), with the two version checkpoints and the
+//     commit-gated cache publish.
 //   * read-only diagnostics.
 //
 //  The compile callback, the physical-code release callback, and the worker
@@ -37,7 +37,7 @@
 #include "llvm/ExecutionEngine/EJIT/EJitCodeRange.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPoolState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitStats.h"
-#include "llvm/ExecutionEngine/EJIT/EJitTaskPool.h" // EJitCompileMode, status enum
+#include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -109,7 +109,7 @@ enum class EJitWorkerStep : uint32_t {
 // .mc_shared) rather than per-core .bss, so ONE table backs every core:
 //
 //  * PARTITIONED, so no locking. A cell's index is icacheLinearize(dims), the
-//    ejit_dim argument values (the ejit_period_lc instance indices). Cores
+//    ejit_dim argument values (the ejit_guard instance indices). Cores
 //    drive disjoint instance ranges, so they write disjoint cells and the hit
 //    path is what it was when the table was private: no gate, no contention,
 //    one load.
@@ -124,7 +124,7 @@ enum class EJitWorkerStep : uint32_t {
 //    to call.
 //
 // PREREQUISITE, and it is a CORRECTNESS one: the partitioning must be real --
-// each core drives its OWN ejit_period_lc instance indices, so no two cores
+// each core drives its OWN ejit_guard instance indices, so no two cores
 // call one ejit_entry with the same ejit_dim values.
 //
 // Disjointness is what makes a cell safe to jump to. A core only ever reads
@@ -230,7 +230,7 @@ void ejitIcacheClearAll();
 // dims) on a successful resolve (icacheFill), and empties the whole array on
 // a period toggle (icacheDrainAll); the wrapper reads the cell directly.
 // Called from ejit_register_icache_slot (name->funcIndex resolution) at
-// ejit_auto_register / .ejit_period time.
+// ejit_auto_register / .ejit_group time.
 //
 // Every core registers the SAME base: with EJIT_ICACHE_SECTION set the array is
 // one shared object, which is what lets a drain on any core clear the cells
@@ -409,7 +409,7 @@ public:
   using OwnerReleasedFn = void (*)(void *ctx);
   /// Owner-private diagnostic callback. It runs only on the owner worker and
   /// may access owner-local optimizer state.
-  using MayConstRankingCallback = bool (*)(void *ctx);
+  using PeriodConstRankingCallback = bool (*)(void *ctx);
 #ifdef EJIT_SRE_TASKPOOL_TESTING
   using TestHookFn = void (*)(void *ctx);
 #endif
@@ -513,12 +513,11 @@ public:
     publishFn_ = fn;
     publishCtx_ = ctx;
   }
-  void setMayConstRankingCallback(MayConstRankingCallback fn, void *ctx) {
-    mayConstRankingFn_ = fn;
-    mayConstRankingCtx_ = ctx;
+  void setPeriodConstRankingCallback(PeriodConstRankingCallback fn, void *ctx) {
+    periodConstRankingFn_ = fn;
+    periodConstRankingCtx_ = ctx;
   }
   void setReleaser(ReleaseCallback fn, void *ctx) {
-    const bool had = (releaseFn_ != nullptr);
     releaseFn_ = fn;
     releaseCtx_ = ctx;
     // v2 inline cache never reclaims (no HP-scan retire, ever). A wired
@@ -532,7 +531,6 @@ public:
     // would happily refill what this one just drained, and the probe consults
     // no gate at all. Track the transition as a count in the blob so the cache
     // re-arms only when the LAST releaser goes away.
-    (void)had;
     icacheReclamationSafe_ = (fn == nullptr);
     syncIcacheReleaserCount();
     if (fn) {
@@ -715,9 +713,7 @@ public:
   /// I/D-cache coherent for cross-core execution (spec §11 fnPtr
   /// prerequisites).
   void setCodeSharingEnabled(bool enabled) { codeSharingEnabled_ = enabled; }
-  /// Owner-only PRE-INIT configuration: the mode the owner publishes into the
-  /// shared state during init(). After the blob is Ready this only stages the
-  /// desired mode; use setSharedMode() to change the live cross-core mode.
+  /// The owner publishes this initial mode when creating the shared state.
   void setMode(EJitCompileMode mode) { configuredMode_ = mode; }
 
   /// PGO (§6): enable the online-PGO Tier-2 auto-trigger on the shared
@@ -774,45 +770,6 @@ public:
   /// stay on AOT until the current Tier-2 finishes.
   bool admitPgoFunction(uint32_t funcIndex, bool &newlyAdmitted);
 
-  //--- compile mode: CROSS-CORE SHARED runtime state --------------------------
-  /// Publish the compile/taskpool mode as cross-core shared runtime state.
-  /// Compile mode is a shared control flag (engine/worker ownership stays
-  /// owner-private): once the blob is Ready any core may flip it and every
-  /// core's compileOrGet() observes it through an acquire load of state_->mode.
-  /// A mode flip is a pure control flag — it never touches the queue, dedup,
-  /// cache, owner election, or the single worker.
-  ///   * If the blob is Ready, write state_->mode with RELEASE semantics so the
-  ///     new mode is visible to every core (including peers/other cores), not
-  ///     only to the owner object.
-  ///   * If the blob is not yet initialized, only stage configuredMode_ so the
-  ///     owner publishes the desired mode during init().
-  void setSharedMode(EJitCompileMode mode) {
-    configuredMode_ = mode;
-    if (state_ && state_->initState.loadAcquire() ==
-                      static_cast<uint32_t>(EJitSharedInitState::Ready))
-      state_->mode.storeRelease(static_cast<uint32_t>(mode));
-  }
-  /// Publish \p mode only if the blob is still Ready at generation \p gen --
-  /// the one asyncServiceAvailable() validated. An ownerShutdown that lands in
-  /// between bumps the generation, so the stale mode is never committed and the
-  /// caller learns the switch did not take. Returns false without writing then.
-  bool publishSharedMode(EJitCompileMode mode, uint32_t gen) {
-    if (!state_)
-      return false;
-    if (state_->initState.loadAcquire() !=
-            static_cast<uint32_t>(EJitSharedInitState::Ready) ||
-        state_->generation.loadAcquire() != gen)
-      return false;
-    configuredMode_ = mode;
-    state_->mode.storeRelease(static_cast<uint32_t>(mode));
-    // Re-check: if the owner went Stopping between the gate and the store, the
-    // write is stale. Producers gate on Ready before enqueuing so nothing can
-    // act on it, but report the failure rather than claim the switch took.
-    return state_->initState.loadAcquire() ==
-               static_cast<uint32_t>(EJitSharedInitState::Ready) &&
-           state_->generation.loadAcquire() == gen;
-  }
-
   /// The current cross-core compile mode: the shared state's mode (acquire
   /// load) once the blob is Ready, otherwise the staged configuredMode_.
   EJitCompileMode getSharedMode() const {
@@ -832,14 +789,12 @@ public:
   /// Can an async request submitted from THIS core actually be compiled? True
   /// when the blob is Ready, an owner is elected, and that owner's single
   /// worker started. Says nothing about a LOCAL engine: peers have none by
-  /// design and the owner compiles for every core (see EJit::setCompileMode).
+  /// design and the owner compiles for every core.
   ///
   /// The fields are re-read after the check and the whole thing is rejected if
   /// the generation or state moved, so the answer describes ONE generation
-  /// rather than a mix of before- and after-shutdown reads. \p outGeneration
-  /// receives that generation; pass it to publishSharedMode() so the mode can
-  /// only commit against the same one.
-  bool asyncServiceAvailable(uint32_t *outGeneration = nullptr) const {
+  /// rather than a mix of before- and after-shutdown reads.
+  bool asyncServiceAvailable() const {
     if (!state_)
       return false;
     const uint32_t gen = state_->generation.loadAcquire();
@@ -859,8 +814,6 @@ public:
             static_cast<uint32_t>(EJitSharedInitState::Ready) ||
         state_->generation.loadAcquire() != gen)
       return false;
-    if (outGeneration)
-      *outGeneration = gen;
     return true;
   }
 
@@ -869,6 +822,8 @@ public:
   void ownerShutdown();
 
   //--- producer path ----------------------------------------------------------
+  static bool validCompileRequest(const EJitCompileRequest &req);
+
   /// Submit a request carrying borrowed raw bound-pointer descriptors. Only
   /// the fixed descriptors are copied into the queue; pointee bytes are read
   /// by the compile callback and are never owned by this pool.
@@ -906,14 +861,8 @@ public:
   tryCacheHit(uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
               const EJitBoundPtrDescriptor *boundPointers = nullptr,
               uint32_t boundCount = 0);
-  /// Fixed-dimension fast cache-hit entries (0-4 dims). Same terminal
-  /// semantics as tryCacheHit() but the instance-enabled check is unrolled and
-  /// the dim identity is built directly on the stack (no numDims loop / no
-  /// variable-length array handling), so the C ABI fixed-dimension entries
-  /// (ejit_taskpool_compile_or_get_Nd) reach the cache lookup with the least
-  /// overhead. The cache lookup itself is still the shared generic
-  /// cacheLookup(). 4 is the maximum dimension count (numDims > 4 is rejected
-  /// by the C ABI); higher-dimension callers keep using tryCacheHit().
+  /// Internal fixed-arity queries. Their terminal results and token ownership
+  /// match tryCacheHit() for the same identity.
   CompileOrGetResult tryCacheHit0D(uint32_t funcIndex);
   CompileOrGetResult tryCacheHit1D(uint32_t funcIndex, uint32_t dim0,
                                    uint32_t inst0);
@@ -966,13 +915,14 @@ public:
   bool isInstanceActive(uint32_t dimType, uint32_t instanceId) const;
 
   //--- per-function inline cache (multi-version direct-indexed) --------------
+#ifdef EJIT_SRE_TASKPOOL_TESTING
   // NOTE: the production hit path does NOT use icacheTry. With -ejit-inline-cache
   // the ejit_entry wrapper reads its per-function @__ejit_icache_fn_<name> slot
   // directly - a GEP into the [D]^numDims array by the ejit_dim arg values, one
   // load + indirect call, NO ejit_icache_try call, NO
   // per-call guards; for NumDims <= 2 (no timing) the table is sentinel-formed,
   // so even the null-check is gone - a miss BLRs into MissFn itself. icacheTry
-  // is retained for unit tests / diagnostics: on a
+  // models the probe for unit tests: on a
   // hit it sets *outFn to the cached specialization for the given dims (call
   // with NO releaseRead) and returns true; on a miss returns false. It keeps
   // the reclamation-safety, pool-Ready, range, and cross-core code-sharing gates
@@ -981,6 +931,7 @@ public:
   // compile-time true).
   bool icacheTry(uint32_t funcIndex, const EJitDimPair *dims,
                  uint32_t numDims, void **outFn);
+#endif
   // Fill the per-function icache cell at [i0][i1]... (linearized from \p dims,
   // row-major, dim0 = leftmost ejit_dim param - MUST match the AOT array order)
   // with a freshly resolved specialization (call on a taskpool cache hit or a
@@ -1094,7 +1045,9 @@ public:
 
   //--- consumer path (worker / test) -----------------------------------------
   bool pollOne();
+#ifdef EJIT_SRE_TASKPOOL_TESTING
   unsigned pollBudget(unsigned maxItems);
+#endif
 
   //--- diagnostics ------------------------------------------------------------
   void getDiagnostics(EJitSharedDiagnostics &out) const;
@@ -1114,10 +1067,10 @@ public:
   /// core.
   bool requestCodeBatchFlushAndWait();
 
-  /// Ask the owner worker to print its owner-local may_const ranking. Any
+  /// Ask the owner worker to print its owner-local period_const ranking. Any
   /// attached core may call this; concurrent callers coalesce. The call waits
   /// for the owner to complete the diagnostic and returns its success status.
-  bool requestMayConstRanking();
+  bool requestPeriodConstRanking();
 
   /// The worker loop body: poll until the shared state leaves Ready. Public so
   /// an injected task entry can forward to it; normally reached via
@@ -1144,6 +1097,17 @@ public:
   uint64_t workerIdleYields() const { return workerIdleYields_.loadRelaxed(); }
 
 private:
+  // Only the C ABI dispatcher may bypass the public producer checks: it
+  // validates before even probing L0.
+  friend struct EJitRuntimeDispatch;
+  CompileOrGetResult tryCacheHitValidated(
+      uint32_t funcIndex, const EJitDimPair *dims, uint32_t numDims,
+      const EJitBoundPtrDescriptor *boundPointers, uint32_t boundCount);
+  CompileOrGetResult
+  compileOrGetValidated(uint32_t funcIndex, const EJitDimPair *dims,
+                        uint32_t numDims, void *fallback,
+                        const EJitBoundPtrDescriptor *boundPointers,
+                        uint32_t boundCount);
   static void workerEntryThunk(void *ctx);
   /// Yield/delay the CPU (injected hook, or a reordering barrier). \p ticks=1
   /// is a single yield (idle/wait); \p ticks=MULT*DELAY_TICKS is the post-task
@@ -1153,7 +1117,7 @@ private:
   /// normal worker loop. Batch helpers must call this between internal compile
   /// operations because they execute more than one operation per worker step.
   void workerThrottle();
-  bool serviceMayConstRankingRequest();
+  bool servicePeriodConstRankingRequest();
 
   /// Result of a shared-cache lookup, including the cross-core fnPtr gate.
   struct SharedLookup {
@@ -1195,50 +1159,22 @@ private:
                         const EJitDimPair *dims, uint32_t numDims);
   SharedLookup cacheLookup(uint32_t funcIndex, const EJitDimPair *dims,
                            uint32_t numDims);
+  SharedLookup cacheLookupDynamic(uint32_t funcIndex, const EJitDimPair *dims,
+                                  uint32_t numDims);
 #ifdef EJIT_SRE_TASKPOOL_NO_RECLAIM
   /// Load-only seqlock cache lookup (no per-hit read-token RMW). Returned hits
   /// carry no read token (SharedLookup::noTokenHit). See the .cpp for the
   /// never-free safety precondition.
   SharedLookup cacheLookupSeq(uint32_t funcIndex, const EJitDimPair *dims,
                               uint32_t numDims);
-  /// Fixed-dimension load-only seqlock specializations (0-2 dims). Same
-  /// never-free seqlock discipline as cacheLookupSeq() but with the identity
-  /// hashing, slot identity comparison, and version comparison unrolled exactly
-  /// like cacheLookup0D/1D/2D — so a NO_RECLAIM fixed-dimension caller reaches
-  /// the shared slot resolution without the generic numDims loop, the
-  /// slotIdentityMatches() call, or variable-length dims[] handling. Behavior
-  /// is identical to cacheLookupSeq() with the matching numDims. 3D/4D keep
-  /// using the generic cacheLookupSeq() (rare on the hot path).
-  SharedLookup cacheLookupSeq0D(uint32_t funcIndex);
-  SharedLookup cacheLookupSeq1D(uint32_t funcIndex, uint32_t dim0,
-                                uint32_t inst0);
-  SharedLookup cacheLookupSeq2D(uint32_t funcIndex, uint32_t dim0,
-                                uint32_t inst0, uint32_t dim1, uint32_t inst1);
 #endif
-  /// Fixed-dimension specializations of cacheLookup() (0-4 dims). Identity
-  /// hashing, slot identity comparison, and version comparison are all unrolled
-  /// (no numDims loops, no dims[] indexing), so a cache hit reaches the shared
-  /// slot resolution with the least per-hit work. Behavior is identical to
-  /// cacheLookup() with the matching numDims. The cross-core fnPtr gate and the
-  /// cold non-owner preparation are shared via resolveMatchedSlot() /
-  /// peerPrepareSlot(), so these stay small on the hot path.
-  SharedLookup cacheLookup0D(uint32_t funcIndex);
-  SharedLookup cacheLookup1D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0);
-  SharedLookup cacheLookup2D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
-                             uint32_t dim1, uint32_t inst1);
-  SharedLookup cacheLookup3D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
-                             uint32_t dim1, uint32_t inst1, uint32_t dim2,
-                             uint32_t inst2);
-  SharedLookup cacheLookup4D(uint32_t funcIndex, uint32_t dim0, uint32_t inst0,
-                             uint32_t dim1, uint32_t inst1, uint32_t dim2,
-                             uint32_t inst2, uint32_t dim3, uint32_t inst3);
   /// Resolve a cache slot whose identity + versions already matched, with the
   /// bucket read lock HELD on entry. Applies the cross-core fnPtr gate and
   /// returns the hit (with the read token held) for the owner core or a core
   /// that has already memoized execute permission; a core that may not read the
   /// pointer gets a clean readyButNotShareable fallback (lock released). The
   /// rare non-owner first-touch case is delegated to peerPrepareSlot(). Shared
-  /// by cacheLookup() and all fixed-dimension specializations.
+  /// by the token and seqlock scans.
   SharedLookup resolveMatchedSlot(EJitSharedCacheBucket &bucket,
                                   uint32_t bucketIndex, uint32_t slotIndex);
   /// Submit Tier-2 from an identity/version-validated slot while its bucket
@@ -1257,7 +1193,7 @@ private:
   /// slot, with the bucket read lock HELD on entry (this function releases it).
   /// Snapshots the slot, drops the lock for the per-core platform seal, then
   /// re-validates before handing back the prepared pointer. Kept out-of-line
-  /// (noinline) so it never bloats the hit path in cacheLookup()/cacheLookupNd.
+  /// (noinline) so it never bloats the hit path.
   SharedLookup peerPrepareSlot(EJitSharedCacheBucket &bucket,
                                uint32_t bucketIndex, uint32_t slotIndex);
   /// Convert a shared cache lookup outcome into a CompileOrGetResult with the
@@ -1377,8 +1313,8 @@ private:
   void *codeRangeCtx_ = nullptr;
   CodePoolStatsCallback codePoolStatsFn_ = nullptr;
   void *codePoolStatsCtx_ = nullptr;
-  MayConstRankingCallback mayConstRankingFn_ = nullptr;
-  void *mayConstRankingCtx_ = nullptr;
+  PeriodConstRankingCallback periodConstRankingFn_ = nullptr;
+  void *periodConstRankingCtx_ = nullptr;
   CodeReadyCallback codeReadyFn_ = nullptr;
   CodeBatchFlushCallback codeBatchFlushFn_ = nullptr;
   void *codeBatchCtx_ = nullptr;

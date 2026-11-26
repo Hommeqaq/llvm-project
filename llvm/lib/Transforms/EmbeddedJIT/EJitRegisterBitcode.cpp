@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/EmbeddedJIT/EJitPasses.h"
+#include "EJitAutoRegister.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
@@ -51,8 +52,8 @@ extern cl::opt<bool> EnableEJitGlobalCtors;
 extern cl::opt<std::string> EJitDumpBitcodeDir;
 extern cl::opt<bool> EJitWarnNoSpecialization;
 extern cl::opt<bool> EJitWarnUnusedDim;
-extern cl::opt<bool> EJitReportMayConst;
-extern cl::opt<unsigned> EJitWarnFewMayConst;
+extern cl::opt<bool> EJitReportPeriodConst;
+extern cl::opt<unsigned> EJitWarnFewPeriodConst;
 extern cl::opt<unsigned> EJitExternalizeMinInsts;
 
 #define DEBUG_TYPE "ejit-register-bitcode"
@@ -104,36 +105,19 @@ static void collectEntryFunctions(Module &M,
       EntryFuncs.push_back(&F);
 }
 
+/// Walk a GEP chain from a load's pointer operand down to the root
+/// GlobalVariable, accumulating the total byte offset.
 static const GlobalVariable *findRootGV(const Value *V, APInt &Offset,
-                                        const DataLayout &DL);
-
-/// Resolve a value to the underlying GlobalVariable it references, walking
-/// through bitcasts, addrspacecasts and constant-offset GEP chains (mirrors
-/// findRootGV). This is the single definition of "this operand references a
-/// global", shared by the closure collector and both symbol-registration
-/// emitters. Keeping them on one helper avoids the class of bug where a
-/// global is kept in the extracted bitcode (as an external declaration) by
-/// the collector but never registered by the emitters — which the JIT linker
-/// then fails to resolve.
-static GlobalVariable *rootGlobal(Value *V, const DataLayout &DL) {
-  APInt Offset;
-  return const_cast<GlobalVariable *>(findRootGV(V, Offset, DL));
-}
-
-/// Resolve the global that roots an entry-reachable operand, including aliases
-/// used as whole-table names. This is deliberately separate from rootGlobal:
-/// may-const offsets and symbol registration retain their existing alias-free
-/// semantics. Constant GEP handling matches findRootGV, and the alias set
-/// prevents malformed alias cycles from making closure discovery unbounded.
-static GlobalVariable *closureRootGlobal(Value *V, const DataLayout &DL) {
-  APInt Offset(DL.getPointerSizeInBits(0), 0);
+                                        const DataLayout &DL,
+                                        bool FollowAliases = false) {
   SmallPtrSet<const GlobalAlias *, 4> VisitedAliases;
+  Offset = APInt(DL.getPointerSizeInBits(0), 0);
   while (V) {
     V = V->stripPointerCasts();
-    if (auto *GV = dyn_cast<GlobalVariable>(V))
-      return GV;
+    if (isa<GlobalVariable>(V))
+      return cast<GlobalVariable>(V);
     if (auto *GA = dyn_cast<GlobalAlias>(V)) {
-      if (!VisitedAliases.insert(GA).second)
+      if (!FollowAliases || !VisitedAliases.insert(GA).second)
         return nullptr;
       V = GA->getAliasee();
       continue;
@@ -151,6 +135,19 @@ static GlobalVariable *closureRootGlobal(Value *V, const DataLayout &DL) {
     V = GEP->getPointerOperand();
   }
   return nullptr;
+}
+
+/// Registration operands and period-const offsets do not look through aliases.
+static GlobalVariable *rootGlobal(Value *V, const DataLayout &DL) {
+  APInt Offset;
+  return const_cast<GlobalVariable *>(findRootGV(V, Offset, DL));
+}
+
+/// Closure discovery also follows aliases used as whole-table names.
+static GlobalVariable *closureRootGlobal(Value *V, const DataLayout &DL) {
+  APInt Offset;
+  return const_cast<GlobalVariable *>(
+      findRootGV(V, Offset, DL, /*FollowAliases=*/true));
 }
 
 /// An alias in serialized bitcode may not ultimately point at a declaration.
@@ -243,8 +240,6 @@ collectInitializerClosureRefs(Constant *C, SmallPtrSetImpl<Constant *> &Visited,
                                   Globals);
     return;
   }
-  if (isa<GlobalValue>(C))
-    return;
   for (Value *Op : C->operands())
     if (auto *OpC = dyn_cast<Constant>(Op))
       collectInitializerClosureRefs(OpC, Visited, Functions, Globals);
@@ -299,40 +294,16 @@ computeTransitiveClosure(const SmallVectorImpl<Function *> &EntryFuncs,
   }
 }
 
-/// Walk a GEP chain from a load's pointer operand down to the root
-/// GlobalVariable, accumulating the total byte offset.
-static const GlobalVariable *findRootGV(const Value *V, APInt &Offset,
-                                         const DataLayout &DL) {
-  Offset = APInt(DL.getPointerSizeInBits(0), 0);
-  while (V) {
-    V = V->stripPointerCasts();
-    if (isa<GlobalVariable>(V))
-      return cast<GlobalVariable>(V);
-    auto *GEP = dyn_cast<GEPOperator>(V);
-    if (!GEP)
-      return nullptr;
-    SmallVector<Value *, 4> IdxList;
-    for (auto I = GEP->idx_begin(), E = GEP->idx_end(); I != E; ++I) {
-      if (!isa<ConstantInt>(*I))
-        return nullptr;
-      IdxList.push_back(*I);
-    }
-    Offset += DL.getIndexedOffsetInType(GEP->getSourceElementType(), IdxList);
-    V = GEP->getPointerOperand();
-  }
-  return nullptr;
-}
-
-/// Re-annotate loads with !ejit.may_const using GV-level offset metadata.
+/// Re-annotate loads with !ejit.period_const using GV-level offset metadata.
 /// Optimization passes may drop per-load metadata; this restores it from
-/// the !ejit.may_const_field entries on the GV's !ejit.metadata.
-static void reAnnotateMayConst(Module &M) {
+/// the !ejit.period_const_field entries on the GV's !ejit.metadata.
+static void reAnnotatePeriodConst(Module &M) {
   const DataLayout &DL = M.getDataLayout();
   LLVMContext &Ctx = M.getContext();
-  auto MayConstKind = Ctx.getMDKindID(MD_EJIT_MAY_CONST);
+  auto PeriodConstKind = Ctx.getMDKindID(MD_EJIT_PERIOD_CONST);
 
   // Build offset map from GV metadata
-  DenseMap<const GlobalVariable *, SmallVector<uint64_t, 4>> mayConstMap;
+  DenseMap<const GlobalVariable *, SmallVector<uint64_t, 4>> periodConstMap;
   for (GlobalVariable &GV : M.globals()) {
     MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
     if (!MD)
@@ -343,15 +314,15 @@ static void reAnnotateMayConst(Module &M) {
       if (!Sub || Sub->getNumOperands() < 2)
         continue;
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_MAY_CONST_FIELD)
+      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_CONST_FIELD)
         continue;
       if (auto *CI = mdconst::dyn_extract<ConstantInt>(Sub->getOperand(1)))
         offsets.push_back(CI->getZExtValue());
     }
     if (!offsets.empty())
-      mayConstMap[&GV] = std::move(offsets);
+      periodConstMap[&GV] = std::move(offsets);
   }
-  if (mayConstMap.empty())
+  if (periodConstMap.empty())
     return;
 
   // Re-annotate matching loads
@@ -362,7 +333,7 @@ static void reAnnotateMayConst(Module &M) {
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         auto *LI = dyn_cast<LoadInst>(&I);
-        if (!LI || LI->hasMetadata(MayConstKind))
+        if (!LI || LI->hasMetadata(PeriodConstKind))
           continue;
         // Never folded, so never re-annotated.
         if (LI->isVolatile() || LI->isAtomic())
@@ -370,11 +341,11 @@ static void reAnnotateMayConst(Module &M) {
         // The recorded offsets are element-relative, so match on the field
         // coordinate rather than the total offset from the global.
         const GlobalVariable *GV = nullptr;
-        auto Off = ejitMayConstFieldOffset(LI->getPointerOperand(), DL, GV);
+        auto Off = ejitPeriodConstFieldOffset(LI->getPointerOperand(), DL, GV);
         if (!Off || !GV)
           continue;
-        auto it = mayConstMap.find(GV);
-        if (it == mayConstMap.end())
+        auto it = periodConstMap.find(GV);
+        if (it == periodConstMap.end())
           continue;
         if (!is_contained(it->second, *Off))
           continue;
@@ -382,16 +353,16 @@ static void reAnnotateMayConst(Module &M) {
         // next field, which is free to change.
         TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
         if (AccessSize.isScalable() ||
-            !ejitAccessFitsMayConstField(GV, *Off, AccessSize.getFixedValue(),
+            !ejitAccessFitsPeriodConstField(GV, *Off, AccessSize.getFixedValue(),
                                          DL))
           continue;
-        LI->setMetadata(MayConstKind, MDNode::get(Ctx, {}));
+        LI->setMetadata(PeriodConstKind, MDNode::get(Ctx, {}));
         count++;
       }
     }
   }
   LLVM_DEBUG(dbgs() << "ejit-register-bitcode: re-annotated " << count
-                    << " may_const load(s)\n");
+                    << " period_const load(s)\n");
 }
 
 /// Run pre-optimization on the extracted bitcode at AOT time to reduce
@@ -468,8 +439,8 @@ static void preOptimizeBitcode(Module &M) {
         FPM.run(F, FAM);
   }
 
-  // 6. Restore !ejit.may_const metadata that passes may have dropped
-  reAnnotateMayConst(M);
+  // 6. Restore !ejit.period_const metadata that passes may have dropped
+  reAnnotatePeriodConst(M);
 }
 #else
 static void preOptimizeBitcode(Module &) {}
@@ -483,8 +454,6 @@ static void preOptimizeBitcode(Module &) {}
 /// never serialize. Writes both .ll (readable: grep "define @Fn" vs
 /// "declare @Fn") and .bc.
 static void dumpExtractedBitcode(const Module &M, StringRef Dir) {
-  if (Dir.empty())
-    return;
   if (std::error_code EC = sys::fs::create_directories(Dir))
     return;
   std::string Stem;
@@ -510,14 +479,14 @@ static void dumpExtractedBitcode(const Module &M, StringRef Dir) {
 }
 
 /// Diagnostic: count globals carrying !ejit.metadata, and within that the
-/// period_arr / may_const_field tags. Gated on EJitDumpBitcodeDir so it only
+/// period_arr / period_const_field tags. Gated on EJitDumpBitcodeDir so it only
 /// runs when the dump is enabled. Used to pinpoint where the struct-field
 /// pass's GV metadata is lost during extraction (clone → preOptimize →
 /// externalization).
 static void logEJitGlobalMeta(const char *label, const Module &M) {
   if (EJitDumpBitcodeDir.empty())
     return;
-  unsigned withMeta = 0, periodArr = 0, mayConstField = 0;
+  unsigned withMeta = 0, periodArr = 0, periodConstField = 0;
   for (const GlobalVariable &GV : M.globals()) {
     MDNode *MD = GV.getMetadata(MD_EJIT_METADATA);
     if (!MD)
@@ -528,16 +497,16 @@ static void logEJitGlobalMeta(const char *label, const Module &M) {
       if (!Sub || Sub->getNumOperands() < 2)
         continue;
       if (auto *Tag = dyn_cast<MDString>(Sub->getOperand(0))) {
-        if (Tag->getString() == TAG_EJIT_PERIOD_ARR)
+        if (Tag->getString() == TAG_EJIT_GROUP_INDEXED)
           ++periodArr;
-        else if (Tag->getString() == TAG_EJIT_MAY_CONST_FIELD)
-          ++mayConstField;
+        else if (Tag->getString() == TAG_EJIT_PERIOD_CONST_FIELD)
+          ++periodConstField;
       }
     }
   }
   errs() << "ejit-register-bitcode: " << label
          << " globals=" << M.global_size() << " withMeta=" << withMeta
-         << " periodArr=" << periodArr << " mayConstField=" << mayConstField
+         << " periodArr=" << periodArr << " periodConstField=" << periodConstField
          << "\n";
 }
 
@@ -545,9 +514,9 @@ namespace {
 
 /// Per-function direct info used by the specialization diagnostic.
 struct EjitFuncDiagInfo {
-  bool HasMayConstLoad = false;
-  unsigned MayConstCount = 0;        // # of !ejit.may_const loads (direct)
-  unsigned MayConstInLoopCount = 0;  // subset sitting inside a loop
+  bool HasPeriodConstLoad = false;
+  unsigned PeriodConstCount = 0;        // # of !ejit.period_const loads (direct)
+  unsigned PeriodConstInLoopCount = 0;  // subset sitting inside a loop
   SetVector<StringRef> RefsPeriodArr; // deduped period names referenced
   SmallVector<const Function *, 4> Callees;  // direct, defined, non-intrinsic
 };
@@ -592,9 +561,9 @@ static void computeLoopBBs(Function &F,
 }
 
 /// Compute direct (pre-propagation) diagnostic info for \p F. \p LoopBBs is
-/// optional (non-null only when the may_const count report is enabled).
+/// optional (non-null only when the period_const count report is enabled).
 static void
-computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKind,
+computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned PeriodConstKind,
                         const SmallPtrSetImpl<const BasicBlock *> *LoopBBs) {
   const DataLayout &DL = F.getParent()->getDataLayout();
   SetVector<GlobalVariable *> GVs;
@@ -602,11 +571,11 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
     const bool InLoop = LoopBBs && LoopBBs->count(&BB);
     for (Instruction &I : BB) {
       if (auto *Ld = dyn_cast<LoadInst>(&I))
-        if (Ld->hasMetadata(MayConstKind)) {
-          Info.HasMayConstLoad = true;
-          ++Info.MayConstCount;
+        if (Ld->hasMetadata(PeriodConstKind)) {
+          Info.HasPeriodConstLoad = true;
+          ++Info.PeriodConstCount;
           if (InLoop)
-            ++Info.MayConstInLoopCount;
+            ++Info.PeriodConstInLoopCount;
         }
       if (auto *CB = dyn_cast<CallBase>(&I))
         if (Function *Callee = CB->getCalledFunction())
@@ -628,7 +597,7 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
       if (!Sub || Sub->getNumOperands() < 2)
         continue;
       auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-      if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR)
+      if (!Tag || Tag->getString() != TAG_EJIT_GROUP_INDEXED)
         continue;
       if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
         Info.RefsPeriodArr.insert(PN->getString());
@@ -638,18 +607,18 @@ computeEjitFuncDiagInfo(Function &F, EjitFuncDiagInfo &Info, unsigned MayConstKi
 
 /// AOT specialization diagnostics on the extracted bitcode (post-preOptimize),
 /// which is exactly what the JIT will specialize.
-///   #1: ejit_entry whose specialization closure reads no ejit_may_const field.
-///   #2: ejit_entry that declares ejit_period_arr_ind(P) but its closure never
-///       indexes an ejit_period_arr(P).
+///   #1: ejit_entry whose specialization closure reads no ejit_period_const field.
+///   #2: ejit_entry that declares ejit_dim(P) but its closure never
+///       indexes an ejit_group(P).
 /// The closure is the direct-call reachability within the extracted module.
 /// External calls (declarations) and indirect calls (function pointers) do NOT
-/// count: the JIT cannot inline them, so their may_const reads never enter this
+/// count: the JIT cannot inline them, so their period_const reads never enter this
 /// entry's specialization. This keeps #1 sound (no false positives).
 static void
 runSpecializationDiagnostic(Module &Extracted,
                             const SmallVectorImpl<Function *> &EntryFuncs) {
-  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim && !EJitReportMayConst &&
-      !EJitWarnFewMayConst)
+  if (!EJitWarnNoSpecialization && !EJitWarnUnusedDim && !EJitReportPeriodConst &&
+      !EJitWarnFewPeriodConst)
     return;
 
   SmallVector<EjitEntryDiag, 4> Entries;
@@ -662,7 +631,7 @@ runSpecializationDiagnostic(Module &Extracted,
         if (!Sub || Sub->getNumOperands() < 2)
           continue;
         auto *Tag = dyn_cast<MDString>(Sub->getOperand(0));
-        if (!Tag || Tag->getString() != TAG_EJIT_PERIOD_ARR_IND)
+        if (!Tag || Tag->getString() != TAG_EJIT_DIM)
           continue;
         if (auto *PN = dyn_cast<MDString>(Sub->getOperand(1)))
           ED.DeclaredDims.push_back(PN->getString().str());
@@ -670,30 +639,30 @@ runSpecializationDiagnostic(Module &Extracted,
     Entries.push_back(std::move(ED));
   }
 
-  unsigned MayConstKind = Extracted.getContext().getMDKindID(MD_EJIT_MAY_CONST);
+  unsigned PeriodConstKind = Extracted.getContext().getMDKindID(MD_EJIT_PERIOD_CONST);
 
   // Direct info per defined function in the extracted module. Loop membership
-  // (for the may_const count report) uses a lightweight CFG-cycle test so the
+  // (for the period_const count report) uses a lightweight CFG-cycle test so the
   // report does not pull LoopInfo / PassBuilder into LLVMEmbeddedJIT.
   DenseMap<const Function *, EjitFuncDiagInfo> Info;
   for (Function &F : Extracted) {
     if (F.isDeclaration())
       continue;
     SmallPtrSet<const BasicBlock *, 16> LoopBBs;
-    bool NeedLoops = EJitReportMayConst || EJitWarnFewMayConst > 0;
+    bool NeedLoops = EJitReportPeriodConst || EJitWarnFewPeriodConst > 0;
     if (NeedLoops)
       computeLoopBBs(F, LoopBBs);
-    computeEjitFuncDiagInfo(F, Info[&F], MayConstKind,
+    computeEjitFuncDiagInfo(F, Info[&F], PeriodConstKind,
                             NeedLoops ? &LoopBBs : nullptr);
   }
 
-  // Fixpoint: propagate HasMayConstLoad and RefsPeriodArr up the call graph.
+  // Fixpoint: propagate HasPeriodConstLoad and RefsPeriodArr up the call graph.
   // The extracted module holds only the closure, so every function is reachable
   // from some entry; the monotonic fixpoint converges quickly.
   DenseMap<const Function *, bool> ClosureMC;
   DenseMap<const Function *, SetVector<StringRef>> ClosureRefs;
   for (auto &KV : Info) {
-    ClosureMC[KV.first] = KV.second.HasMayConstLoad;
+    ClosureMC[KV.first] = KV.second.HasPeriodConstLoad;
     ClosureRefs[KV.first] = KV.second.RefsPeriodArr;
   }
   bool Changed = true;
@@ -702,8 +671,6 @@ runSpecializationDiagnostic(Module &Extracted,
     for (auto &KV : Info) {
       const Function *F = KV.first;
       for (const Function *Callee : KV.second.Callees) {
-        if (!Info.count(Callee))
-          continue;
         if (ClosureMC[Callee] && !ClosureMC[F]) {
           ClosureMC[F] = true;
           Changed = true;
@@ -722,13 +689,11 @@ runSpecializationDiagnostic(Module &Extracted,
       continue;
     auto MCIt = ClosureMC.find(EF);
     auto RefIt = ClosureRefs.find(EF);
-    if (MCIt == ClosureMC.end() || RefIt == ClosureRefs.end())
-      continue;
 
-    // #1: no ejit_may_const read in the specialization closure.
+    // #1: no ejit_period_const read in the specialization closure.
     if (EJitWarnNoSpecialization && !MCIt->second)
       errs() << "EJit warning: ejit_entry function '" << EF->getName()
-             << "' reads no ejit_may_const field in its specialization "
+             << "' reads no ejit_period_const field in its specialization "
                 "closure; no JIT specialization value, consider removing "
                 "ejit_entry\n";
 
@@ -737,17 +702,17 @@ runSpecializationDiagnostic(Module &Extracted,
       for (const std::string &P : ED.DeclaredDims)
         if (RefIt->second.count(P) == 0)
           errs() << "EJit warning: ejit_entry function '" << EF->getName()
-                 << "' declares ejit_period_arr_ind('" << P
+                 << "' declares ejit_dim('" << P
                  << "') but its specialization closure never indexes an "
-                    "ejit_period_arr('"
+                    "ejit_group('"
                  << P << "'); unused specialization dimension, consider "
                         "removing it\n";
   }
 
-  // Per-entry may_const read counts over the specialization closure (BFS).
-  // Used by the info report and the few-may-const warning; both share the
+  // Per-entry period_const read counts over the specialization closure (BFS).
+  // Used by the info report and the few-period-const warning; both share the
   // same closure walk so they share one gated loop.
-  if (EJitReportMayConst || EJitWarnFewMayConst > 0) {
+  if (EJitReportPeriodConst || EJitWarnFewPeriodConst > 0) {
     for (const EjitEntryDiag &ED : Entries) {
       const Function *EF = Extracted.getFunction(ED.Name);
       if (!EF || EF->isDeclaration())
@@ -761,34 +726,32 @@ runSpecializationDiagnostic(Module &Extracted,
         if (!Seen.insert(F).second)
           continue;
         auto It = Info.find(F);
-        if (It == Info.end())
-          continue;
-        K += It->second.MayConstCount;
-        J += It->second.MayConstInLoopCount;
+        K += It->second.PeriodConstCount;
+        J += It->second.PeriodConstInLoopCount;
         for (const Function *Callee : It->second.Callees)
           WL.push_back(Callee);
       }
 
-      // Info report (not a warning): summary of all may-const reads.
-      if (EJitReportMayConst)
+      // Info report (not a warning): summary of all period-const reads.
+      if (EJitReportPeriodConst)
         errs() << "EJit info: ejit_entry function '" << EF->getName() << "': "
-               << K << " ejit_may_const read" << (K == 1 ? "" : "s") << " ("
+               << K << " ejit_period_const read" << (K == 1 ? "" : "s") << " ("
                << J << " in loops)\n";
 
-      // Warning #3: too few may-const reads for meaningful specialization.
+      // Warning #3: too few period-const reads for meaningful specialization.
       // A low count means the JIT has little to fold, but doesn't mean the
       // entry is misconfigured — the significance depends on what those loads
       // gate.  This only flags the count for manual review.
       // A load inside a loop is high specialization value regardless of
       // count — a single loop load executes thousands of times.  Only
       // warn when there are no loop loads AND the total is below threshold.
-      if (EJitWarnFewMayConst > 0 && K < EJitWarnFewMayConst && J == 0)
+      if (EJitWarnFewPeriodConst > 0 && K < EJitWarnFewPeriodConst && J == 0)
         errs() << "EJit warning: ejit_entry function '" << EF->getName()
-               << "' has only " << K << " ejit_may_const read"
+               << "' has only " << K << " ejit_period_const read"
                << (K == 1 ? "" : "s") << " in its specialization closure"
-               << " (threshold: " << EJitWarnFewMayConst
+               << " (threshold: " << EJitWarnFewPeriodConst
                << "); low specialization surface, consider adding more"
-                  " may-const fields\n";
+                  " period-const fields\n";
     }
   }
 }
@@ -854,8 +817,7 @@ static std::string extractAndSerialize(Module &M,
   // conversion below so GV definitions (and their !ejit.metadata) are intact.
   runSpecializationDiagnostic(*Extracted, EntryFuncs);
 
-  // Externalize the closure helpers that generateSymbolRegisters /
-  // generateRegistryTable register on the AOT side: turn each surviving
+  // Externalize the closure helpers that both registration emitters register on the AOT side: turn each surviving
   // (i.e. not fully preopt-inlined) helper into an external declaration so
   // its body is not serialized into the bitcode. Internal helpers are
   // renamed to their deterministic registration key (their AOT symbol is
@@ -958,149 +920,94 @@ static GlobalVariable *embedBitcode(Module &M, const std::string &Bitcode) {
 static void collectFunctionsFromConstant(Constant *C,
                                          SmallPtrSetImpl<Function *> &Funcs);
 
-/// Collect external symbols (functions + globals) referenced by the
-/// closure and generate ejit_register_symbol calls so the JIT can resolve
-/// them without dlsym — suitable for bare-metal embedded environments.
-static void generateSymbolRegisters(
-    Module &M,
-    const SmallVectorImpl<Function *> &EntryFuncs,
+namespace {
+struct RegistrationSymbol {
+  std::string Name;
+  GlobalValue *Address;
+};
+
+// Ctors interleave calls and operand globals, deduplicating by name. The
+// section groups functions before globals, deduplicates by address, then
+// appends externalized helpers. Preserve both orders while walking IR once.
+struct RegistrationSymbols {
+  SmallVector<RegistrationSymbol> Ctor;
+  SmallVector<RegistrationSymbol> Section;
+};
+} // namespace
+
+static RegistrationSymbols collectRegistrationSymbols(
+    Module &M, ArrayRef<Function *> EntryFuncs,
     const SetVector<Function *> &ClosureFuncs,
     const SetVector<GlobalVariable *> &ClosureGlobals,
-    const SetVector<Function *> &ToExternalize,
-    Function *AutoReg) {
-  LLVMContext &Ctx = M.getContext();
-  const DataLayout &DL = M.getDataLayout();
-  auto *VoidTy = Type::getVoidTy(Ctx);
-  auto *PtrTy = PointerType::getUnqual(Ctx);
-
-  M.getOrInsertFunction(FN_REGISTER_SYMBOL,
-      FunctionType::get(VoidTy, {PtrTy, PtrTy}, false));
-
-  std::set<std::string> registered;
-
-  auto isPeriodVar = [&](GlobalVariable &GV) -> bool {
-    return GV.hasMetadata(MD_EJIT_METADATA);
+    const SetVector<Function *> &ToExternalize) {
+  RegistrationSymbols Result;
+  std::set<std::string> CtorNames;
+  SmallPtrSet<GlobalValue *, 16> SectionAddresses;
+  SmallVector<RegistrationSymbol> SectionGlobals;
+  auto addCtor = [&](GlobalValue *GV, StringRef Name) {
+    if (CtorNames.insert(Name.str()).second)
+      Result.Ctor.push_back({Name.str(), GV});
+  };
+  auto addSectionFn = [&](Function *F, StringRef Name) {
+    if (!F->isIntrinsic() && !isEJitLocalFreeDimFunction(*F) &&
+        SectionAddresses.insert(F).second)
+      Result.Section.push_back({Name.str(), F});
+  };
+  auto addGlobal = [&](GlobalVariable *GV, bool FromClosure) {
+    if (!GV || (GV->isConstant() && !GV->isDeclaration()))
+      return;
+    bool IsLLVM = GV->getName().starts_with("llvm.");
+    if ((!FromClosure || !IsLLVM) &&
+        (GV->isDeclaration() || !GV->hasMetadata(MD_EJIT_METADATA)))
+      addCtor(GV, GV->getName());
+    if (!IsLLVM && SectionAddresses.insert(GV).second)
+      SectionGlobals.push_back({GV->getName().str(), GV});
   };
 
-  BasicBlock *BB = &AutoReg->getEntryBlock();
-  Instruction *InsertBefore = BB->getTerminator();
-
-  // Nested ejit_entry calls are specialization boundaries. PASS3 rewrites
-  // these Function objects in place into their AOT wrappers after this pass,
-  // so the addresses recorded here ultimately point at the wrappers. The JIT
-  // externalizes every entry except the one currently being specialized and
-  // resolves calls to those declarations through this table.
+  // PASS3 rewrites these same Function objects into the AOT wrappers.
   for (Function *F : EntryFuncs) {
-    std::string Name = ejitRegistrationKey(M, *F);
-    if (registered.insert(Name).second) {
-      IRBuilder<> Builder(InsertBefore);
-      Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
-                         {Builder.CreateGlobalString(Name),
-                          Builder.CreateBitCast(F, PtrTy)});
-    }
+    std::string Key = ejitRegistrationKey(M, *F);
+    addCtor(F, Key);
+    addSectionFn(F, Key);
   }
-
-  for (Function *F : ClosureFuncs) {
-    for (BasicBlock &Blk : *F) {
-      for (Instruction &I : Blk) {
-        // External function calls
-        if (auto *CI = dyn_cast<CallInst>(&I)) {
-          if (Function *Callee = CI->getCalledFunction()) {
-            if (Callee->isDeclaration() && !Callee->isIntrinsic() &&
-                !isEJitLocalFreeDimFunction(*Callee)) {
-              std::string Name = Callee->getName().str();
-              if (registered.insert(Name).second) {
-                IRBuilder<> Builder(InsertBefore);
-                Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
-                    {Builder.CreateGlobalString(Name),
-                     Builder.CreateBitCast(Callee, PtrTy)});
-              }
-            }
+  for (Function *F : ClosureFuncs)
+    for (BasicBlock &BB : *F)
+      for (Instruction &I : BB) {
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          Function *Callee = CB->getCalledFunction();
+          if (Callee && Callee->isDeclaration()) {
+            // Only the section historically registers invoke/callbr targets.
+            if (isa<CallInst>(I) && !Callee->isIntrinsic() &&
+                !isEJitLocalFreeDimFunction(*Callee))
+              addCtor(Callee, Callee->getName());
+            addSectionFn(Callee, Callee->getName());
           }
         }
-        // External global variable references. A const global *with a local
-        // definition* (initializer) is embedded in the extracted bitcode by
-        // extractAndSerialize, so it needs no registration. A const global that
-        // is only a *declaration* (extern const, no initializer in this TU)
-        // cannot be embedded and must be resolved from the host process at JIT
-        // link time, so it MUST be registered — dropping it leaves an
-        // unresolved external that fails JITLink. Resolve through bitcasts/GEPs
-        // via rootGlobal so every global the collector kept in the extracted
-        // bitcode is actually registered here.
-        for (Use &U : I.operands()) {
-          auto *GV = rootGlobal(U.get(), DL);
-          if (!GV || (GV->isConstant() && !GV->isDeclaration()))
-            continue;
-          if (GV->isDeclaration() || !isPeriodVar(*GV)) {
-            std::string Name = GV->getName().str();
-            if (registered.insert(Name).second) {
-              IRBuilder<> Builder(InsertBefore);
-              Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
-                  {Builder.CreateGlobalString(Name),
-                   Builder.CreateBitCast(GV, PtrTy)});
-            }
-          }
-        }
+        for (Value *Op : I.operands())
+          addGlobal(rootGlobal(Op, M.getDataLayout()), /*FromClosure=*/false);
       }
-    }
-  }
+  // Include alias roots not encountered by the alias-free operand walk.
+  for (GlobalVariable *GV : ClosureGlobals)
+    addGlobal(GV, /*FromClosure=*/true);
 
-  // Alias-rooted globals are present in ClosureGlobals even though rootGlobal
-  // intentionally does not follow aliases. Register those closure members as
-  // a fallback so an extracted clone whose mutable aliases were dissolved can
-  // resolve the same host object. The set keeps the direct-reference path
-  // above unchanged and avoids duplicate registrations.
-  for (GlobalVariable *GV : ClosureGlobals) {
-    if ((GV->isConstant() && !GV->isDeclaration()) ||
-        GV->getName().starts_with("llvm."))
-      continue;
-    if (!GV->isDeclaration() && isPeriodVar(*GV))
-      continue;
-    std::string Name = GV->getName().str();
-    if (registered.insert(Name).second) {
-      IRBuilder<> Builder(InsertBefore);
-      Builder.CreateCall(
-          M.getFunction(FN_REGISTER_SYMBOL),
-          {Builder.CreateGlobalString(Name), Builder.CreateBitCast(GV, PtrTy)});
-    }
-  }
-
-  // Scan GlobalVariable initializers for function pointers stored in
-  // constant aggregates (e.g., const arrays of structs with fn_ptr
-  // fields used as indirect-call tables).  The instruction-level scan
-  // above only catches direct calls and direct GV operand references;
-  // indirect calls through loaded function pointers are missed because
-  // CI->getCalledFunction() returns nullptr.
   for (GlobalVariable *GV : ClosureGlobals) {
     if (!GV->hasInitializer())
       continue;
     SmallPtrSet<Function *, 8> FuncsInInit;
     collectFunctionsFromConstant(GV->getInitializer(), FuncsInInit);
-    for (Function *F : FuncsInInit) {
-      if (!F->isDeclaration() || F->isIntrinsic())
-        continue;
-      std::string Name = F->getName().str();
-      if (registered.insert(Name).second) {
-        IRBuilder<> Builder(InsertBefore);
-        Builder.CreateCall(M.getFunction("ejit_register_symbol"),
-            {Builder.CreateGlobalString(Name),
-             Builder.CreateBitCast(F, PtrTy)});
+    for (Function *F : FuncsInInit)
+      if (F->isDeclaration() && !F->isIntrinsic()) {
+        addCtor(F, F->getName());
+        addSectionFn(F, F->getName());
       }
-    }
   }
-
-  // Register externalized closure helpers under the same deterministic keys
-  // extractAndSerialize renamed them to in the bitcode. The address is the
-  // AOT original — taking it also keeps the body alive under --gc-sections.
+  Result.Section.append(SectionGlobals);
   for (Function *F : ToExternalize) {
     std::string Key = ejitRegistrationKey(M, *F);
-    if (registered.insert(Key).second) {
-      IRBuilder<> Builder(InsertBefore);
-      Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
-                         {Builder.CreateGlobalString(Key),
-                          Builder.CreateBitCast(F, PtrTy)});
-    }
+    addCtor(F, Key);
+    Result.Section.push_back({std::move(Key), F});
   }
+  return Result;
 }
 
 /// Recursively walk a Constant (initializer of a GlobalVariable) and
@@ -1124,9 +1031,7 @@ static void collectFunctionsFromConstant(Constant *C,
 
 static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
-                      const SetVector<Function *> &ClosureFuncs,
-                      const SetVector<GlobalVariable *> &ClosureGlobals,
-                      const SetVector<Function *> &ToExternalize,
+                      ArrayRef<RegistrationSymbol> Symbols,
                       GlobalVariable *BitcodeGV);
 
 static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
@@ -1142,14 +1047,7 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
   M.getOrInsertFunction(FN_REGISTER_BITCODE,
       FunctionType::get(VoidTy, {PtrTy, PtrTy, I64Ty}, false));
 
-  Function *AutoReg = M.getFunction(FN_AUTO_REGISTER);
-  if (!AutoReg) {
-    AutoReg = Function::Create(FunctionType::get(VoidTy, false),
-                               GlobalValue::InternalLinkage,
-                               FN_AUTO_REGISTER, &M);
-    BasicBlock::Create(Ctx, "entry", AutoReg);
-    ReturnInst::Create(Ctx, &AutoReg->getEntryBlock());
-  }
+  Function *AutoReg = getOrCreateAutoRegister(M).first;
 
   BasicBlock *EntryBB = &AutoReg->getEntryBlock();
   Instruction *Ret = EntryBB->getTerminator();
@@ -1166,15 +1064,21 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
 
   // Auto-register external symbols referenced by the closure so the JIT
   // can resolve them without manual ejit_register_symbol calls.
-  generateSymbolRegisters(M, EntryFuncs, ClosureFuncs, ClosureGlobals,
-                          ToExternalize, AutoReg);
+  M.getOrInsertFunction(FN_REGISTER_SYMBOL,
+      FunctionType::get(VoidTy, {PtrTy, PtrTy}, false));
+  auto Symbols = collectRegistrationSymbols(M, EntryFuncs, ClosureFuncs,
+                                            ClosureGlobals, ToExternalize);
+  IRBuilder<> Builder(Ret);
+  for (const auto &S : Symbols.Ctor)
+    Builder.CreateCall(M.getFunction(FN_REGISTER_SYMBOL),
+                       {Builder.CreateGlobalString(S.Name),
+                        Builder.CreateBitCast(S.Address, PtrTy)});
 
   if (EnableEJitGlobalCtors)
     appendToGlobalCtors(M, AutoReg, EJIT_CTOR_PRIORITY);
 
   // Always build the static registry table for bare-metal / testing fallback.
-  generateRegistryTable(M, EntryFuncs, ClosureFuncs, ClosureGlobals,
-                        ToExternalize, BitcodeGV);
+  generateRegistryTable(M, EntryFuncs, Symbols.Section, BitcodeGV);
 }
 
 /// Emit this translation unit's bitcode registry entries as a private array in
@@ -1184,9 +1088,7 @@ static void generateRegisterCall(Module &M, GlobalVariable *BitcodeGV,
 /// constructors are unavailable.
 static void
 generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
-                      const SetVector<Function *> &ClosureFuncs,
-                      const SetVector<GlobalVariable *> &ClosureGlobals,
-                      const SetVector<Function *> &ToExternalize,
+                      ArrayRef<RegistrationSymbol> Symbols,
                       GlobalVariable *BitcodeGV) {
   LLVMContext &Ctx = M.getContext();
   auto *I32Ty = Type::getInt32Ty(Ctx);
@@ -1215,123 +1117,15 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
     }));
   }
 
-  // Symbol entries for external references
-  SmallPtrSet<const Function *, 8> SymbolsDone;
-  auto addSymbol = [&](const Function *F, bool RequireDeclaration = true,
-                       StringRef RegistrationName = {}) {
-    if (!F->isIntrinsic() && !isEJitLocalFreeDimFunction(*F) &&
-        (!RequireDeclaration || F->isDeclaration())) {
-      if (SymbolsDone.insert(F).second) {
-        StringRef Name = RegistrationName.empty() ? F->getName()
-                                                   : RegistrationName;
-        Constant *NameStr = ConstantDataArray::getString(Ctx, Name, true);
-        auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
-            GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
-        Entries.push_back(ConstantStruct::get(EntryTy, {
-            ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),                      // EJIT_REG_SYMBOL
-            ConstantExpr::getBitCast(NameGV, PtrTy),         // name1 string
-            ConstantPointerNull::get(PtrTy),
-            ConstantExpr::getBitCast(const_cast<Function *>(F), PtrTy),
-            ConstantInt::get(I64Ty, 0),
-        }));
-      }
-    }
-  };
-
-  // PASS3 later turns these functions into wrappers in place, so these
-  // constants resolve to wrapper addresses in the final AOT object.
-  for (Function *F : EntryFuncs)
-    addSymbol(F, /*RequireDeclaration=*/false, ejitRegistrationKey(M, *F));
-  for (Function *F : ClosureFuncs) {
-    for (const BasicBlock &BB : *F) {
-      for (const Instruction &I : BB) {
-        if (const CallBase *CB = dyn_cast<CallBase>(&I))
-          if (Function *Callee = CB->getCalledFunction())
-            addSymbol(Callee);
-      }
-    }
-  }
-
-  // Also collect external function declarations referenced through
-  // GlobalVariable initializers (e.g., function pointers stored in
-  // constant struct arrays used as indirect-call targets).  The
-  // instruction scanning loop above only catches direct calls.
-  for (GlobalVariable *GV : ClosureGlobals) {
-    if (!GV->hasInitializer())
-      continue;
-    SmallPtrSet<Function *, 8> FuncsInInit;
-    collectFunctionsFromConstant(GV->getInitializer(), FuncsInInit);
-    for (Function *F : FuncsInInit)
-      addSymbol(F);
-  }
-
-  // Global variable symbol entries. Resolve through bitcasts/GEPs via
-  // rootGlobal so registration matches what collectReferencedGlobals kept in
-  // the extracted bitcode.
-  SmallPtrSet<const GlobalVariable *, 4> GVsDone;
-  const DataLayout &DL = M.getDataLayout();
-  for (Function *F : ClosureFuncs) {
-    for (const BasicBlock &BB : *F) {
-      for (const Instruction &I : BB) {
-        for (const Value *Op : I.operands()) {
-          const GlobalVariable *GV =
-              rootGlobal(const_cast<Value *>(Op), DL);
-          // Skip const globals that have a local definition (they're embedded
-          // in the bitcode), but keep const *declarations* (extern const) so
-          // they get registered and resolved from the host at JIT link time.
-          if (!GV || (GV->isConstant() && !GV->isDeclaration()) ||
-              GV->getName().starts_with("llvm."))
-            continue;
-          if (!GVsDone.insert(GV).second)
-            continue;
-          Constant *NameStr = ConstantDataArray::getString(Ctx, GV->getName(), true);
-          auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
-              GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
-          Entries.push_back(ConstantStruct::get(EntryTy, {
-              ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),                // EJIT_REG_SYMBOL
-              ConstantExpr::getBitCast(NameGV, PtrTy),   // name1 string
-              ConstantPointerNull::get(PtrTy),
-              ConstantExpr::getBitCast(
-                  const_cast<GlobalVariable *>(GV), PtrTy),
-              ConstantInt::get(I64Ty, 0),
-          }));
-        }
-      }
-    }
-  }
-
-  // Closure discovery follows aliases, while rootGlobal above deliberately
-  // retains its existing alias-free behavior. Add any remaining externally
-  // resolved closure globals so the static registry mirrors ctor registration
-  // after mutable aliases are dissolved in the extracted clone.
-  for (GlobalVariable *GV : ClosureGlobals) {
-    if ((GV->isConstant() && !GV->isDeclaration()) ||
-        GV->getName().starts_with("llvm.") || !GVsDone.insert(GV).second)
-      continue;
-    Constant *NameStr = ConstantDataArray::getString(Ctx, GV->getName(), true);
-    auto *NameGV =
-        new GlobalVariable(M, NameStr->getType(), true,
-                           GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
-    Entries.push_back(
-        ConstantStruct::get(EntryTy, {ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),
-                                      ConstantExpr::getBitCast(NameGV, PtrTy),
-                                      ConstantPointerNull::get(PtrTy),
-                                      ConstantExpr::getBitCast(GV, PtrTy),
-                                      ConstantInt::get(I64Ty, 0)}));
-  }
-
-  // Externalized closure helpers: same keys as generateSymbolRegisters, so
-  // the bare-metal section walk (no ctors) resolves them identically.
-  for (Function *F : ToExternalize) {
-    std::string Key = ejitRegistrationKey(M, *F);
-    Constant *NameStr = ConstantDataArray::getString(Ctx, Key, true);
+  for (const auto &S : Symbols) {
+    Constant *NameStr = ConstantDataArray::getString(Ctx, S.Name, true);
     auto *NameGV = new GlobalVariable(M, NameStr->getType(), true,
         GlobalValue::PrivateLinkage, NameStr, ".ejit.str.");
     Entries.push_back(ConstantStruct::get(EntryTy, {
-        ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),            // EJIT_REG_SYMBOL
-        ConstantExpr::getBitCast(NameGV, PtrTy),             // name1: key
+        ConstantInt::get(I32Ty, EJIT_REG_SYMBOL),
+        ConstantExpr::getBitCast(NameGV, PtrTy),
         ConstantPointerNull::get(PtrTy),
-        ConstantExpr::getBitCast(F, PtrTy),                  // AOT original
+        ConstantExpr::getBitCast(S.Address, PtrTy),
         ConstantInt::get(I64Ty, 0),
     }));
   }
@@ -1339,9 +1133,6 @@ generateRegistryTable(Module &M, const SmallVectorImpl<Function *> &EntryFuncs,
   // No sentinel entry: the runtime iterates the linker-provided
   // [__start_ejit_bitcode, __stop_ejit_bitcode) range over the dedicated
   // section, so each translation unit contributes only its own entries.
-  if (Entries.empty())
-    return;
-
   ArrayType *ArrayTy = ArrayType::get(EntryTy, Entries.size());
   Constant *ArrayInit = ConstantArray::get(ArrayTy, Entries);
 
@@ -1376,8 +1167,6 @@ EJitRegisterBitcodePass::run(Module &M, ModuleAnalysisManager &) {
   computeTransitiveClosure(EntryFuncs, ClosureFuncs, ClosureGlobals);
   LLVM_DEBUG(dbgs() << "ejit-register-bitcode: closure " << ClosureFuncs.size()
                     << " funcs, " << ClosureGlobals.size() << " globals\n");
-  if (ClosureFuncs.empty())
-    return PreservedAnalyses::all();
 
   // Helpers to externalize: non-entry closure functions whose bodies cost
   // more than the AOT registration record that replaces them. Computed on

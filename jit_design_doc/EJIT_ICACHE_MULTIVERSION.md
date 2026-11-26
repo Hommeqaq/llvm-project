@@ -7,14 +7,14 @@
 
 > Extends the v2 sticky-monomorphic inline cache (`ejit_icache_design.md`) to
 > **polymorphic** specialization: one cached slot per `(instanceId…)` identity,
-> so an `ejit_entry` called with different `ejit_dim` parameter values serves
+> so an `EJIT_ENTRY` called with different `ejit_dim` parameter values serves
 > the correct specialization for each. Baseline is the `ejit-integrate-djq`
 > direct-load hit path (`@__ejit_icache_fn_<name>` + `gIcacheFnSlots`).
 
 ## 1. Problem
 
 v2 is **monomorphic**: one frozen slot per funcIndex, first resolver wins, read
-forever. It is correct only if every `ejit_entry` is always called with the same
+forever. It is correct only if every `EJIT_ENTRY` is always called with the same
 dim identity. If a function is called with different `ejit_dim` argument values
 (e.g. `funcA(ejit_dim(P0) x)` called with `x=0` then `x=1`), v2 serves the
 first-resolved specialization for **all** calls -> wrong code.
@@ -91,23 +91,19 @@ dimType globals (dimType is the taskpool's key, not the icache's; for a given
 function the dimTypes are fixed by the signature, so `(i0,i1,…)` alone identifies
 the specialization).
 
-`-ejit-inline-cache` (default off) emits the probe; otherwise the wrapper goes
-straight to the funcidx guard / `compile_or_get` (no icache).
+The probe is enabled by default. Use `-mllvm -ejit-inline-cache=false` for the generic wrapper. Out-of-table identities use the slow path; runtimes without shared code pointers never populate a direct probe.
 
 ### Lever B: frame-less wrapper + noinline MissFn
 
-The wrapper (`ejit_entry` itself) is a **frame-less hit path**: just the probe
+The wrapper (`EJIT_ENTRY` itself) is a **frame-less hit path**: just the probe
 (GEP + plain load + null-check) + two **tail calls** (`br spec` on hit, `br
 MissFn` on miss). No allocas, no calls, no frame setup -- the hot path never
 touches `sp`. The slow path (funcidx guard + `compile_or_get` + dispatch + AOT
 fallback) is extracted into a per-function `noinline MissFn` (`<name>_miss`),
 which has its own frame. Miss is rare, so the tail-call overhead is irrelevant.
 
-The two tail calls are `musttail` (so they lower to `br` and the wrapper needs
-no frame) **only when `!EJitWrapperTiming`**; under `-ejit-wrapper-timing` the
-hit path inserts `trace_now`/`trace_wrapper` between the call and `ret`, which
-violates the musttail rule, so it becomes a framed plain call + trace + ret
-(the miss path stays musttail). MissFn must inherit F's target attributes
+The dispatcher tail-calls its target without wrapper timing instrumentation.
+MissFn must inherit the entry target attributes
 (`target-cpu`/`target-features`/`tune-cpu`) via `setAttributes(F->getAttributes())`
 -- `Function::Create` only inherits module-default `uwtable`/`frame-pointer`,
 and a bare MissFn fails `TTI::areInlineCompatible`, so the CGSCC InlinerPass
@@ -165,7 +161,7 @@ no read-token, no `release_read`, no dimType load, no version compare, no frame.
 Counts above are the latest measured hit-path instruction totals (probe + tail-call).
 
 ### numDims > EJIT_ICACHE_MAX_DIMS (default 4) -> compile error
-An `ejit_entry` with more than `EJIT_ICACHE_MAX_DIMS` `ejit_dim` params is
+An `EJIT_ENTRY` with more than `EJIT_ICACHE_MAX_DIMS` `ejit_dim` params is
 **rejected at compile time** with a diagnostic; the wrapper emits no probe and
 does not wrap such a function. `EJIT_ICACHE_MAX_DIMS` defaults to 4, matching
 the existing taskpool `DimCount` cap - exceeding it is a programming error, not
@@ -272,7 +268,7 @@ is required**; a non-power-of-2 value is **rejected at CMake configure**.
 | 8 | 8B | 64B | 512B | 4KB | 32KB |
 | 16 | 8B | 128B | 2KB | 32KB | 512KB |
 
-× N `ejit_entry` functions (no longer × cores — the table is shared). D=16 +
+× N `EJIT_ENTRY` functions (no longer × cores — the table is shared). D=16 +
 maxDims=4 is a safe default (≤32KB/func at 4 dims); D=16 + maxDims=2 keeps every
 function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
 
@@ -283,7 +279,7 @@ function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
    `[D][D]…[D]` (numDims dims) `uintptr_t` array (scalar for numDims=0).
    numDims > `EJIT_ICACHE_MAX_DIMS` -> compile error.
 2. **Lever B -- frame-less wrapper + MissFn**: for icache ON, the wrapper
-   (`ejit_entry`) emits ONLY the probe (GEP + plain `ldr` + `expect` +
+   (`EJIT_ENTRY`) emits ONLY the probe (GEP + plain `ldr` + `expect` +
    `cbz`) + two tail calls (`br spec` on hit, `br MissFn` on miss). No
    allocas, no frame. The slow path (funcidx guard + `compile_or_get` +
    dispatch + AOT fallback) is extracted into a per-function `noinline
@@ -303,13 +299,7 @@ function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
 6. **Idempotency** (`isAlreadyWrapped`): recognizes a `LoadInst` OR
    `GetElementPtrInst` of `@__ejit_icache_fn_<name>` (multi-version GEP)
    in the entry block, in addition to `@__ejit_funcidx_`.
-7. **Wrapper timing** (`-ejit-wrapper-timing`): the hit path keeps its
-   sentinel (`0xFE`) report; the slow path (in MissFn or F) keeps the
-   `trace_now` + `trace_wrapper` sequence. Because trace calls are inserted
-   between the call and `ret`, the hit path can no longer be `musttail` and
-   demotes from frame-less to a framed plain call + trace + ret (the miss
-   path stays musttail). The frame-less cycle figures in §11 assume
-   `!EJitWrapperTiming`.
+7. Out-of-range identities and an unregistered entry reach the normal miss path.
 
 ## 9. Runtime changes
 
@@ -317,7 +307,7 @@ function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
    uint32_t numDims}` (per-core private). `ejitIcacheRegisterSlot(funcIndex,
    base, numDims)` and `ejitIcacheClearAll` (null base pointers).
 2. **`ejit_register_icache_slot(name, base, numDims)`**: forward `numDims`
-   (carried in the `.ejit_period` entry's `size` field; the walker in
+   (carried in the `.ejit_group` entry's `size` field; the walker in
    `EJit.cpp` reads it).
 3. **`icacheFill(funcIndex, fnPtr, dims, numDims)`**: Horner-linearize and
    **plain store** the cell (no CAS, no atomic -- per-core private, §5).
@@ -374,9 +364,7 @@ function ≤2KB. The product picks D + maxDims to fit the shared-region budget.
 - **Cold**: O(1) per miss (Horner linearize + one `str`). No scan. Miss
   tail-calls `MissFn` (1 `b` instruction).
 
-> 注：本节 frame-less / cycle 数据前提是 `!EJitWrapperTiming`（见 §8 item 7）。
-> 开启 `-ejit-wrapper-timing` 时 hit 路径退化为带帧 plain call + trace + ret，
-> cycle 不适用。
+> Historical cycle estimates, not measurements of the current bounds-checked wrapper.
 
 ### 逐维度命中路径汇编（`-Os`，入口 -> `br spec`）
 

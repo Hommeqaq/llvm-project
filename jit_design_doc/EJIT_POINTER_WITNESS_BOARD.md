@@ -67,7 +67,7 @@ Do not run constructors twice or only on core6.
 
 ## What Must Fold
 
-All entries use `cell=1` and an `ejit_free_dim` slot. The original four use a
+All entries use `cell=1` and an `EJIT_FREE_DIM` slot. The original four use a
 parameter; the fifth reads a local slot from an unbound input structure.
 Cell0 deliberately has
 different marked values. Within a cell and generation, the marked fields are
@@ -86,7 +86,7 @@ The 64-bit field is invariant in its entirety, not merely bit 17.
 The added entry uses the existing spelling on an initialized, read-only local:
 
 ```c
-const uint16_t slot ejit_free_dim = input->slot;
+const uint16_t slot EJIT_FREE_DIM = input->slot;
 ```
 
 The input is not a bound pointer, and its real value need not be constant.
@@ -124,11 +124,11 @@ Runtime evidence:
 - 20 successful compilations, five Ready/T2 entries, all five
   `post_publish_seen=yes`, no pending work or compile/publication/queue errors.
 - Ten real `root_entries=64` branch audits across the two generations.
-- In each generation, mayconst audits for the five entries report
+- In each generation, period_const audits for the five entries report
   `2/0/0`, `1/0/0`, `2/0/0`, `1/0/0`, `1/0/0`, with removed counts 2/1/2/1/1.
 
 **Functional success alone does not prove folding.** Final core6 printing
-includes the mayconst ranking and captured IR/modules. Require the final five
+includes the period_const ranking and captured IR/modules. Require the final five
 T2 definitions to have `function_entry_count=64`, PGO profile metadata, the
 constants above, and **zero remaining marked loads in those definitions**.
 Slot-dependent payload loads and visit stores must remain. Remaining `urem`

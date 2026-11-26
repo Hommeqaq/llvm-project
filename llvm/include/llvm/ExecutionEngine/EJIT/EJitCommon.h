@@ -54,25 +54,25 @@ namespace ejit {
 // Metadata kind names
 //===----------------------------------------------------------------------===//
 constexpr const char *MD_EJIT_METADATA = "ejit.metadata";
-constexpr const char *MD_EJIT_MAY_CONST = "ejit.may_const";
+constexpr const char *MD_EJIT_PERIOD_CONST = "ejit.period_const";
 
 //===----------------------------------------------------------------------===//
 // Metadata entry tags (first operand of sub-nodes in !ejit.metadata)
 //===----------------------------------------------------------------------===//
 constexpr const char *TAG_EJIT_ENTRY = "ejit_entry";
-constexpr const char *TAG_EJIT_PERIOD_LC = "ejit_period_lc";
-constexpr const char *TAG_EJIT_PERIOD_ARR_IND = "ejit_period_arr_ind";
+constexpr const char *TAG_EJIT_GUARD = "ejit_guard";
+constexpr const char *TAG_EJIT_DIM = "ejit_dim";
 constexpr const char *TAG_EJIT_BOUND_PTR = "ejit_bound_ptr";
-// Same {tag, MDString, i32 argIndex} shape as TAG_EJIT_PERIOD_ARR_IND; the
+// Same {tag, MDString, i32 argIndex} shape as TAG_EJIT_DIM; the
 // MDString is always empty (a free dim names no period). Unlike every other
 // dim tag this one is NOT a dimension on the wire: it never reaches the
 // wrapper, the cache key or the inline cache. It marks a parameter whose value
-// the may_const data behind it does not depend on, so PASS6 may evaluate an
+// the period_const data behind it does not depend on, so PASS6 may evaluate an
 // address at a fixed witness of 0 instead of failing on a non-constant index.
 constexpr const char *TAG_EJIT_FREE_DIM = "ejit_free_dim";
-constexpr const char *TAG_EJIT_PERIOD_ARR = "ejit_period_arr";
-constexpr const char *TAG_EJIT_PERIOD = "ejit_period";
-constexpr const char *TAG_EJIT_MAY_CONST_FIELD = "ejit_may_const_field";
+constexpr const char *TAG_EJIT_GROUP_INDEXED = "ejit_group_indexed";
+constexpr const char *TAG_EJIT_GROUP = "ejit_group";
+constexpr const char *TAG_EJIT_PERIOD_CONST_FIELD = "ejit_period_const_field";
 
 // PASS1 records the process-unique AOT wrapper symbol for local ejit_entry
 // functions on the embedded-bitcode clone. The JIT uses it only when that
@@ -89,7 +89,7 @@ constexpr const char *GV_EJIT_BITCODE = "__ejit_bitcode";
 // ejit_registry.ld): a typo on either side yields an empty registry with no
 // diagnostic. Keep these constants as the single source for the AOT side.
 constexpr const char *SECT_EJIT_BITCODE = ".ejit_bitcode";
-constexpr const char *SECT_EJIT_PERIOD = ".ejit_period";
+constexpr const char *SECT_EJIT_GROUP = ".ejit_group";
 constexpr const char *FN_AUTO_REGISTER = "ejit_auto_register";
 constexpr const char *CTORS_GLOBAL = "llvm.global_ctors";
 
@@ -121,36 +121,9 @@ constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_BOUND =
     "ejit_taskpool_compile_or_get_bound";
 constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_BOUND_V =
     "ejit_taskpool_compile_or_get_bound_v";
-// Fixed-dimension fast-path C ABI entries (0-4 dims), emitted by the wrapper
-// when -ejit-wrapper-fixed-dim-entry is enabled and the entry has <= 4 dims.
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_0D =
-    "ejit_taskpool_compile_or_get_0d";
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_1D =
-    "ejit_taskpool_compile_or_get_1d";
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_2D =
-    "ejit_taskpool_compile_or_get_2d";
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_3D =
-    "ejit_taskpool_compile_or_get_3d";
-constexpr const char *FN_TASKPOOL_COMPILE_OR_GET_4D =
-    "ejit_taskpool_compile_or_get_4d";
 constexpr const char *FN_TASKPOOL_RELEASE_READ = "ejit_taskpool_release_read";
-constexpr const char *FN_TASKPOOL_TRACE_NOW = "ejit_taskpool_trace_now";
-constexpr const char *FN_TASKPOOL_TRACE_WRAPPER =
-    "ejit_taskpool_trace_wrapper";
-constexpr const char *FN_FUNCTION_BODY_CYCLES_RECORD =
-    "ejit_function_body_cycles_record";
-constexpr uint32_t kEJitFunctionBodyPathAOT = 0u;
-constexpr uint32_t kEJitFunctionBodyPathJIT = 1u;
-// Wrapper-timing sentinel status passed to ejit_taskpool_trace_wrapper for
-// icache-hit samples so they aggregate as their own report line (get_fn_avg =
-// probe cost, release_avg = 0), separate from the slow-path compile_or_get
-// samples. The value is RESERVED in the ejit_status_t enum itself
-// (EJIT_STATUS_ICACHE_HIT_SENTINEL = 0xFE in EJitRuntime.h): a future real
-// status assigned 0xFE is a duplicate-enumerator compile error, and a
-// static_assert in EJitRuntime.cpp locks this constant to that enumerator.
-constexpr uint32_t kEJitIcacheHitTimingStatus = 0xFEu;
 // Lifecycle activation is keyed by period/lifecycle name + instance index only.
-// PASS4 emits these name-level calls at ejit_period_lc entry/exit; there is no
+// PASS4 emits these name-level calls at ejit_guard entry/exit; there is no
 // array-pointer dimension in the active-state hot path.
 constexpr const char *FN_DEACTIVATE = "ejit_deactivate";
 constexpr const char *FN_ACTIVATE = "ejit_activate";
@@ -221,7 +194,7 @@ inline uint32_t getMDIntValue(const MDNode *Node, StringRef Tag) {
 }
 
 /// Byte offset of a field access *within its period-array element*, which is
-/// the coordinate the `ejit_may_const_field` entries on a period-array global
+/// the coordinate the `ejit_period_const_field` entries on a period-array global
 /// are expressed in (they are relative to the element struct, NOT to the array
 /// base). Writes the root global to \p RootGV.
 ///
@@ -246,7 +219,7 @@ inline uint32_t getMDIntValue(const MDNode *Node, StringRef Tag) {
 ///
 /// Returns nullopt when the access cannot be attributed to a fixed field.
 inline std::optional<uint64_t>
-ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
+ejitPeriodConstFieldOffset(const Value *Ptr, const DataLayout &DL,
                         const GlobalVariable *&RootGV) {
   RootGV = nullptr;
 
@@ -335,15 +308,15 @@ ejitMayConstFieldOffset(const Value *Ptr, const DataLayout &DL,
 /// Size in bytes of the field beginning at \p Off inside \p Ty, or nullopt
 /// when \p Off is not the start of a field.
 ///
-/// The `ejit_may_const_field` metadata records offsets and nothing else, so it
+/// The `ejit_period_const_field` metadata records offsets and nothing else, so it
 /// cannot bound how many bytes an access may read; the aggregate layout
 /// supplies that bound. A nested aggregate shares its offset with its own first
 /// field, so the descent continues to the innermost field starting at \p Off.
 /// That is the conservative choice, and it is what rejects a widened load (say
-/// an i64 formed from a memcpy over a may_const i32 and the mutable i32 beside
+/// an i64 formed from a memcpy over a period_const i32 and the mutable i32 beside
 /// it).
 inline std::optional<uint64_t>
-ejitMayConstFieldSizeInType(Type *Ty, uint64_t Off, const DataLayout &DL) {
+ejitPeriodConstFieldSizeInType(Type *Ty, uint64_t Off, const DataLayout &DL) {
   if (!Ty || !Ty->isSized())
     return std::nullopt;
   // Descend into whichever element contains Off, rebasing Off as we go. Only at
@@ -383,23 +356,23 @@ ejitMayConstFieldSizeInType(Type *Ty, uint64_t Off, const DataLayout &DL) {
 }
 
 inline std::optional<uint64_t>
-ejitMayConstFieldSize(const GlobalVariable *RootGV, uint64_t Off,
+ejitPeriodConstFieldSize(const GlobalVariable *RootGV, uint64_t Off,
                       const DataLayout &DL) {
   if (!RootGV)
     return std::nullopt;
   Type *Ty = RootGV->getValueType();
   if (const auto *ATy = dyn_cast<ArrayType>(Ty))
     Ty = ATy->getElementType();
-  return ejitMayConstFieldSizeInType(Ty, Off, DL);
+  return ejitPeriodConstFieldSizeInType(Ty, Off, DL);
 }
 
-/// True when [\p Off, \p Off + \p AccessSize) lies entirely within the may_const
+/// True when [\p Off, \p Off + \p AccessSize) lies entirely within the period_const
 /// field that begins at \p Off. Guards the offset-matching paths, which would
 /// otherwise let a widened load freeze the bytes of an adjacent mutable field.
-inline bool ejitAccessFitsMayConstField(const GlobalVariable *RootGV,
+inline bool ejitAccessFitsPeriodConstField(const GlobalVariable *RootGV,
                                         uint64_t Off, uint64_t AccessSize,
                                         const DataLayout &DL) {
-  std::optional<uint64_t> FieldSize = ejitMayConstFieldSize(RootGV, Off, DL);
+  std::optional<uint64_t> FieldSize = ejitPeriodConstFieldSize(RootGV, Off, DL);
   return FieldSize && AccessSize != 0 && AccessSize <= *FieldSize;
 }
 

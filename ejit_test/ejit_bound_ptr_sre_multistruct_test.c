@@ -29,14 +29,11 @@ typedef _Bool bool;
 #define UINTPTR_MAX (~(uintptr_t)0)
 
 #define EJIT_PERIOD_CONST __attribute__((ejit_period_const))
-#define EJIT_IN_PERIOD_ARRAY(x) __attribute__((ejit_in_period_array(#x)))
+#define EJIT_GROUP(x) __attribute__((ejit_group(#x)))
 #define EJIT_DIM(x) __attribute__((ejit_dim(#x)))
 #define EJIT_BOUND_PTR(x) __attribute__((ejit_bound_ptr(#x)))
-#define ejit_entry __attribute__((ejit_entry))
-#define EJIT_ENTRY ejit_entry
+#define EJIT_ENTRY __attribute__((ejit_entry))
 
-#define ejit_may_const EJIT_PERIOD_CONST
-#define ejit_period_arr(x) EJIT_IN_PERIOD_ARRAY(x)
 
 typedef enum {
   EJIT_OK = 0,
@@ -44,7 +41,7 @@ typedef enum {
 } ejit_status_t;
 
 typedef enum {
-  EJIT_COMPILE_SYNC = 0,
+  EJIT_COMPILE_OFF = 2,
   EJIT_COMPILE_ASYNC = 1,
 } ejit_compile_mode_t;
 
@@ -57,14 +54,17 @@ typedef enum {
 typedef struct {
   ejit_compile_mode_t compileMode;
   ejit_opt_level_t optLevel;
-  size_t maxCodeMemory;
-  size_t maxDataMemory;
-  size_t maxCacheEntries;
-  size_t maxCacheSize;
-  bool enableLogger;
   bool forceStaticRegistry;
   const char *dumpJITDir;
 } ejit_config_t;
+
+// Keep this standalone board declaration in step with EJitRuntime.h.
+_Static_assert(sizeof(ejit_config_t) == 24 &&
+               __builtin_offsetof(ejit_config_t, compileMode) == 0 &&
+               __builtin_offsetof(ejit_config_t, optLevel) == 4 &&
+               __builtin_offsetof(ejit_config_t, forceStaticRegistry) == 8 &&
+               __builtin_offsetof(ejit_config_t, dumpJITDir) == 16,
+               "EJIT config ABI mismatch");
 
 typedef struct {
   uint32_t dimType;
@@ -133,15 +133,15 @@ extern uint8_t g_ucLocalCoreID;
 // These are deliberately larger than 1 KiB. They model shared application
 // state while keeping the request transport fixed at one descriptor each.
 typedef struct {
-  ejit_may_const uint32_t algorithm;
-  ejit_may_const uint32_t scale;
+  EJIT_PERIOD_CONST uint32_t algorithm;
+  EJIT_PERIOD_CONST uint32_t scale;
   uint32_t runtimeBias;
   uint32_t payload[EJIT_BOUND_MULTI_PAYLOAD_WORDS];
 } EJitBoundMultiCellConfig;
 
 typedef struct {
-  ejit_may_const uint32_t multiplier;
-  ejit_may_const uint32_t offset;
+  EJIT_PERIOD_CONST uint32_t multiplier;
+  EJIT_PERIOD_CONST uint32_t offset;
   uint32_t runtimeTag;
   uint32_t payload[EJIT_BOUND_MULTI_PAYLOAD_WORDS];
 } EJitBoundMultiTrpConfig;
@@ -161,9 +161,9 @@ enum BoundMultiStage {
   BOUND_MULTI_PRINTED = 3,
 };
 
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(cell)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(cell)
 uint32_t g_bound_multi_cells[8];
-EJIT_SHARED_SECTION_ATTR ejit_period_arr(trp)
+EJIT_SHARED_SECTION_ATTR EJIT_GROUP(trp)
 uint32_t g_bound_multi_trps[8];
 EJIT_SHARED_SECTION_ATTR EJitBoundMultiCellConfig
     g_bound_multi_cell_configs[8] = {
@@ -179,7 +179,7 @@ EJIT_SHARED_SECTION_ATTR volatile uint64_t g_bound_multi_sink;
 
 // The helper owns an independent cell/trp identity and repeats both borrowed
 // pointer contracts so its wrapper can carry descriptors on direct calls.
-ejit_entry uint32_t bound_multi_helper(
+EJIT_ENTRY uint32_t bound_multi_helper(
     EJIT_DIM(cell) uint8_t cellIndex, EJIT_DIM(trp) uint8_t trpIndex,
     EJIT_BOUND_PTR(cell) const EJitBoundMultiCellConfig *cellConfig,
     EJIT_BOUND_PTR(trp) const EJitBoundMultiTrpConfig *trpConfig,
@@ -191,7 +191,7 @@ ejit_entry uint32_t bound_multi_helper(
          trpConfig->offset + trpConfig->runtimeTag + cellIndex + trpIndex;
 }
 
-ejit_entry uint32_t bound_multi_root0(
+EJIT_ENTRY uint32_t bound_multi_root0(
     EJIT_DIM(cell) uint8_t cellIndex, EJIT_DIM(trp) uint8_t trpIndex,
     EJIT_BOUND_PTR(cell) const EJitBoundMultiCellConfig *cellConfig,
     EJIT_BOUND_PTR(trp) const EJitBoundMultiTrpConfig *trpConfig,
@@ -200,7 +200,7 @@ ejit_entry uint32_t bound_multi_root0(
 }
 
 #define DEFINE_BOUND_MULTI_ROOT(N)                                             \
-  ejit_entry uint32_t bound_multi_root##N(                                     \
+  EJIT_ENTRY uint32_t bound_multi_root##N(                                     \
       EJIT_DIM(cell) uint8_t cellIndex, EJIT_DIM(trp) uint8_t trpIndex,        \
       EJIT_BOUND_PTR(cell) const EJitBoundMultiCellConfig *cellConfig,         \
       EJIT_BOUND_PTR(trp) const EJitBoundMultiTrpConfig *trpConfig,            \
@@ -639,7 +639,6 @@ int test_ejit_period(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
   ejit_config_t cfg = {0};
   cfg.compileMode = EJIT_COMPILE_ASYNC;
   cfg.optLevel = EJIT_OPT_L2;
-  cfg.enableLogger = true;
   cfg.forceStaticRegistry = true;
 
   ejit_status_t rc = ejit_init_pgo(&cfg);

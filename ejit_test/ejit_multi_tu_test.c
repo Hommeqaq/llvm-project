@@ -3,17 +3,17 @@
  *
  * 目的: 复现并验证最初报的链接错误已修复:
  *   "ld.lld: error: duplicate symbol __ejit_registry_bitcode / __ejit_registry_period"
- * 当多个 .c 文件各自包含 ejit_entry 函数 + period 全局变量时,旧的 AOT pass 会在每个
+ * 当多个 .c 文件各自包含 EJIT_ENTRY 函数 + period 全局变量时,旧的 AOT pass 会在每个
  * TU 里用固定外部名发射强符号 __ejit_registry_{bitcode,period},多 TU 链接即冲突。
  *
  * 本测试由两个 TU 组成:
- *   - ejit_multi_tu_test.c   (本文件): ejit_entry jit_a + period 数组 g_aCfg("acell")
- *   - ejit_multi_tu_test_b.c (第二 TU): ejit_entry jit_b + period 数组 g_bCfg("bcell")
+ *   - ejit_multi_tu_test.c   (本文件): EJIT_ENTRY jit_a + period 数组 g_aCfg("acell")
+ *   - ejit_multi_tu_test_b.c (第二 TU): EJIT_ENTRY jit_b + period 数组 g_bCfg("bcell")
  * 两者一起编译链接。
  *
  * 验证点:
  *   1. 能成功链接 (修复前这一步就会 duplicate symbol 失败)
- *   2. 两个 TU 的 ejit_entry 都被 JIT 编译 (entries >= 2),证明两个 TU 各自的
+ *   2. 两个 TU 的 EJIT_ENTRY 都被 JIT 编译 (entries >= 2),证明两个 TU 各自的
  *      bitcode/period 注册表在链接后都被运行时正确解析 (跨 TU 合并)
  *   3. 两个函数的特化结果正确
  *
@@ -30,15 +30,15 @@
 //===-- TU-A 的 EJIT 数据与入口 --------------------------------------------===//
 
 struct ACfg {
-  ejit_may_const uint32_t kind;
+  EJIT_PERIOD_CONST uint32_t kind;
   uint32_t x;
 };
 
 #define N_A 8
-ejit_period_arr(acell) struct ACfg g_aCfg[N_A];
+EJIT_GROUP(acell) struct ACfg g_aCfg[N_A];
 
-ejit_entry
-uint32_t jit_a(ejit_period_arr_ind(acell) uint8_t i)
+EJIT_ENTRY
+uint32_t jit_a(EJIT_DIM(acell) uint8_t i)
 {
   // JIT 应把 g_aCfg[i].kind 替换为常量并折叠此分支
   if (g_aCfg[i].kind == 0xAA)
@@ -48,7 +48,7 @@ uint32_t jit_a(ejit_period_arr_ind(acell) uint8_t i)
 
 //===-- 第二 TU 的接口 -----------------------------------------------------===//
 
-extern uint32_t jit_b(uint8_t i);       // ejit_entry in the other TU
+extern uint32_t jit_b(uint8_t i);       // EJIT_ENTRY in the other TU
 extern void b_init(uint8_t idx, uint32_t kind);  // sets g_bCfg[idx].kind
 
 //===-- 运行时 API ---------------------------------------------------------===//
@@ -94,7 +94,7 @@ int main(int argc, char **argv)
   ejit_activate("bcell", ib);
 
   //=== Both entry functions execute and specialize correctly ===
-  printf("\n--- 两个 TU 的 ejit_entry 都应被 JIT 编译 ---\n");
+  printf("\n--- 两个 TU 的 EJIT_ENTRY 都应被 JIT 编译 ---\n");
 
   uint32_t ra1 = jit_a(ia);
   VERIFY(ra1 == 100, "jit_a(%u) = %u (expected 100, kind=0xAA)", ia, ra1);
@@ -104,7 +104,6 @@ int main(int argc, char **argv)
 
   // The key multi-TU assertion: BOTH TUs' bitcode got registered and JIT'd.
   ejit_drain_taskpool();
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp1; memset(&tp1, 0, sizeof(tp1));
   ejit_taskpool_get_stats(&tp1);
   printf("  stats: ready=%u hits=%llu compiles=%llu\n",
@@ -115,16 +114,6 @@ int main(int argc, char **argv)
   VERIFY(tp1.asyncCompiles >= 2,
          "JIT compiles >= 2 (both first calls, actual %llu)",
          (unsigned long long)tp1.asyncCompiles);
-#else
-  ejit_stats_t s1;
-  ejit_get_stats(&s1);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
-         s1.entryCount, (unsigned long long)s1.hits, (unsigned long long)s1.misses);
-  VERIFY(s1.entryCount >= 2, "JIT entries >= 2 (both TUs compiled, actual %zu)",
-         s1.entryCount);
-  VERIFY(s1.misses >= 2, "JIT misses >= 2 (both first calls, actual %llu)",
-         (unsigned long long)s1.misses);
-#endif
 
   //=== Second calls hit the cache (specialized code was stored) ===
   printf("\n--- 二次调用应命中缓存 ---\n");
@@ -134,7 +123,6 @@ int main(int argc, char **argv)
   VERIFY(ra2 == 100, "jit_a(%u) 2nd = %u", ia, ra2);
   VERIFY(rb2 == 200, "jit_b(%u) 2nd = %u", ib, rb2);
 
-#ifdef EJIT_SRE_SHARED_TASKPOOL
   ejit_taskpool_stats_t tp2; memset(&tp2, 0, sizeof(tp2));
   ejit_taskpool_get_stats(&tp2);
   printf("  stats: ready=%u hits=%llu compiles=%llu\n",
@@ -142,14 +130,6 @@ int main(int argc, char **argv)
          (unsigned long long)tp2.asyncCompiles);
   VERIFY(tp2.cacheHits >= 2, "Cache hits >= 2 (both 2nd calls, actual %llu)",
          (unsigned long long)tp2.cacheHits);
-#else
-  ejit_stats_t s2;
-  ejit_get_stats(&s2);
-  printf("  stats: entries=%zu hits=%llu misses=%llu\n",
-         s2.entryCount, (unsigned long long)s2.hits, (unsigned long long)s2.misses);
-  VERIFY(s2.hits >= 2, "Cache hits >= 2 (both 2nd calls, actual %llu)",
-         (unsigned long long)s2.hits);
-#endif
 
   ejit_shutdown();
 
