@@ -20,11 +20,11 @@ in Async mode: records are collected by the shared worker's own compiles.
 
 ## Pacing and budgets
 
-- `EJIT_WORKER_VERIFY_IDLE_TICKS` (default 120000): one probe slice every Nth
+- `EJIT_WORKER_VERIFY_IDLE_TICKS` (default 5000): one probe slice every Nth
   worker idle round. Each idle round already costs one platform tick
   (`SRE_TaskDelay` via the injected idle hook), so the two-check interval is
   N platform ticks plus poll overhead — with the product clock (1 tick ~ 1 ms)
-  the default is one scan every ~2 minutes. A dump request bypasses the
+  the default is one scan every ~5 seconds. A dump request bypasses the
   throttle on the next idle round, and compile/publish work always takes
   priority.
 - `EJIT_WORKER_VERIFY_STEP_BUDGET` (default 32): max probe/retirement steps

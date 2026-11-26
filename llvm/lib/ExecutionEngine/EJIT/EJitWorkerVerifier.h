@@ -22,9 +22,9 @@ namespace llvm::ejit {
 // host unit tests, which drive idle() directly and rely on deterministic
 // budgets — independent of any board configuration.
 // Product clock calibration: 1 platform tick ~ 1 ms, so the default
-// IDLE_TICKS is one probe slice every ~2 minutes.
+// IDLE_TICKS is one probe slice every ~5 seconds.
 #ifndef EJIT_WORKER_VERIFY_IDLE_TICKS
-#define EJIT_WORKER_VERIFY_IDLE_TICKS 120000
+#define EJIT_WORKER_VERIFY_IDLE_TICKS 5000
 #endif
 #ifndef EJIT_WORKER_VERIFY_STEP_BUDGET
 #define EJIT_WORKER_VERIFY_STEP_BUDGET 32
