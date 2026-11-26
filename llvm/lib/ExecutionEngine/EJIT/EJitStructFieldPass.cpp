@@ -2374,13 +2374,16 @@ static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
 
 #ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
 namespace {
-constexpr unsigned MaxVerifyResidues = 16;
+// Widest remainder domain a watch may enumerate; the per-residue sticky
+// record arrays in EJitWorkerVerifyWatch are sized to this.
+constexpr unsigned MaxVerifyResidues = EJitWorkerVerifyWatch::MaxResidues;
 
 // A single free dim may appear repeatedly, but only behind the same urem.
 // Do not extrapolate the zero witness into a runtime-dependent raw index.
 struct VerifyDomain {
   const Value *slot = nullptr;
   unsigned modulus = 1;
+  uint8_t arg = 0xFF; // driving free-dim parameter index; 0xFF = constant
   SmallPtrSet<const Value *, 32> visited;
 
   bool collect(const Value *V, const EJitFreeDimAssumptions &Assumed,
@@ -2406,6 +2409,14 @@ struct VerifyDomain {
         return false;
       slot = Op->getOperand(0);
       modulus = M;
+      // Report which function parameter drives the index: the free-dim value
+      // is either the argument itself or a local marker wrapping it.
+      auto *A = dyn_cast<Argument>(slot);
+      if (!A)
+        if (auto *Call = dyn_cast<CallInst>(slot))
+          if (Call->arg_size() == 1)
+            A = dyn_cast<Argument>(Call->getArgOperand(0));
+      arg = A ? static_cast<uint8_t>(A->getArgNo()) : 0xFF;
       return true;
     }
     for (const Use &U : Op->operands())
@@ -2428,20 +2439,16 @@ std::optional<uint64_t> verifyBits(Constant *C) {
 }
 
 void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
-                         Constant *Frozen, unsigned Ordinal,
-                         FoldSource Source, bool Absolute,
+                         Constant *Frozen, FoldSource Source, bool Absolute,
                          const GVPeriodMap &Periods, PeriodArrayRegistry &Reg,
                          const DataLayout &DL,
                          const EJitFreeDimAssumptions &Assumed) {
   auto It = Periods.find(Source.global);
-  if (It != Periods.end() && It->second.periodName != Capture.period)
-    return;
 
   auto Uncovered = [&](const char *Reason) {
     ++Capture.uncovered;
-    EJIT_DIAG_VERBOSE("[WORKER-VERIFY] uncovered fn=%s load=%u reason=%s",
-                      LI.getFunction()->getName().str().c_str(), Ordinal,
-                      Reason);
+    EJIT_DIAG_VERBOSE("[WORKER-VERIFY] uncovered fn=%s reason=%s",
+                      LI.getFunction()->getName().str().c_str(), Reason);
   };
   if (It == Periods.end())
     return Uncovered("no-shared-period-source");
@@ -2466,7 +2473,7 @@ void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
   EJitWorkerVerifyWatch Watch;
   Watch.function = LI.getFunction()->getName().take_front(128).str();
   Watch.object = GV->getName().take_front(128).str();
-  Watch.loadOrdinal = Ordinal;
+  Watch.period = It->second.periodName;
   Watch.width = Width;
   Watch.littleEndian = DL.isLittleEndian();
   Watch.expected = *Expected;
@@ -2478,6 +2485,8 @@ void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
     if (!Absolute && LI.getPointerOperand()->stripPointerCasts() == GV &&
         Size == sizeof(uintptr_t)) {
       Watch.rootValue = true;
+      // The compared member is the pointer slot itself.
+      Watch.objectBase = Slot;
       Watch.addresses.push_back(Slot);
       Capture.watches.push_back(std::move(Watch));
       return;
@@ -2504,6 +2513,11 @@ void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
   const auto *Ptr = LI.getPointerOperand();
   if (!Domain.collect(Ptr, Assumed))
     return Uncovered("unsupported-index-domain");
+  Watch.freeArg = Domain.arg;
+  // The report row's offset is relative to this base: the registered
+  // object/array base for value folds, the pointee base for fields behind a
+  // shared pointer (changed-root rows re-pin to the slot at print time).
+  Watch.objectBase = Base;
   auto Trial = Assumed;
   for (unsigned R = 0; R < Domain.modulus; ++R) {
     if (Domain.slot)
@@ -2554,14 +2568,11 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<LoadInst *, 16> PendingFields;
   SmallVector<Replacement, 16> replacements;
 #ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  unsigned Ordinal = 0;
-  DenseMap<const LoadInst *, unsigned> Ordinals;
   auto Capture = [&](LoadInst &LI, Constant *C, FoldSource Source,
                      bool Absolute) {
     if (workerVerify_)
-      captureWorkerVerify(*workerVerify_, LI, C, Ordinals.lookup(&LI), Source,
-                          Absolute, gvPeriodMap_, registry_, DL,
-                          freeDimAssumptions_);
+      captureWorkerVerify(*workerVerify_, LI, C, Source, Absolute,
+                          gvPeriodMap_, registry_, DL, freeDimAssumptions_);
   };
 #endif
 #ifdef EJIT_DIAG_ENABLE
@@ -2580,10 +2591,6 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       auto *LI = dyn_cast<LoadInst>(&I);
       if (!LI)
         continue;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-      if (workerVerify_)
-        Ordinals.try_emplace(LI, ++Ordinal);
-#endif
 #ifdef EJIT_DIAG_ENABLE
       ++totalLoads;
 #endif

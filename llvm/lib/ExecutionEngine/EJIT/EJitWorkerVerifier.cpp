@@ -122,17 +122,99 @@ void EJitWorkerVerifier::advance() {
     cursor_ = 0;
 }
 
-void EJitWorkerVerifier::dump() const {
+void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
+                                           void *YieldCtx) const {
+  // Dump-only console output. Every location that has EVER mismatched is
+  // reported (sticky: recovery does not unregister it), with its saturating
+  // count/samples pair as a rate and the value seen at the FIRST mismatch
+  // (`first`); nothing is re-read at print time. `object=<symbol>@<base>
+  // offset=<bytes>` pins the member inside its shared object (for a changed
+  // pointer root the compared member is the slot itself: base=slot,
+  // offset=0). `src` names the driving free-dim argument of the remainder
+  // domain (or `const` when the index is fully constant); the domain size is
+  // the residue denominator. After every row the worker pauses
+  // DumpRowDelayTicks so the report trickles out and never stresses the
+  // console or the heartbeat.
+  for (const auto &V : live_)
+    for (const auto &W : V.capture.watches)
+      for (const auto &Rec : W.first) {
+        const unsigned R = Rec.residue;
+        const unsigned Rate =
+            W.samples[R] ? (W.count[R] * 1000u) / W.samples[R] : 0;
+        const auto &Q = V.request;
+        const unsigned long long Base =
+            Rec.changedRoot ? W.rootSlot : W.objectBase;
+        const unsigned long long Offset =
+            Rec.changedRoot ? 0 : W.addresses[R] - W.objectBase;
+        const char *Kind =
+            (Rec.changedRoot || W.rootValue) ? "pointer-root" : "value";
+        if (W.freeArg != 0xFF)
+          EJIT_DIAG_RAW(
+              "[WORKER-VERIFY] MISMATCH tier=%u gen=%u "
+              "dims=%u:%u@%u,%u:%u@%u,%u:%u@%u,%u:%u@%u "
+              "period=%s fn=%s object=%s@0x%llx offset=0x%llx src=arg%u "
+              "residue=%u/%zu kind=%s expected=0x%llx first=0x%llx "
+              "count=%u/%u rate=%u.%u%%",
+              decodeReqTier(Q.funcIndex), Q.generation,
+              Q.dims[0].dimType, Q.dims[0].instanceId, Q.versions[0],
+              Q.dims[1].dimType, Q.dims[1].instanceId, Q.versions[1],
+              Q.dims[2].dimType, Q.dims[2].instanceId, Q.versions[2],
+              Q.dims[3].dimType, Q.dims[3].instanceId, Q.versions[3],
+              W.period.c_str(), W.function.c_str(), W.object.c_str(), Base,
+              Offset, W.freeArg, R, W.addresses.size(), Kind,
+              (unsigned long long)(Rec.changedRoot ? W.expectedRoot
+                                                   : W.expected),
+              (unsigned long long)Rec.value,
+              W.count[R], W.samples[R], Rate / 10u, Rate % 10u);
+        else
+          EJIT_DIAG_RAW(
+              "[WORKER-VERIFY] MISMATCH tier=%u gen=%u "
+              "dims=%u:%u@%u,%u:%u@%u,%u:%u@%u,%u:%u@%u "
+              "period=%s fn=%s object=%s@0x%llx offset=0x%llx src=const "
+              "residue=%u/%zu kind=%s expected=0x%llx first=0x%llx "
+              "count=%u/%u rate=%u.%u%%",
+              decodeReqTier(Q.funcIndex), Q.generation,
+              Q.dims[0].dimType, Q.dims[0].instanceId, Q.versions[0],
+              Q.dims[1].dimType, Q.dims[1].instanceId, Q.versions[1],
+              Q.dims[2].dimType, Q.dims[2].instanceId, Q.versions[2],
+              Q.dims[3].dimType, Q.dims[3].instanceId, Q.versions[3],
+              W.period.c_str(), W.function.c_str(), W.object.c_str(), Base,
+              Offset, R, W.addresses.size(), Kind,
+              (unsigned long long)(Rec.changedRoot ? W.expectedRoot
+                                                   : W.expected),
+              (unsigned long long)Rec.value,
+              W.count[R], W.samples[R], Rate / 10u, Rate % 10u);
+        if (Yield)
+          Yield(YieldCtx, DumpRowDelayTicks);
+      }
+}
+
+void EJitWorkerVerifier::dump(VerifyYieldFn Yield, void *YieldCtx) const {
+  unsigned Recorded = 0;
+  for (const auto &V : live_)
+    for (const auto &W : V.capture.watches)
+      Recorded += W.first.size();
+  const bool Full = retainedWatches_ >= MaxWatches;
+  // Blocked-root samples count into mismatch_samples_ but not into checks_,
+  // so the global ratio is clamped to 100%.
+  unsigned GlobalRate =
+      checks_ ? (unsigned)((mismatchSamples_ * 1000) / checks_) : 0;
+  if (GlobalRate > 1000)
+    GlobalRate = 1000;
   EJIT_DIAG_RAW(
-      "[WORKER-VERIFY] versions=%zu staged=%zu checked_active=%llu/%llu "
-      "checks=%llu mismatch_samples=%llu uncovered=%llu dropped=%llu "
-      "blocked_root=%llu retired=%llu suppressed=%llu",
-      live_.size(), pending_.size(),
-      (unsigned long long)checkedActiveProbes_, (unsigned long long)activeProbes_,
-      (unsigned long long)checks_, (unsigned long long)mismatchSamples_,
-      (unsigned long long)uncovered_, (unsigned long long)dropped_,
-      (unsigned long long)blockedRoot_,
-      (unsigned long long)retired_, (unsigned long long)suppressed_);
+      "[WORKER-VERIFY] versions=%zu staged=%zu watches=%u/%u%s "
+      "checked_active=%llu/%llu checks=%llu mismatch_samples=%llu "
+      "rate=%u.%u%% recorded=%u uncovered=%llu dropped=%llu "
+      "blocked_root=%llu retired=%llu",
+      live_.size(), pending_.size(), retainedWatches_, MaxWatches,
+      Full ? " FULL" : "",
+      (unsigned long long)checkedActiveProbes_,
+      (unsigned long long)activeProbes_, (unsigned long long)checks_,
+      (unsigned long long)mismatchSamples_, GlobalRate / 10u, GlobalRate % 10u,
+      Recorded, (unsigned long long)uncovered_, (unsigned long long)dropped_,
+      (unsigned long long)blockedRoot_, (unsigned long long)retired_);
+  if (Yield)
+    Yield(YieldCtx, DumpRowDelayTicks);
 }
 
 void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested,
@@ -140,16 +222,13 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested
   if (++idleTicks_ < IdleTicks && !DumpRequested)
     return;
   idleTicks_ = 0;
-  // Report at most four new discrepancies per slice. The other transitions
-  // are counted and can be surfaced on request without flooding the console.
-  unsigned Printed = 0;
   for (unsigned N = 0; N < StepBudget && !live_.empty(); ++N) {
     // Interleave a platform tick inside one slice so a print-heavy dump or a
     // large configured step budget cannot starve the worker's heartbeat
     // (bare-metal watchdog) between the loop's own per-round yields.
     if (Yield && EJIT_WORKER_VERIFY_YIELD_EVERY &&
         N % EJIT_WORKER_VERIFY_YIELD_EVERY == 0 && N != 0)
-      Yield(YieldCtx);
+      Yield(YieldCtx, 1);
     auto &V = live_[cursor_];
     auto IsLive = Pool.workerVerifyLive(V.request, V.function);
     if (!IsLive || !*IsLive) {
@@ -192,36 +271,19 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested
     }
     if (!ChangedRoot)
       ++checks_;
+    // Sticky per-residue record: every probe attempt counts as a sample,
+    // every mismatch into the location's count; both saturate at 0xFFFF and
+    // freeze so the printed ratio stays meaningful. The FIRST mismatching
+    // value (and whether it was a changed pointer root) is frozen into the
+    // sparse record; nothing prints here — rows surface only on a dump.
+    if (W.samples[R] != 0xFFFF)
+      ++W.samples[R];
     if (Actual != Expected) {
       ++mismatchSamples_;
-      if (!(W.mismatched & Bit)) {
-        if (gEJitDiagLevel >= EJIT_LOG_LVL_INFO &&
-            (Printed < 4 || DumpRequested)) {
-          ++Printed;
-          const auto &Q = V.request;
-          EJIT_DIAG_RAW(
-              "[WORKER-VERIFY] MISMATCH entry=%u tier=%u gen=%u "
-              "dims=%u:%u@%u,%u:%u@%u,%u:%u@%u,%u:%u@%u "
-              "period=%.*s fn=%s load=%u object=%s residue=%u/%zu "
-              "kind=%s addr=0x%llx expected=0x%llx actual=0x%llx",
-              stripReqTier(Q.funcIndex), decodeReqTier(Q.funcIndex), Q.generation,
-              Q.dims[0].dimType, Q.dims[0].instanceId, Q.versions[0],
-              Q.dims[1].dimType, Q.dims[1].instanceId, Q.versions[1],
-              Q.dims[2].dimType, Q.dims[2].instanceId, Q.versions[2],
-              Q.dims[3].dimType, Q.dims[3].instanceId, Q.versions[3],
-              (int)V.capture.period.size(), V.capture.period.data(),
-              W.function.c_str(), W.loadOrdinal, W.object.c_str(), R,
-              W.addresses.size(),
-              (ChangedRoot || W.rootValue) ? "pointer-root" : "value",
-              (unsigned long long)(ChangedRoot ? W.rootSlot : W.addresses[R]),
-              (unsigned long long)Expected, (unsigned long long)Actual);
-          W.mismatched |= Bit;
-        } else {
-          ++suppressed_;
-        }
-      }
-    } else {
-      W.mismatched &= ~Bit;
+      if (W.count[R] == 0)
+        W.first.push_back({uint8_t(R), ChangedRoot, Actual});
+      if (W.count[R] != 0xFFFF)
+        ++W.count[R];
     }
     if (++V.residue == W.addresses.size()) {
       V.residue = 0;
@@ -230,6 +292,8 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested
     }
     advance();
   }
-  if (DumpRequested)
-    dump();
+  if (DumpRequested) {
+    printRecordedRows(Yield, YieldCtx);
+    dump(Yield, YieldCtx);
+  }
 }

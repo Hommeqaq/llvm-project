@@ -212,8 +212,9 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
           Driver->workerVerifier_->idle(
               Driver->sharedPool_, Dump,
               // Same platform primitive as the worker loop's per-round yield,
-              // so a verifier slice feeds the watchdog exactly like the loop.
-              [](void *) { EJitSreTask::delay(1); });
+              // so a verifier slice feeds the watchdog exactly like the loop;
+              // dump rows pace themselves with DumpRowDelayTicks.
+              [](void *, uint32_t Ticks) { EJitSreTask::delay(Ticks); });
       },
       this);
 #endif
@@ -473,14 +474,13 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
 #ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+  // All-period capture: every worker compile whose request collects verifier
+  // data records every coverable fold of every registered period; each watch
+  // carries its own source period for the dump rows.
   EJitWorkerVerifyCapture VerifyCapture;
-  VerifyCapture.period = EJIT_WORKER_VERIFY_PERIOD;
-  if (CollectVerify && request && workerVerifier_)
-    for (const auto &Dim : ctx.dimensions)
-      if (Dim.periodName == VerifyCapture.period) {
-        ctx.workerVerify = &VerifyCapture;
-        break;
-      }
+  if (CollectVerify && request && workerVerifier_) {
+    ctx.workerVerify = &VerifyCapture;
+  }
 #endif
   if (request && request->boundCount) {
     for (uint32_t I = 0; I < request->boundCount; ++I) {

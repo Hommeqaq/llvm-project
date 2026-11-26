@@ -86,7 +86,6 @@ TEST(EJitWorkerVerifier, CapturesEveryResidueWithoutChangingIR) {
       EJitOptimizer Reference(Registry);
       Reference.runPipeline(*Without, Ctx);
       EJitWorkerVerifyCapture Capture;
-      Capture.period = "cell";
       Ctx.workerVerify = &Capture;
       EJitOptimizer Observed(Registry);
       Observed.runPipeline(*With, Ctx);
@@ -94,6 +93,10 @@ TEST(EJitWorkerVerifier, CapturesEveryResidueWithoutChangingIR) {
       EXPECT_EQ(Capture.uncovered, 0u);
       ASSERT_EQ(Capture.watches.size(), 1u);
       const auto &W = Capture.watches.front();
+      EXPECT_EQ(W.period, "cell");
+      EXPECT_EQ(W.object, "cfg");
+      EXPECT_EQ(W.objectBase, reinterpret_cast<uintptr_t>(Data));
+      EXPECT_EQ(W.freeArg, 1);
       EXPECT_EQ(W.expected, 11u);
       ASSERT_EQ(W.addresses.size(), Mod);
       for (unsigned R = 0; R < Mod; ++R)
@@ -118,10 +121,12 @@ TEST(EJitWorkerVerifier, ReportsTailResidueOnlyAfterPublication) {
       [](void *Ptr, const EJitCompileRequest &Req, void **Out) {
         auto &C = *static_cast<Context *>(Ptr);
         EJitWorkerVerifyCapture Capture;
-        Capture.period = "cell";
         auto &W = Capture.watches.emplace_back();
         W.function = "probe";
         W.object = "cfg";
+        W.period = "cell";
+        W.objectBase = reinterpret_cast<uintptr_t>(C.data);
+        W.freeArg = 0;
         W.width = 32;
         W.expected = 7;
         uint32_t Endian = 1;
@@ -131,6 +136,8 @@ TEST(EJitWorkerVerifier, ReportsTailResidueOnlyAfterPublication) {
         EJitWorkerVerifyWatch Leaf;
         Leaf.function = "probe";
         Leaf.object = "pointer_cfg";
+        Leaf.period = "cell";
+        Leaf.objectBase = C.root;
         Leaf.width = 32;
         Leaf.expected = 7;
         Leaf.littleEndian = W.littleEndian;
@@ -164,20 +171,43 @@ TEST(EJitWorkerVerifier, ReportsTailResidueOnlyAfterPublication) {
   };
   EXPECT_NE(Dump().find("checks=0"), std::string::npos);
   ASSERT_TRUE(Pool.pollOne());
-  EXPECT_NE(Dump().find("checked_active=6/6"), std::string::npos);
+  auto Live = Dump();
+  EXPECT_NE(Live.find("checked_active=6/6"), std::string::npos);
+  EXPECT_NE(Live.find("watches=2/81920"), std::string::npos);
   __atomic_store_n(&Data[4], 9u, __ATOMIC_RELEASE);
   auto Mismatch = Dump();
   EXPECT_NE(Mismatch.find("residue=4/5 kind=value"), std::string::npos);
-  EXPECT_NE(Mismatch.find("expected=0x7 actual=0x9"), std::string::npos);
-  EXPECT_EQ(Dump().find("MISMATCH"), std::string::npos);
+  EXPECT_NE(Mismatch.find("expected=0x7 first=0x9"), std::string::npos);
+  EXPECT_NE(Mismatch.find("object=cfg@0x"), std::string::npos);
+  EXPECT_NE(Mismatch.find("offset=0x10"), std::string::npos);
+  EXPECT_NE(Mismatch.find("src=arg0 "), std::string::npos);
+  // The rate is the location's lifetime ratio (samples accumulate from
+  // before the first mismatch too), so its exact value depends on scan
+  // rotation; assert presence and a non-zero ratio instead of an exact one.
+  EXPECT_NE(Mismatch.find("count="), std::string::npos);
+  EXPECT_NE(Mismatch.find("rate="), std::string::npos);
+  EXPECT_EQ(Mismatch.find("rate=0.0%"), std::string::npos);
+  // Sticky records: the recorded location re-reports on every dump; it is
+  // not unregistered while still mismatching.
+  EXPECT_NE(Dump().find("residue=4/5"), std::string::npos);
   __atomic_store_n(&Root, uintptr_t(1), __ATOMIC_RELEASE);
   auto ChangedRoot = Dump();
-  EXPECT_NE(ChangedRoot.find("object=pointer_cfg"), std::string::npos);
+  EXPECT_NE(ChangedRoot.find("object=pointer_cfg@0x"), std::string::npos);
   EXPECT_NE(ChangedRoot.find("kind=pointer-root"), std::string::npos);
-  EXPECT_NE(ChangedRoot.find("actual=0x1"), std::string::npos);
+  EXPECT_NE(ChangedRoot.find("first=0x1"), std::string::npos);
   EXPECT_EQ(ChangedRoot.find("blocked_root=0"), std::string::npos);
+  // Recovery does not unregister a recorded location either: the rows stay
+  // listed with their frozen counts while samples keep growing, so the
+  // printed rate drops below 100%.
+  __atomic_store_n(&Data[4], 7u, __ATOMIC_RELEASE);
+  __atomic_store_n(&Root, reinterpret_cast<uintptr_t>(Data),
+                   __ATOMIC_RELEASE);
+  auto Recovered = Dump();
+  EXPECT_NE(Recovered.find("residue=4/5"), std::string::npos);
+  EXPECT_NE(Recovered.find("residue=0/1"), std::string::npos);
+  EXPECT_EQ(Recovered.find("rate=100.0%"), std::string::npos);
   EXPECT_TRUE(Pool.setInstanceEnabled(0, 1, false));
-  EXPECT_NE(Dump().find("versions=0 staged=0 checked_active=0/0"),
+  EXPECT_NE(Dump().find("versions=0 staged=0 watches=0/81920"),
             std::string::npos);
   ejit_set_log_level(Level);
   Pool.ownerShutdown();

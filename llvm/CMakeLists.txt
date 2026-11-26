@@ -945,9 +945,7 @@ endif()
 set(EJIT_SHARED_SECTION_ATTR "" CACHE STRING
   "Attribute placing the shared taskpool state into inter-core shared memory")
 option(EJIT_WORKER_VERIFY_SUBSTITUTION
-  "Check selected live period_const substitutions on the shared worker" OFF)
-set(EJIT_WORKER_VERIFY_PERIOD "" CACHE STRING
-  "Name of a shared, resident period to check on the worker")
+  "Check live period_const substitutions on the shared worker (all periods)" OFF)
 # Scan pacing (LLVMEJIT target definitions; see EJitWorkerVerifier.h). The
 # interval between two probe slices is EJIT_WORKER_VERIFY_IDLE_TICKS worker
 # idle rounds; each idle round already costs one platform tick (SRE_TaskDelay
@@ -962,21 +960,32 @@ set(EJIT_WORKER_VERIFY_STEP_BUDGET "32" CACHE STRING
 # (>= 1 keeps this on; 0 disables, host-only builds).
 set(EJIT_WORKER_VERIFY_YIELD_EVERY "8" CACHE STRING
   "Verifier: yield one platform tick every Nth step inside a slice (>=1; 0 disables)")
+# Global budgets across all tracked versions (watch = one folded-load site
+# with its residue addresses). Overrun trims the NEWEST capture and counts
+# into `dropped`; the dump stats line reports watches=<n>/<cap> with a FULL
+# marker once the budget is exhausted.
+set(EJIT_WORKER_VERIFY_MAX_WATCHES "81920" CACHE STRING
+  "Verifier: global watch budget across all tracked versions (>= 1)")
+set(EJIT_WORKER_VERIFY_MAX_VERSIONS "1024" CACHE STRING
+  "Verifier: max simultaneous tracked specializations, pending+live (>= 1)")
 if(EJIT_WORKER_VERIFY_SUBSTITUTION)
-  if(NOT EJIT_DIAG_ENABLE OR
-     NOT EJIT_WORKER_VERIFY_PERIOD MATCHES "^[A-Za-z0-9_.-]+$")
+  if(NOT EJIT_DIAG_ENABLE)
     message(FATAL_ERROR
-      "Worker verification requires diagnostics, and a named shared EJIT_WORKER_VERIFY_PERIOD")
+      "Worker verification requires diagnostics (EJIT_DIAG_ENABLE=ON)")
   endif()
   ejit_require_numeric(EJIT_WORKER_VERIFY_IDLE_TICKS)
   ejit_require_numeric(EJIT_WORKER_VERIFY_STEP_BUDGET)
   ejit_require_numeric(EJIT_WORKER_VERIFY_YIELD_EVERY)
+  ejit_require_numeric(EJIT_WORKER_VERIFY_MAX_WATCHES)
+  ejit_require_numeric(EJIT_WORKER_VERIFY_MAX_VERSIONS)
   if(EJIT_WORKER_VERIFY_IDLE_TICKS LESS 1 OR
      EJIT_WORKER_VERIFY_STEP_BUDGET LESS 1 OR
-     EJIT_WORKER_VERIFY_YIELD_EVERY LESS 0)
+     EJIT_WORKER_VERIFY_YIELD_EVERY LESS 0 OR
+     EJIT_WORKER_VERIFY_MAX_WATCHES LESS 1 OR
+     EJIT_WORKER_VERIFY_MAX_VERSIONS LESS 1)
     message(FATAL_ERROR
-      "EJIT_WORKER_VERIFY_IDLE_TICKS/STEP_BUDGET must be >= 1 and "
-      "EJIT_WORKER_VERIFY_YIELD_EVERY >= 0 (0 disables in-slice yields)")
+      "EJIT_WORKER_VERIFY_IDLE_TICKS/STEP_BUDGET/MAX_WATCHES/MAX_VERSIONS "
+      "must be >= 1 and EJIT_WORKER_VERIFY_YIELD_EVERY >= 0")
   endif()
   add_definitions(-DEJIT_WORKER_VERIFY_SUBSTITUTION)
 endif()

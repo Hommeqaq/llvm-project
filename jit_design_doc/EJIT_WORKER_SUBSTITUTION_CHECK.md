@@ -9,73 +9,137 @@ The worker check is not a replacement for that coverage or a correctness guard.
 Configure the runtime (not the business Clang):
 
 ```text
--DEJIT_WORKER_VERIFY_SUBSTITUTION=ON -DEJIT_WORKER_VERIFY_PERIOD=<shared-period>
+-DEJIT_WORKER_VERIFY_SUBSTITUTION=ON
 ```
 
-The feature defaults to OFF. It requires diagnostics (`EJIT_DIAG_ENABLE`) and a
-named shared period. Use the normal `ejit_init` / `ejit_init_pgo` in Async mode:
-records are collected by the shared worker's own compiles.
-Only one named period is selected per prototype package. Scan pacing is
-configurable: one probe slice runs on every `EJIT_WORKER_VERIFY_IDLE_TICKS`-th
-(default 8) worker idle round, each slice performs at most
-`EJIT_WORKER_VERIFY_STEP_BUDGET` (default 32) probe/retirement steps, and every
-`EJIT_WORKER_VERIFY_YIELD_EVERY`-th (default 8) step inside a slice yields one
-platform tick (`SRE_TaskDelay(1)`, the same primitive as the worker loop's own
-per-round yield) so a print-heavy dump or a large step budget cannot starve the
-bare-metal watchdog heartbeat. Between two slices the worker still performs its
-normal unconditional per-round yield, so the two-check interval is
-`EJIT_WORKER_VERIFY_IDLE_TICKS` platform ticks plus poll overhead; a dump
-request bypasses the tick throttle on the next idle round, and compile/publish
-work always takes priority over scanning. This is a work budget, not a time or
-detection guarantee.
+The feature defaults to OFF. It requires diagnostics (`EJIT_DIAG_ENABLE`) and
+monitors **all periods at once**: every worker compile records every coverable
+period_const fold of every registered period, and each watch carries its own
+source period for the report rows. Use the normal `ejit_init` / `ejit_init_pgo`
+in Async mode: records are collected by the shared worker's own compiles.
 
-The selected source ranges must be coherent shared RAM with the same contents
-on worker and producer. The globals, registered pointer slots and any bounded
-pointees being scanned must remain mapped and resident through shutdown;
-shared mapping alone does not make a freed or reused allocation readable.
-Updates must not tear or race ordinary loads; deliberate diagnostic mutations
-in the demo use naturally aligned atomic stores. Do not opt a period with
-volatile/MMIO or moving pointees into this prototype. A generation check
-discards a sample that overlaps a lifecycle change; it does not pin storage.
+## Pacing and budgets
+
+- `EJIT_WORKER_VERIFY_IDLE_TICKS` (default 8): one probe slice every Nth
+  worker idle round. Each idle round already costs one platform tick
+  (`SRE_TaskDelay` via the injected idle hook), so the two-check interval is
+  N platform ticks plus poll overhead; a dump request bypasses the throttle on
+  the next idle round, and compile/publish work always takes priority.
+- `EJIT_WORKER_VERIFY_STEP_BUDGET` (default 32): max probe/retirement steps
+  per slice; inside a slice the worker yields one platform tick every
+  `EJIT_WORKER_VERIFY_YIELD_EVERY` (default 8) steps so a large budget cannot
+  starve the bare-metal watchdog heartbeat.
+- `EJIT_WORKER_VERIFY_MAX_WATCHES` (default 81920) /
+  `EJIT_WORKER_VERIFY_MAX_VERSIONS` (default 1024): global budgets across all
+  tracked versions (watch = one folded-load site with its residue addresses).
+  Overrun trims the NEWEST capture and counts into `dropped`; existing
+  watches are never evicted.
+- Dump output pacing is fixed (not configurable): after every printed problem
+  row — and once after the stats line — the worker delays 20 platform ticks,
+  so a report trickles out and never stresses the console or the system.
+
+This is a work budget, not a time or detection guarantee.
+
+## Output model
+
+Normal scanning never prints: a mismatching probe only bumps the location's
+sticky record and the global counters. Output happens only when the worker
+core calls `ejit_worker_verify_dump()`:
+
+1. one scan slice runs as usual (same pacing as any other slice);
+2. every location that has EVER mismatched is reported, one row each (nothing
+   is re-read at print time):
+
+   ```text
+   [WORKER-VERIFY] MISMATCH tier=0 gen=1 dims=0:1@1,0:0@0,0:0@0,0:0@0
+     period=worker_verify_cell fn=ejit_worker_verify_probe
+     object=gEJitWorkerVerifyCells@0x82f40000 offset=0x14 src=arg1
+     residue=4/5 kind=value expected=0x7 first=0x11 count=7/7 rate=100.0%
+   ```
+
+   - `tier/gen/dims` — which specialization version (tier, generation,
+     dimType:instance@version).
+   - `period/fn` — the fold's source period and function.
+   - `object=<symbol>@<base> offset=<bytes>` — the watched member's exact
+     position: the fold's source global (C symbol) with its base address,
+     and the member's byte offset inside it. For a changed pointer root the
+     compared member is the slot itself (`object=<ptr>@<slot> offset=0x0`).
+   - `src` — the driving free-dim parameter of the remainder domain
+     (`arg<N>`, or `const` for fully constant indices); the domain size is
+     the residue denominator.
+   - `residue=r/n` — which slot of the free-dim domain (e.g. `slot % 5`
+     folds watch all 5 candidate addresses; each slot is probed and reported
+     independently).
+   - `kind` — what the row compares: `value` (shared bytes vs the constant
+     baked into the code) or `pointer-root` (the shared pointer slot vs the
+     pointer baked into the code).
+   - `expected`/`first` — the value baked into the code and the value seen at
+     the FIRST mismatch (frozen; later mismatches do not update it).
+   - `count=m/s rate=x.y%` — saturating per-location counters (mismatches /
+     probe attempts); recovery does NOT unregister a recorded location: the
+     row stays listed with its frozen count while samples keep growing, so
+     the rate decays after recovery.
+3. the stats line: `versions`, `staged`, `watches=<used>/<cap>` (with a FULL
+   marker once the budget is exhausted), `checked_active=A/B`, `checks`,
+   `mismatch_samples`, `rate` (global, clamped to 100%), `recorded`
+   (recorded locations), `uncovered`, `dropped`, `blocked_root`, `retired`.
+
+`ejit_worker_verify_dump()` returns as soon as the request is queued; the
+rows appear on the worker later. `checks=0` is not a pass; `uncovered`
+counts folds whose shape the verifier cannot watch.
+
+### Mapping offsets to source-level members
+
+The embedded bitcode carries IR-level layouts only: struct member NAMES are
+stripped during lowering, so the runtime cannot print `slot5[4].value`
+directly. To resolve `object=...@0x... offset=0x14` to a field, build a `-g`
+(full debug info, not `-gline-tables-only`) image once and read the DWARF:
+
+```bash
+llvm-dwarfdump --name=gEJitWorkerVerifyCells board.elf
+```
+
+The struct type tree lists every member with its byte offset and size; the
+row's offset picks the member (and the residue picks the array slot) without
+any runtime support. This mapping stays offline tooling by design.
+
+## Coverage and contract
 
 Coverage is limited to scalar integer/pointer folds with a registered source,
-constant offsets and one fully enumerable unsigned remainder, including
-`%5` and `%10`. For root pointers it compares the current shared slot against
-the materialized pointer. For bounded fields behind them it double-checks the
-root and does not follow a newly installed pointer. Leaf scans require a
-matching explicit pointer extent; otherwise the root may be verified while the
-field is uncovered. Borrowed bound-pointer arguments, PHI, and unknown index
-domains are not covered. A load that never folded is not a verifier failure.
+constant offsets and one fully enumerable unsigned remainder (residues <= 16),
+including `%5` and `%10`. For root pointers it compares the current shared
+slot against the materialized pointer. For bounded fields behind them it
+double-checks the root and does not follow a newly installed pointer.
+Borrowed bound-pointer arguments and PHI-witness folds are not covered yet
+(planned follow-up); they count as `uncovered` meanwhile. A load that never
+folded is not a verifier failure.
 
-Mismatches print from the worker with function, artifact tier, generation,
-dimension ids, source object, load ordinal, residue, and expected/actual bits.
-There is no automatic fallback or recompile. `ejit_worker_verify_dump` on the
-worker core requests a summary; success means queued, not printed or passed.
-On the worker keep log level at INFO; producers need no verifier log setting.
-
-- `checked_active=A/B`: candidate reads checked at least once out of tracked
-  candidates, not execution coverage. Stale versions retire lazily.
-- `mismatch_samples`: cumulative mismatching samples, not unique functions.
-  Repeated mismatches at a candidate are counted but normally logged once until
-  it recovers. `suppressed` counts log deferrals due to the print limit or a
-  disabled worker log.
-- `uncovered`, `dropped`, `blocked_root`: unsupported published sites,
-  budget loss, and skipped leaf reads after a root changed, respectively.
-  In particular `checks=0` is not a pass.
+The selected source ranges must be coherent shared RAM with the same contents
+on worker and producer. The globals and registered objects of every monitored
+period must remain mapped and resident through shutdown; shared mapping alone
+does not make a freed or reused allocation readable. Updates must not tear or
+race ordinary loads; deliberate diagnostic mutations use naturally aligned
+atomic stores. Do not opt volatile/MMIO or moving pointees into this feature.
+A generation check discards a sample that overlaps a lifecycle change; it does
+not pin storage.
 
 ## Board smoke
 
 Link only `ejit_test/ejit_worker_verify_sre_test.c` using normal spec5
-annotations and build flags. Enable stats and set
-`EJIT_WORKER_VERIFY_PERIOD=worker_verify_cell` for the runtime. Follow the
-product's existing init-array and shared section configuration:
+annotations and build flags (the verifier runtime requires no new Clang flag).
+Enable stats for the runtime build. Follow the product's existing init-array
+and shared section configuration:
 
 1. Core 6: `test_ejit_worker_verify_start`.
 2. Core 16: `test_ejit_worker_verify_sample` (waits for T1 and T2).
-3. Core 6: `ejit_worker_verify_dump`. Wait for checked coverage and zero
-   mismatches. With just this demo, the active T2 has 15 residue candidates.
+3. Core 6: `ejit_worker_verify_dump`. The stats line must show full checked
+   coverage (`checked_active=15/15`, `watches=2/81920`) with zero recorded
+   locations and zero mismatch_samples. With just this demo there is nothing
+   to report, so no problem rows print.
 4. Core 16: `test_ejit_worker_verify_inject`. It changes only residues 4 and 9
-   and does not call the optimized function.
-5. Core 6: observe worker mismatch rows for `residue=4/5` and
-   `residue=9/10`. A dump can also advance one scan slice. Reboot before
-   repeating; never use the injection command in a production image.
+   and does not call the optimized function — nothing prints on its own.
+5. Core 6: `ejit_worker_verify_dump` again. Wait for the two problem rows
+   (`residue=4/5` and `residue=9/10`, one printed every 20 ticks) followed by
+   the stats line, with `mismatch_samples` and `recorded` both non-zero.
+   A dump also advances one scan slice. Reboot before repeating; never use
+   the injection command in a production image.
