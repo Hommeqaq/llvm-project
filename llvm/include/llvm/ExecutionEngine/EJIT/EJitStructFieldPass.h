@@ -143,6 +143,9 @@ private:
     EJitBoundPointerView view;
     AssumedArgMap boundArguments;
     SmallVector<std::pair<uint64_t, uint64_t>, 4> periodConstFields;
+    /// Period name from the ejit_bound_ptr annotation (empty when the bound
+    /// metadata carries none); used by the worker verifier's report rows.
+    std::string periodName;
   };
   SmallVector<BoundPointerState, kEJitMaxBoundPointers> boundStates_;
   void initBoundArgumentPropagation(Module &M);

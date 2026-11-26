@@ -21,8 +21,10 @@ namespace llvm::ejit {
 // variables). The #ifndef defaults keep standalone consumers — including the
 // host unit tests, which drive idle() directly and rely on deterministic
 // budgets — independent of any board configuration.
+// Product clock calibration: 1 platform tick ~ 1 ms, so the default
+// IDLE_TICKS is one probe slice every ~2 minutes.
 #ifndef EJIT_WORKER_VERIFY_IDLE_TICKS
-#define EJIT_WORKER_VERIFY_IDLE_TICKS 8
+#define EJIT_WORKER_VERIFY_IDLE_TICKS 120000
 #endif
 #ifndef EJIT_WORKER_VERIFY_STEP_BUDGET
 #define EJIT_WORKER_VERIFY_STEP_BUDGET 32
@@ -73,6 +75,7 @@ struct EJitWorkerVerifyWatch {
   uint8_t width = 0;
   bool littleEndian = false;
   bool rootValue = false;
+  bool bound = false; // fold of a borrowed bound-pointer pointee (kind=bound)
   uint64_t expected = 0;
   uintptr_t rootSlot = 0;
   uintptr_t expectedRoot = 0;
@@ -105,7 +108,7 @@ public:
   /// only bump the per-residue sticky records and the global counters.
   /// \p Yield, when non-null, feeds the platform tick: once per
   /// EJIT_WORKER_VERIFY_YIELD_EVERY completed steps while scanning, and
-  /// DumpRowDelayTicks after every row printed by a dump request (plus once
+  /// YieldDelayTicks after every row printed by a dump request (plus once
   /// after the stats line). The driver maps it to EJitSreTask::delay, the
   /// same primitive the worker loop's own per-round yield uses.
   using VerifyYieldFn = void (*)(void *Ctx, uint32_t Ticks);
@@ -131,11 +134,12 @@ private:
   static constexpr unsigned MaxWatches = EJIT_WORKER_VERIFY_MAX_WATCHES;
   static constexpr unsigned IdleTicks = EJIT_WORKER_VERIFY_IDLE_TICKS;
   static constexpr unsigned StepBudget = EJIT_WORKER_VERIFY_STEP_BUDGET;
-  // Dump output pacing, deliberately fixed (not a CMake knob): after every
-  // printed problem row — and once after the stats line — the worker delays
-  // this many platform ticks so a dump trickles out and never stresses the
-  // console or the system.
-  static constexpr unsigned DumpRowDelayTicks = 20;
+  // Verifier yield pacing, deliberately fixed (not a CMake knob): every
+  // platform yield the verifier makes — one per EJIT_WORKER_VERIFY_YIELD_EVERY
+  // completed scan steps, after every printed problem row, and once after the
+  // stats line — pauses this many platform ticks, so neither a large step
+  // budget nor a long report can stress the console or the system.
+  static constexpr unsigned YieldDelayTicks = 20;
   std::vector<Version> pending_, live_;
   size_t cursor_ = 0;
   unsigned retainedWatches_ = 0;

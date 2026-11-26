@@ -61,11 +61,29 @@ void EJitWorkerVerifier::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
     return;
   if (pending_.size() + live_.size() >= MaxVersions) {
     dropped_ += Capture.watches.size() + Capture.uncovered + Capture.dropped;
+    // Budget failures must be discoverable at compile time, not only in a
+    // later dump: one line per dropped capture (rare anomaly, not scanning).
+    EJIT_DIAG("[WORKER-VERIFY] capture DROPPED: version budget full "
+              "(tracked=%zu cap=%u) fn=%u watches=%u uncovered=%u",
+              pending_.size() + live_.size(), MaxVersions,
+              stripReqTier(Req.funcIndex),
+              static_cast<unsigned>(Capture.watches.size()), Capture.uncovered);
     return;
   }
+  unsigned Trimmed = 0;
   while (Capture.watches.size() + retainedWatches_ > MaxWatches) {
     Capture.watches.pop_back();
     ++Capture.dropped;
+    ++Trimmed;
+  }
+  if (Capture.dropped) {
+    // Either the per-capture fold cap (EJitWorkerVerifyCapture::MaxWatches)
+    // or the global watch budget trimmed this capture.
+    EJIT_DIAG("[WORKER-VERIFY] capture TRIMMED: dropped=%u (global watch "
+              "budget trim=%u, retained=%u+%zu cap=%u) fn=%u",
+              Capture.dropped, Trimmed, retainedWatches_,
+              Capture.watches.size(), MaxWatches,
+              stripReqTier(Req.funcIndex));
   }
   retainedWatches_ += Capture.watches.size();
   EJitCompileRequest Identity{};
@@ -133,7 +151,7 @@ void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
   // offset=0). `src` names the driving free-dim argument of the remainder
   // domain (or `const` when the index is fully constant); the domain size is
   // the residue denominator. After every row the worker pauses
-  // DumpRowDelayTicks so the report trickles out and never stresses the
+  // YieldDelayTicks so the report trickles out and never stresses the
   // console or the heartbeat.
   for (const auto &V : live_)
     for (const auto &W : V.capture.watches)
@@ -146,8 +164,11 @@ void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
             Rec.changedRoot ? W.rootSlot : W.objectBase;
         const unsigned long long Offset =
             Rec.changedRoot ? 0 : W.addresses[R] - W.objectBase;
-        const char *Kind =
-            (Rec.changedRoot || W.rootValue) ? "pointer-root" : "value";
+        const char *Kind = W.bound
+                               ? "bound"
+                               : (Rec.changedRoot || W.rootValue)
+                                     ? "pointer-root"
+                                     : "value";
         if (W.freeArg != 0xFF)
           EJIT_DIAG_RAW(
               "[WORKER-VERIFY] MISMATCH tier=%u gen=%u "
@@ -185,7 +206,7 @@ void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
               (unsigned long long)Rec.value,
               W.count[R], W.samples[R], Rate / 10u, Rate % 10u);
         if (Yield)
-          Yield(YieldCtx, DumpRowDelayTicks);
+          Yield(YieldCtx, YieldDelayTicks);
       }
 }
 
@@ -214,7 +235,7 @@ void EJitWorkerVerifier::dump(VerifyYieldFn Yield, void *YieldCtx) const {
       Recorded, (unsigned long long)uncovered_, (unsigned long long)dropped_,
       (unsigned long long)blockedRoot_, (unsigned long long)retired_);
   if (Yield)
-    Yield(YieldCtx, DumpRowDelayTicks);
+    Yield(YieldCtx, YieldDelayTicks);
 }
 
 void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested,
@@ -222,13 +243,15 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested
   if (++idleTicks_ < IdleTicks && !DumpRequested)
     return;
   idleTicks_ = 0;
+  bool Worked = false;
   for (unsigned N = 0; N < StepBudget && !live_.empty(); ++N) {
+    Worked = true;
     // Interleave a platform tick inside one slice so a print-heavy dump or a
     // large configured step budget cannot starve the worker's heartbeat
     // (bare-metal watchdog) between the loop's own per-round yields.
     if (Yield && EJIT_WORKER_VERIFY_YIELD_EVERY &&
         N % EJIT_WORKER_VERIFY_YIELD_EVERY == 0 && N != 0)
-      Yield(YieldCtx, 1);
+      Yield(YieldCtx, YieldDelayTicks);
     auto &V = live_[cursor_];
     auto IsLive = Pool.workerVerifyLive(V.request, V.function);
     if (!IsLive || !*IsLive) {
@@ -292,6 +315,12 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested
     }
     advance();
   }
+  // Work/rest rhythm: a finished slice always ends with one fixed rest. A
+  // light slice's probe work is microseconds per step (far under the work
+  // window), so in practice the rest dominates; dump printing pauses
+  // separately, once per row.
+  if (Worked && Yield)
+    Yield(YieldCtx, YieldDelayTicks);
   if (DumpRequested) {
     printRecordedRows(Yield, YieldCtx);
     dump(Yield, YieldCtx);

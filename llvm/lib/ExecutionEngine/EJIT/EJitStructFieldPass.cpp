@@ -783,6 +783,7 @@ void EJitStructFieldPass::initBoundArgumentPropagation(Module &M) {
               {Offset->getZExtValue(), Size->getZExtValue()});
       }
     }
+    State.periodName = BoundPeriodName;
 
     if (!BoundPeriodName.empty()) {
       bool Changed;
@@ -2264,7 +2265,9 @@ static Constant *tryReplacePhiWitness(
     LoadInst *LI, const GVPeriodMap &Globals, const PeriodConstOffsetMap &Fields,
     PeriodArrayRegistry &Registry, const DataLayout &DL,
     const EJitFreeDimAssumptions &Assumed,
-    const StringMap<uint8_t> *LocalPeriods) {
+    const StringMap<uint8_t> *LocalPeriods,
+    FoldSource *Source = nullptr,
+    EJitFreeDimAssumptions *EffAssumed = nullptr) {
   if (!LI->isSimple() || !LI->getType()->isIntegerTy() ||
       LI->getType()->getIntegerBitWidth() > 64)
     return nullptr;
@@ -2294,12 +2297,19 @@ static Constant *tryReplacePhiWitness(
       Selected.phiInputs[PN] = PN->getIncomingValue(Choice % Count);
       Choice /= Count;
     }
+    FoldSource WitnessSource;
     Constant *C = tryReplacePeriodAbsoluteAddress(
-        LI, *LI->getFunction(), Globals, Fields, Registry, DL, Selected);
-    if (!C && GV && Global != Globals.end())
+        LI, *LI->getFunction(), Globals, Fields, Registry, DL, Selected,
+        Source ? &WitnessSource : nullptr);
+    if (C && Source)
+      *Source = WitnessSource;
+    if (!C && GV && Global != Globals.end()) {
       C = tryReplaceLocalWitnessGEP(LI, LI->getPointerOperand(), GV,
                                     Global->second, Fields, Registry, DL,
                                     Selected, Cell);
+      if (C && Source)
+        *Source = {GV, 0};
+    }
     if (!C || (Common && Common != C)) {
       EJIT_DIAG_DEBUG("phi-witness missed fn=%s reason=%s",
                       LI->getFunction()->getName().str().c_str(),
@@ -2308,6 +2318,10 @@ static Constant *tryReplacePhiWitness(
     }
     Common = C;
   }
+  // Every feasible edge agreed on Common, so the last witness's PHI binding
+  // is a valid evaluation context for the verifier's residue enumeration.
+  if (EffAssumed)
+    *EffAssumed = Selected;
   EJIT_DIAG_DEBUG("phi-witness folded fn=%s witnesses=%u",
                   LI->getFunction()->getName().str().c_str(), Witnesses);
   return Common;
@@ -2387,7 +2401,7 @@ struct VerifyDomain {
   SmallPtrSet<const Value *, 32> visited;
 
   bool collect(const Value *V, const EJitFreeDimAssumptions &Assumed,
-               unsigned Depth = 0) {
+               unsigned Depth = 0, bool AllowArgs = false) {
     if (isa<Constant>(V))
       return true;
     if (Depth > kMaxAssumedEvalDepth || visited.size() >= 64)
@@ -2395,8 +2409,13 @@ struct VerifyDomain {
     if (!visited.insert(V).second)
       return true;
     auto *Op = dyn_cast<Operator>(V);
-    if (!Op || Assumed.values.contains(V) ||
-        isa<LoadInst, CallBase, PHINode>(V))
+    if (!Op) {
+      // Bound-pointer capture only: a bare Argument outside Assumed.values is
+      // a bound-argument leaf whose runtime value is fixed for this
+      // specialization — nothing to enumerate, so the domain stays valid.
+      return AllowArgs && isa<Argument>(V);
+    }
+    if (Assumed.values.contains(V) || isa<LoadInst, CallBase, PHINode>(V))
       return false;
     if (Op->getOpcode() == Instruction::URem &&
         Assumed.values.contains(Op->getOperand(0))) {
@@ -2542,6 +2561,67 @@ void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
   }
   Capture.watches.push_back(std::move(Watch));
 }
+// Bound-pointer capture (slice-2 extension): a fold of a borrowed
+// bound-pointer pointee. Product discipline: a bound pointee is heap memory
+// whose lifetime spans the active specialization version (a stack address
+// would be reused after return and produce false mismatches). The report row
+// pins the member with object=bound@<rawPtr> offset=<bytes> and kind=bound;
+// a runtime-borrowed buffer has no source symbol to name.
+void captureBoundWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
+                              Constant *Frozen, const uint8_t *Data,
+                              uint32_t DataSize, StringRef PeriodName,
+                              const AssumedArgMap &BoundArguments,
+                              const DataLayout &DL,
+                              const EJitFreeDimAssumptions &Assumed) {
+  auto Uncovered = [&](const char *Reason) {
+    ++Capture.uncovered;
+    EJIT_DIAG_VERBOSE("[WORKER-VERIFY] uncovered fn=%s reason=%s",
+                      LI.getFunction()->getName().str().c_str(), Reason);
+  };
+  if (Capture.watches.size() >= EJitWorkerVerifyCapture::MaxWatches) {
+    ++Capture.dropped;
+    return;
+  }
+  auto Expected = verifyBits(Frozen);
+  auto *Ty = LI.getType();
+  unsigned Width = Ty->isIntegerTy() ? Ty->getIntegerBitWidth() :
+                   Ty->isPointerTy() ? DL.getPointerTypeSizeInBits(Ty) : 0;
+  if (!Expected || LI.isAtomic() || LI.isVolatile() ||
+      (Width != 1 && Width != 8 && Width != 16 && Width != 32 && Width != 64))
+    return Uncovered("unsupported-load-type");
+  const unsigned Size = (Width + 7) / 8;
+  EJitWorkerVerifyWatch Watch;
+  Watch.function = LI.getFunction()->getName().take_front(128).str();
+  Watch.object = "bound";
+  Watch.period = PeriodName.empty() ? StringRef("bound") : PeriodName;
+  Watch.objectBase = reinterpret_cast<uintptr_t>(Data);
+  Watch.bound = true;
+  Watch.width = Width;
+  Watch.littleEndian = DL.isLittleEndian();
+  Watch.expected = *Expected;
+
+  VerifyDomain Domain;
+  const auto *Ptr = LI.getPointerOperand();
+  if (!Domain.collect(Ptr, Assumed, /*Depth=*/0, /*AllowArgs=*/true))
+    return Uncovered("unsupported-index-domain");
+  Watch.freeArg = Domain.arg;
+  auto Trial = Assumed;
+  const uintptr_t Base = reinterpret_cast<uintptr_t>(Data);
+  for (unsigned R = 0; R < Domain.modulus; ++R) {
+    if (Domain.slot)
+      Trial.values[Domain.slot] = R;
+    auto Offset = getBoundPointerOffset(Ptr, BoundArguments, DL, Trial);
+    if (!Offset || *Offset > DataSize)
+      return Uncovered("invalid-residue-offset");
+    const uintptr_t Address = Base + *Offset;
+    uint64_t Relative;
+    if (Address % Size ||
+        !absoluteRangeContains(Base, DataSize, Address, Size, Relative))
+      return Uncovered("residue-out-of-bounds-or-unaligned");
+    Watch.addresses.push_back(Address);
+  }
+  Capture.watches.push_back(std::move(Watch));
+}
 } // namespace
 #endif
 
@@ -2568,11 +2648,12 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<LoadInst *, 16> PendingFields;
   SmallVector<Replacement, 16> replacements;
 #ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  auto Capture = [&](LoadInst &LI, Constant *C, FoldSource Source,
-                     bool Absolute) {
+  auto Capture = [&](LoadInst &LI, Constant *C, FoldSource Source, bool Absolute,
+                     const EJitFreeDimAssumptions *EffAssumed = nullptr) {
     if (workerVerify_)
       captureWorkerVerify(*workerVerify_, LI, C, Source, Absolute,
-                          gvPeriodMap_, registry_, DL, freeDimAssumptions_);
+                          gvPeriodMap_, registry_, DL,
+                          EffAssumed ? *EffAssumed : freeDimAssumptions_);
   };
 #endif
 #ifdef EJIT_DIAG_ENABLE
@@ -2635,13 +2716,27 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Pattern 0: an ejit_bound_ptr parameter. Only the marked load is read
       // from the shared object; the pointer argument and all dynamic fields
       // remain live inputs to the specialization.
+      [[maybe_unused]] bool BoundFold = false;
       if (!C) {
         for (const BoundPointerState &State : boundStates_) {
           C = tryReplaceBoundPointer(LI, State.view.rawPtr, State.view.size,
                                      State.boundArguments, DL,
                                      freeDimAssumptions_);
-          if (C)
+          if (C) {
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+            if (workerVerify_) {
+              captureBoundWorkerVerify(*workerVerify_, *LI, C,
+                                        State.view.rawPtr, State.view.size,
+                                        State.periodName,
+                                        State.boundArguments, DL,
+                                        freeDimAssumptions_);
+              // The generic capture below cannot describe a borrowed pointee
+              // (no source GV); skip it for this fold.
+              BoundFold = true;
+            }
+#endif
             break;
+          }
         }
       }
 
@@ -2672,7 +2767,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       if (C) {
 #ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-        Capture(*LI, C, Source, Absolute);
+        if (!BoundFold)
+          Capture(*LI, C, Source, Absolute);
 #endif
         replacements.push_back({LI, C});
       } else
@@ -2699,15 +2795,31 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
                                       Observed);
 #ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
     const bool Absolute = C != nullptr;
+    // PHI-witness exports: the fold's source and the PHI binding the
+    // residue enumeration must evaluate under (each feasible edge agrees
+    // on the folded value, so the last witness binding is a valid context).
+    FoldSource PhiSource;
+    EJitFreeDimAssumptions PhiAssumed;
 #endif
     if (!C)
       C = tryReplacePhiWitness(
           LI, gvPeriodMap_, periodConstFieldMap_, registry_, DL,
           freeDimAssumptions_,
-          F.getName() == boundRootFunction_ ? &localWitnessPeriods_ : nullptr);
+          F.getName() == boundRootFunction_ ? &localWitnessPeriods_ : nullptr
+#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+              ,
+              workerVerify_ ? &PhiSource : nullptr,
+              workerVerify_ ? &PhiAssumed : nullptr
+#endif
+      );
     if (C) {
 #ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-      Capture(*LI, C, Source, Absolute);
+      if (!Absolute)
+        // Folded through the witness path: Source was never filled by the
+        // absolute attempt, so use the exported witness source and binding.
+        Capture(*LI, C, PhiSource, /*Absolute=*/false, &PhiAssumed);
+      else
+        Capture(*LI, C, Source, Absolute);
 #endif
       replacements.push_back({LI, C});
     }

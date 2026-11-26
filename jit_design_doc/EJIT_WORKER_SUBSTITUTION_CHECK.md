@@ -20,23 +20,30 @@ in Async mode: records are collected by the shared worker's own compiles.
 
 ## Pacing and budgets
 
-- `EJIT_WORKER_VERIFY_IDLE_TICKS` (default 8): one probe slice every Nth
+- `EJIT_WORKER_VERIFY_IDLE_TICKS` (default 120000): one probe slice every Nth
   worker idle round. Each idle round already costs one platform tick
   (`SRE_TaskDelay` via the injected idle hook), so the two-check interval is
-  N platform ticks plus poll overhead; a dump request bypasses the throttle on
-  the next idle round, and compile/publish work always takes priority.
+  N platform ticks plus poll overhead — with the product clock (1 tick ~ 1 ms)
+  the default is one scan every ~2 minutes. A dump request bypasses the
+  throttle on the next idle round, and compile/publish work always takes
+  priority.
 - `EJIT_WORKER_VERIFY_STEP_BUDGET` (default 32): max probe/retirement steps
-  per slice; inside a slice the worker yields one platform tick every
-  `EJIT_WORKER_VERIFY_YIELD_EVERY` (default 8) steps so a large budget cannot
-  starve the bare-metal watchdog heartbeat.
+  per slice. A slice always ends with one fixed rest, and inside a slice the
+  worker pauses `EJIT_WORKER_VERIFY_YIELD_EVERY` (default 8) completed steps
+  for the fixed yield below, so a large budget cannot starve the bare-metal
+  watchdog heartbeat. Work/rest scale: one probe step is microseconds
+  (well under a tick), so a 32-step slice's work is far below the ~50-tick
+  work window; the fixed rests dominate by design.
 - `EJIT_WORKER_VERIFY_MAX_WATCHES` (default 81920) /
   `EJIT_WORKER_VERIFY_MAX_VERSIONS` (default 1024): global budgets across all
   tracked versions (watch = one folded-load site with its residue addresses).
   Overrun trims the NEWEST capture and counts into `dropped`; existing
   watches are never evicted.
-- Dump output pacing is fixed (not configurable): after every printed problem
-  row — and once after the stats line — the worker delays 20 platform ticks,
-  so a report trickles out and never stresses the console or the system.
+- Verifier yield pacing is fixed (not configurable): every platform pause the
+  verifier makes — one per `EJIT_WORKER_VERIFY_YIELD_EVERY` completed scan
+  steps, after every printed problem row, and once after the stats line —
+  lasts 20 platform ticks, so neither scanning nor a report ever stresses the
+  console or the system.
 
 This is a work budget, not a time or detection guarantee.
 
@@ -88,6 +95,13 @@ core calls `ejit_worker_verify_dump()`:
 rows appear on the worker later. `checks=0` is not a pass; `uncovered`
 counts folds whose shape the verifier cannot watch.
 
+Registration failures are discoverable at compile time, not only via a
+dump: a capture fully dropped by the version budget logs one
+`[WORKER-VERIFY] capture DROPPED` line, and any trimmed capture (per-capture
+fold cap or global watch budget) logs one
+`[WORKER-VERIFY] capture TRIMMED` line, both from the worker at INFO level.
+Uncoverable fold shapes additionally log at VERBOSE level during capture.
+
 ### Mapping offsets to source-level members
 
 The embedded bitcode carries IR-level layouts only: struct member NAMES are
@@ -110,9 +124,14 @@ constant offsets and one fully enumerable unsigned remainder (residues <= 16),
 including `%5` and `%10`. For root pointers it compares the current shared
 slot against the materialized pointer. For bounded fields behind them it
 double-checks the root and does not follow a newly installed pointer.
-Borrowed bound-pointer arguments and PHI-witness folds are not covered yet
-(planned follow-up); they count as `uncovered` meanwhile. A load that never
-folded is not a verifier failure.
+Borrowed bound-pointer pointees are watched as `kind=bound` rows
+(`object=bound@<rawPtr> offset=...`, period from the ejit_bound_ptr
+annotation): product discipline is that a bound pointee is HEAP memory whose
+lifetime spans the active specialization version — a stack address would be
+reused after return and produce false mismatches. PHI-witness folds are
+watched like the period fold they resolve to (the row carries the witness's
+source object; the residue enumeration evaluates under the same PHI binding
+the fold proved). A load that never folded is not a verifier failure.
 
 The selected source ranges must be coherent shared RAM with the same contents
 on worker and producer. The globals and registered objects of every monitored

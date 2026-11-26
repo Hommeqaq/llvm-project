@@ -950,8 +950,9 @@ option(EJIT_WORKER_VERIFY_SUBSTITUTION
 # interval between two probe slices is EJIT_WORKER_VERIFY_IDLE_TICKS worker
 # idle rounds; each idle round already costs one platform tick (SRE_TaskDelay
 # via the injected idle hook), so the two-check interval in ticks equals this
-# value plus poll overhead.
-set(EJIT_WORKER_VERIFY_IDLE_TICKS "8" CACHE STRING
+# value plus poll overhead. Product clock: 1 tick ~ 1 ms, so the default is
+# one probe slice every ~2 minutes.
+set(EJIT_WORKER_VERIFY_IDLE_TICKS "120000" CACHE STRING
   "Verifier: run one probe slice every Nth worker idle round (>= 1)")
 set(EJIT_WORKER_VERIFY_STEP_BUDGET "32" CACHE STRING
   "Verifier: max probe/retirement steps per idle slice (>= 1)")
