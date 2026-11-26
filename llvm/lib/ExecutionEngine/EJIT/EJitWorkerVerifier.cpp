@@ -135,7 +135,8 @@ void EJitWorkerVerifier::dump() const {
       (unsigned long long)retired_, (unsigned long long)suppressed_);
 }
 
-void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested) {
+void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested,
+                              VerifyYieldFn Yield, void *YieldCtx) {
   if (++idleTicks_ < IdleTicks && !DumpRequested)
     return;
   idleTicks_ = 0;
@@ -143,6 +144,12 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested
   // are counted and can be surfaced on request without flooding the console.
   unsigned Printed = 0;
   for (unsigned N = 0; N < StepBudget && !live_.empty(); ++N) {
+    // Interleave a platform tick inside one slice so a print-heavy dump or a
+    // large configured step budget cannot starve the worker's heartbeat
+    // (bare-metal watchdog) between the loop's own per-round yields.
+    if (Yield && EJIT_WORKER_VERIFY_YIELD_EVERY &&
+        N % EJIT_WORKER_VERIFY_YIELD_EVERY == 0 && N != 0)
+      Yield(YieldCtx);
     auto &V = live_[cursor_];
     auto IsLive = Pool.workerVerifyLive(V.request, V.function);
     if (!IsLive || !*IsLive) {

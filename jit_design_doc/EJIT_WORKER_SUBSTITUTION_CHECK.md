@@ -15,9 +15,19 @@ Configure the runtime (not the business Clang):
 The feature defaults to OFF. It requires diagnostics (`EJIT_DIAG_ENABLE`) and a
 named shared period. Use the normal `ejit_init` / `ejit_init_pgo` in Async mode:
 records are collected by the shared worker's own compiles.
-Only one named period is selected per prototype package. The worker performs up
-to 32 probe/retirement steps every eight idle iterations after serving compile
-and publish work. This is a work budget, not a time or detection guarantee.
+Only one named period is selected per prototype package. Scan pacing is
+configurable: one probe slice runs on every `EJIT_WORKER_VERIFY_IDLE_TICKS`-th
+(default 8) worker idle round, each slice performs at most
+`EJIT_WORKER_VERIFY_STEP_BUDGET` (default 32) probe/retirement steps, and every
+`EJIT_WORKER_VERIFY_YIELD_EVERY`-th (default 8) step inside a slice yields one
+platform tick (`SRE_TaskDelay(1)`, the same primitive as the worker loop's own
+per-round yield) so a print-heavy dump or a large step budget cannot starve the
+bare-metal watchdog heartbeat. Between two slices the worker still performs its
+normal unconditional per-round yield, so the two-check interval is
+`EJIT_WORKER_VERIFY_IDLE_TICKS` platform ticks plus poll overhead; a dump
+request bypasses the tick throttle on the next idle round, and compile/publish
+work always takes priority over scanning. This is a work budget, not a time or
+detection guarantee.
 
 The selected source ranges must be coherent shared RAM with the same contents
 on worker and producer. The globals, registered pointer slots and any bounded

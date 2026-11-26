@@ -17,6 +17,23 @@
 
 namespace llvm::ejit {
 
+// Scan pacing, overridable at build time (target-scoped definitions on
+// LLVMEJIT from the EJIT_WORKER_VERIFY_* CMake cache variables). The #ifndef
+// defaults keep standalone consumers — including the host unit tests, which
+// drive idle() directly and rely on deterministic budgets — independent of
+// any board configuration.
+#ifndef EJIT_WORKER_VERIFY_IDLE_TICKS
+#define EJIT_WORKER_VERIFY_IDLE_TICKS 8
+#endif
+#ifndef EJIT_WORKER_VERIFY_STEP_BUDGET
+#define EJIT_WORKER_VERIFY_STEP_BUDGET 32
+#endif
+// 0 disables in-slice yielding (tight-host builds only; leave >= 1 on the
+// board so a print-heavy dump slice cannot starve the watchdog heartbeat).
+#ifndef EJIT_WORKER_VERIFY_YIELD_EVERY
+#define EJIT_WORKER_VERIFY_YIELD_EVERY 8
+#endif
+
 class EJitSharedTaskPool;
 
 struct EJitWorkerVerifyWatch {
@@ -48,7 +65,15 @@ public:
   void onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
                   EJitWorkerVerifyCapture Capture);
   void onPublished(const EJitCompileRequest &Req, bool Published);
-  void idle(const EJitSharedTaskPool &Pool, bool DumpRequested);
+
+  /// One probe slice on the worker. \p Yield, when non-null, is invoked every
+  /// EJIT_WORKER_VERIFY_YIELD_EVERY completed steps so a large budget or a
+  /// print-heavy dump slice cannot run for long without feeding the platform
+  /// (bare-metal watchdog) tick; the driver maps it to EJitSreTask::delay(1),
+  /// the same primitive the worker loop's own per-round yield uses.
+  using VerifyYieldFn = void (*)(void *Ctx);
+  void idle(const EJitSharedTaskPool &Pool, bool DumpRequested,
+            VerifyYieldFn Yield = nullptr, void *YieldCtx = nullptr);
 
 private:
   struct Version {
@@ -66,8 +91,8 @@ private:
 
   static constexpr unsigned MaxVersions = 1024;
   static constexpr unsigned MaxWatches = 8192;
-  static constexpr unsigned IdleTicks = 8;
-  static constexpr unsigned StepBudget = 32;
+  static constexpr unsigned IdleTicks = EJIT_WORKER_VERIFY_IDLE_TICKS;
+  static constexpr unsigned StepBudget = EJIT_WORKER_VERIFY_STEP_BUDGET;
   std::vector<Version> pending_, live_;
   size_t cursor_ = 0;
   unsigned retainedWatches_ = 0;

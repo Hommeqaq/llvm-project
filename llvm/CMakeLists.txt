@@ -948,11 +948,35 @@ option(EJIT_WORKER_VERIFY_SUBSTITUTION
   "Check selected live period_const substitutions on the shared worker" OFF)
 set(EJIT_WORKER_VERIFY_PERIOD "" CACHE STRING
   "Name of a shared, resident period to check on the worker")
+# Scan pacing (LLVMEJIT target definitions; see EJitWorkerVerifier.h). The
+# interval between two probe slices is EJIT_WORKER_VERIFY_IDLE_TICKS worker
+# idle rounds; each idle round already costs one platform tick (SRE_TaskDelay
+# via the injected idle hook), so the two-check interval in ticks equals this
+# value plus poll overhead.
+set(EJIT_WORKER_VERIFY_IDLE_TICKS "8" CACHE STRING
+  "Verifier: run one probe slice every Nth worker idle round (>= 1)")
+set(EJIT_WORKER_VERIFY_STEP_BUDGET "32" CACHE STRING
+  "Verifier: max probe/retirement steps per idle slice (>= 1)")
+# Inside one slice, yield one platform tick every Nth step so a print-heavy
+# dump or a large step budget cannot starve the worker's watchdog heartbeat
+# (>= 1 keeps this on; 0 disables, host-only builds).
+set(EJIT_WORKER_VERIFY_YIELD_EVERY "8" CACHE STRING
+  "Verifier: yield one platform tick every Nth step inside a slice (>=1; 0 disables)")
 if(EJIT_WORKER_VERIFY_SUBSTITUTION)
   if(NOT EJIT_DIAG_ENABLE OR
      NOT EJIT_WORKER_VERIFY_PERIOD MATCHES "^[A-Za-z0-9_.-]+$")
     message(FATAL_ERROR
       "Worker verification requires diagnostics, and a named shared EJIT_WORKER_VERIFY_PERIOD")
+  endif()
+  ejit_require_numeric(EJIT_WORKER_VERIFY_IDLE_TICKS)
+  ejit_require_numeric(EJIT_WORKER_VERIFY_STEP_BUDGET)
+  ejit_require_numeric(EJIT_WORKER_VERIFY_YIELD_EVERY)
+  if(EJIT_WORKER_VERIFY_IDLE_TICKS LESS 1 OR
+     EJIT_WORKER_VERIFY_STEP_BUDGET LESS 1 OR
+     EJIT_WORKER_VERIFY_YIELD_EVERY LESS 0)
+    message(FATAL_ERROR
+      "EJIT_WORKER_VERIFY_IDLE_TICKS/STEP_BUDGET must be >= 1 and "
+      "EJIT_WORKER_VERIFY_YIELD_EVERY >= 0 (0 disables in-slice yields)")
   endif()
   add_definitions(-DEJIT_WORKER_VERIFY_SUBSTITUTION)
 endif()

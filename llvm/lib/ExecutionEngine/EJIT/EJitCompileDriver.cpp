@@ -209,7 +209,11 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
       [](void *Ctx, bool Dump) {
         auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
         if (Driver->workerVerifier_)
-          Driver->workerVerifier_->idle(Driver->sharedPool_, Dump);
+          Driver->workerVerifier_->idle(
+              Driver->sharedPool_, Dump,
+              // Same platform primitive as the worker loop's per-round yield,
+              // so a verifier slice feeds the watchdog exactly like the loop.
+              [](void *) { EJitSreTask::delay(1); });
       },
       this);
 #endif
