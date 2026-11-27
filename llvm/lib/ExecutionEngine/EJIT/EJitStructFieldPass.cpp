@@ -2633,6 +2633,25 @@ void captureBoundAsan(EJitAsanCapture &Capture, LoadInst &LI,
         !absoluteRangeContains(Base, DataSize, Address, Size, Relative))
       return Uncovered("residue-out-of-bounds-or-unaligned");
     Watch.addresses.push_back(Address);
+    // Entry-stub record for constant-offset bound folds (modulus == 1):
+    // the specialized entry can re-load this field through the CURRENT
+    // bound argument — the only place the actual family member is
+    // observable. Recorded regardless of the runtime mode; the pipeline-end
+    // emitter decides whether to emit the stub. Residue-driven folds
+    // (modulus > 1) stay worker-probe-only: the stub would have to
+    // recompute the free-dim index per call.
+    if (Domain.modulus == 1 && R == 0) {
+      if (const auto *RootArg = findRootArgument(Ptr)) {
+        EJitAsanEntryFold &EF = Capture.entryFolds.emplace_back();
+        EF.period = Watch.period;
+        EF.argNo = static_cast<uint32_t>(RootArg->getArgNo());
+        EF.byteOffset = static_cast<uint64_t>(*Offset);
+        EF.expected = *Expected;
+        EF.width = static_cast<uint8_t>(Width);
+        EF.align = static_cast<uint8_t>(LI.getAlign().value());
+        EF.siteId = kEJitAsanNoSite;
+      }
+    }
   }
   Capture.watches.push_back(std::move(Watch));
 }

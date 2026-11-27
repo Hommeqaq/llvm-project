@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "EJitAsan.h"
+#include "EJitAsanState.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -42,6 +43,142 @@ uint64_t readWatch(uintptr_t Address, unsigned Width, bool LittleEndian) {
 }
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// Shared entry-instrumentation state (EJitAsanState.h).
+//
+// One blob for every core: emitted entry stubs call the gate and the
+// mismatch hook from whichever core executes the specialized function, so
+// the rotation cells, slot table, site table, and sticky records must all
+// live in inter-core shared memory. Mirrors the gEJitVpState discipline.
+//===----------------------------------------------------------------------===//
+namespace llvm {
+namespace ejit {
+EJIT_SHARED_SECTION EJitAsanState gEJitAsanState;
+} // namespace ejit
+} // namespace llvm
+
+namespace llvm {
+namespace ejit {
+
+uint32_t ejitAsanClaimSlot(StringRef FunctionName) {
+  EJitAsanState &St = gEJitAsanState;
+  const uint32_t Used = St.slotsUsed.loadRelaxed();
+  for (uint32_t I = 0; I < Used; ++I)
+    if (FunctionName == St.slots[I].name)
+      return I;
+  if (Used < EJIT_ASAN_MAX_SLOTS) {
+    EJitAsanSlot &S = St.slots[Used];
+    ejitAsanCopyName(S.name, sizeof(S.name), FunctionName);
+    S.activeSites.storeRelaxed(0);
+    St.slotsUsed.storeRelaxed(Used + 1);
+    return Used;
+  }
+  // Table full: reuse a dead slot (one with no published sites). v1 never
+  // frees slots on retirement, so only a renamed dead slot is ever safe.
+  for (uint32_t I = 0; I < EJIT_ASAN_MAX_SLOTS; ++I)
+    if (St.slots[I].activeSites.loadRelaxed() == 0) {
+      EJitAsanSlot &S = St.slots[I];
+      ejitAsanCopyName(S.name, sizeof(S.name), FunctionName);
+      return I;
+    }
+  return kEJitAsanNoSlot;
+}
+
+uint32_t ejitAsanPublishSite(uint32_t Slot, StringRef Function,
+                             StringRef Period, uint8_t Tier, uint8_t ArgNo,
+                             uint8_t Width, uint8_t FieldAlign,
+                             uint64_t ByteOffset, uint64_t Expected) {
+  EJitAsanState &St = gEJitAsanState;
+  const uint32_t Id = St.siteCounter.loadRelaxed();
+  if (Id >= EJIT_ASAN_MAX_SITES)
+    return kEJitAsanNoSite;
+  St.siteCounter.storeRelaxed(Id + 1);
+  EJitAsanSite &S = St.sites[Id];
+  ejitAsanCopyName(S.function, sizeof(S.function), Function);
+  ejitAsanCopyName(S.period, sizeof(S.period), Period);
+  S.gen = 0;
+  S.slot = Slot;
+  S.tier = Tier;
+  S.argNo = ArgNo;
+  S.width = Width;
+  S.fieldAlign = FieldAlign;
+  S.byteOffset = ByteOffset;
+  S.expected = Expected;
+  S.published.storeRelease(1u);
+  if (Slot != kEJitAsanNoSlot)
+    St.slots[Slot].activeSites.fetchAddRelaxed(1);
+  return Id;
+}
+
+} // namespace ejit
+} // namespace llvm
+
+//===----------------------------------------------------------------------===//
+// Entry-stub hooks. Called from JIT'd specialized code through the
+// absolute-symbol path (registered in EJit::init like the value-profiling
+// hooks); report-only — a mismatch is recorded, the call always continues.
+//===----------------------------------------------------------------------===//
+
+/// Rotation gate, one call per instrumented function entry. Reads only this
+/// core's private cell (plain loads/stores, single writer) and the shared
+/// slot count: at most one function slot is active per core at any time.
+/// Returns 1 when the caller's slot holds the active window this call.
+extern "C" int32_t __ejit_asan_gate(uint32_t Slot) {
+  const uint32_t Core = EJitCoreId::current();
+  if (Core >= EJIT_ASAN_MAX_CORES)
+    return 0; // Safely degraded: this core never checks.
+  EJitAsanCell &C = gEJitAsanState.cells[Core];
+  const uint32_t Live = gEJitAsanState.slotsUsed.loadRelaxed();
+  if (Live == 0)
+    return 0;
+  if (C.countdown == 0) {
+    if (C.checks == 0 && C.cycles == 0 && C.slot == 0) {
+      // Fresh core: arm slot 0's first window instead of skipping it.
+      C.countdown = EJIT_ASAN_ROTATION_WINDOW;
+    } else {
+      uint32_t Next = C.slot + 1;
+      if (Next >= Live) {
+        Next = 0;
+        ++C.cycles;
+      }
+      C.slot = Next;
+      C.countdown = EJIT_ASAN_ROTATION_WINDOW;
+    }
+  }
+  if (C.slot != Slot)
+    return 0;
+  --C.countdown;
+  if (C.checks != 0xFFFFFFFFu)
+    ++C.checks;
+  return 1;
+}
+
+/// Mismatch hook, called from the stub's cold block with the site id, the
+/// actual bound-pointer argument of this call, and the value the stub saw
+/// there. The first mismatch freezes {value, argument} (the family member
+/// that diverged); every mismatch grows the saturating count.
+extern "C" void __ejit_asan_mismatch(uint32_t SiteId, const void *Arg,
+                                     uint64_t ValueSeen) {
+  if (SiteId >= EJIT_ASAN_MAX_SITES)
+    return;
+  EJitAsanSite &S = gEJitAsanState.sites[SiteId];
+  if (S.published.loadAcquire() == 0)
+    return;
+  EJitAsanSticky &R = gEJitAsanState.sticky[SiteId];
+  if (R.count.loadRelaxed() < 0xFFFFu)
+    R.count.fetchAddRelaxed(1);
+  // Freeze protocol: CAS 0->1 elects the single freezing writer; only the
+  // winner stores the fields, then publishes with release (2 = frozen and
+  // complete). Losers never store, so the frozen pair cannot be clobbered;
+  // readers acquire the flag and skip a row caught mid-freeze (== 1).
+  uint32_t Expected = 0;
+  if (R.recorded.compareExchange(Expected, 1u)) {
+    R.firstValue = ValueSeen;
+    R.firstArg = reinterpret_cast<uint64_t>(Arg);
+    R.recorded.storeRelease(2u);
+  }
+}
+
 bool EJitAsan::sameRequest(const EJitCompileRequest &A,
                                      const EJitCompileRequest &B) {
   if (A.funcIndex != B.funcIndex || A.numDims != B.numDims ||
@@ -57,7 +194,14 @@ bool EJitAsan::sameRequest(const EJitCompileRequest &A,
 
 void EJitAsan::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
                                    EJitAsanCapture Capture) {
-  if (Capture.watches.empty() && !Capture.uncovered && !Capture.dropped)
+  // Backfill the version generation on the emitted entry sites now that the
+  // request identity is known; the pipeline-end emitter publishes them
+  // during the compile itself.
+  for (const auto &EF : Capture.entryFolds)
+    if (EF.siteId != kEJitAsanNoSite)
+      gEJitAsanState.sites[EF.siteId].gen = Req.generation;
+  if (Capture.watches.empty() && Capture.entryFolds.empty() &&
+      !Capture.uncovered && !Capture.dropped)
     return;
   if (pending_.size() + live_.size() >= MaxVersions) {
     dropped_ += Capture.watches.size() + Capture.uncovered + Capture.dropped;
@@ -217,6 +361,36 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
         if (Yield)
           Yield(YieldCtx, YieldDelayTicks);
       }
+  // Entry-instrumentation rows, read from the shared blob: sites whose
+  // sticky record ever froze a mismatch. object=bound@<arg> carries the
+  // actual bound-pointer argument of the first diverging call — the family
+  // member that broke the fold's consistency, which no worker-side probe
+  // can name. Entry rows have no residue (the stub reads the current
+  // pointer's field directly, nothing to enumerate) and no rate (counting
+  // every executed check would put an atomic in the hot path); `src=boundN`
+  // names the bound-pointer argument the field was reached through.
+  const uint32_t Sites = gEJitAsanState.siteCounter.loadRelaxed();
+  for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si) {
+    const EJitAsanSite &S = gEJitAsanState.sites[Si];
+    if (S.published.loadRelaxed() == 0)
+      continue;
+    const EJitAsanSticky &R = gEJitAsanState.sticky[Si];
+    if (R.recorded.loadRelaxed() < 2)
+      continue; // Never mismatched, or caught mid-freeze (== 1).
+    unsigned Count = R.count.loadRelaxed();
+    if (Count > 0xFFFF)
+      Count = 0xFFFF;
+    EJIT_DIAG_RAW(
+        "[EJIT-ASAN] MISMATCH tier=%u gen=%u period=%s fn=%s "
+        "object=bound@0x%llx offset=0x%llx src=bound%u kind=entry "
+        "expected=0x%llx first=0x%llx count=%u",
+        S.tier, S.gen, S.period, S.function,
+        (unsigned long long)R.firstArg, (unsigned long long)S.byteOffset,
+        S.argNo, (unsigned long long)S.expected,
+        (unsigned long long)R.firstValue, Count);
+    if (Yield)
+      Yield(YieldCtx, YieldDelayTicks);
+  }
 }
 
 void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
@@ -231,18 +405,29 @@ void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
       checks_ ? (unsigned)((mismatchSamples_ * 1000) / checks_) : 0;
   if (GlobalRate > 1000)
     GlobalRate = 1000;
+  // Entry-instrumentation volume: per-core served checks (summed across the
+  // shared cells) and sites whose sticky record froze a mismatch.
+  uint64_t EntryChecks = 0, EntrySites = 0;
+  for (const auto &Cell : gEJitAsanState.cells)
+    EntryChecks += Cell.checks;
+  const uint32_t Sites = gEJitAsanState.siteCounter.loadRelaxed();
+  for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si)
+    if (gEJitAsanState.sites[Si].published.loadRelaxed() &&
+        gEJitAsanState.sticky[Si].recorded.loadRelaxed() >= 2)
+      ++EntrySites;
   EJIT_DIAG_RAW(
       "[EJIT-ASAN] versions=%zu staged=%zu watches=%u/%u%s "
       "checked_active=%llu/%llu checks=%llu mismatch_samples=%llu "
       "rate=%u.%u%% recorded=%u uncovered=%llu dropped=%llu "
-      "blocked_root=%llu retired=%llu",
+      "blocked_root=%llu retired=%llu entry_checks=%llu entry_sites=%llu",
       live_.size(), pending_.size(), retainedWatches_, MaxWatches,
       Full ? " FULL" : "",
       (unsigned long long)checkedActiveProbes_,
       (unsigned long long)activeProbes_, (unsigned long long)checks_,
       (unsigned long long)mismatchSamples_, GlobalRate / 10u, GlobalRate % 10u,
       Recorded, (unsigned long long)uncovered_, (unsigned long long)dropped_,
-      (unsigned long long)blockedRoot_, (unsigned long long)retired_);
+      (unsigned long long)blockedRoot_, (unsigned long long)retired_,
+      (unsigned long long)EntryChecks, (unsigned long long)EntrySites);
   if (Yield)
     Yield(YieldCtx, YieldDelayTicks);
 }

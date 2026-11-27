@@ -101,6 +101,9 @@ struct SpecializationContext {
   uint64_t cacheKey = 0;
 #ifdef EJIT_ASAN
   EJitAsanCapture *asanCapture = nullptr;
+  /// When set (ejit_enable_asan_mode() before ejit_init), the pipeline-end
+  /// emitter inserts the entry-check stub for captured bound folds.
+  bool asanEntryChecks = false;
 #endif
   struct DimInfo {
     std::string periodName;

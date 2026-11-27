@@ -487,6 +487,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (CollectAsan && request && asan_) {
     ctx.asanCapture = &VerifyCapture;
   }
+  ctx.asanEntryChecks = config_.enableAsanEntryChecks;
 #endif
   if (request && request->boundCount) {
     for (uint32_t I = 0; I < request->boundCount; ++I) {

@@ -9,6 +9,7 @@
 #ifndef LLVM_LIB_EXECUTIONENGINE_EJIT_EJITASAN_H
 #define LLVM_LIB_EXECUTIONENGINE_EJIT_EJITASAN_H
 
+#include "EJitAsanState.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include <string>
@@ -90,10 +91,26 @@ struct EJitAsanWatch {
   SmallVector<FirstMismatch, 2> first;
 };
 
+// One bound fold eligible for the entry stub: a constant-offset fold through
+// a bound_ptr argument (modulus == 1). The specialized entry can re-load the
+// field through the CURRENT bound argument — the only place the current
+// family member is observable. siteId stays kEJitAsanNoSite until the
+// pipeline-end emitter publishes it (EJitOptimizer emitAsanEntryChecks).
+struct EJitAsanEntryFold {
+  std::string period;
+  uint32_t siteId = 0; // kEJitAsanNoSite until published
+  uint32_t argNo = 0;  // Bound-pointer argument index.
+  uint64_t byteOffset = 0;
+  uint64_t expected = 0;
+  uint8_t width = 0;
+  uint8_t align = 0; // Field alignment in bytes.
+};
+
 // Compile-side only. No LLVM IR or borrowed calling arguments survive capture.
 struct EJitAsanCapture {
   static constexpr unsigned MaxWatches = 128;
   std::vector<EJitAsanWatch> watches;
+  std::vector<EJitAsanEntryFold> entryFolds;
   unsigned uncovered = 0;
   unsigned dropped = 0;
 };
