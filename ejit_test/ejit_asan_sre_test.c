@@ -1,5 +1,5 @@
-// Build with normal spec5 Clang. Use a verifier runtime configured with
-// EJIT_WORKER_VERIFY_PERIOD=worker_verify_cell. No new Clang flag.
+// Build with normal spec5 Clang and a verifier-enabled runtime; the demo
+// period is asan_cell. No new Clang flag.
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include <stdint.h>
 
@@ -16,43 +16,43 @@ struct VerifyCell {
 };
 
 __attribute__((section(".mc_shared"), aligned(64)))
-EJIT_GROUP(worker_verify_cell)
-struct VerifyCell gEJitWorkerVerifyCells[2];
+EJIT_GROUP(asan_cell)
+struct VerifyCell gEJitAsanCells[2];
 
 EJIT_ENTRY __attribute__((noinline))
-uint32_t ejit_worker_verify_probe(EJIT_DIM(worker_verify_cell) uint8_t cell,
+uint32_t ejit_asan_probe(EJIT_DIM(asan_cell) uint8_t cell,
                                  EJIT_FREE_DIM uint16_t slot, uint32_t token) {
-  return gEJitWorkerVerifyCells[cell].slot5[slot % 5].value +
-         gEJitWorkerVerifyCells[cell].slot10[slot % 10].value + token;
+  return gEJitAsanCells[cell].slot5[slot % 5].value +
+         gEJitAsanCells[cell].slot10[slot % 10].value + token;
 }
 
-int test_ejit_worker_verify_start(void) {
+int test_ejit_asan_start(void) {
   if (ejit_sre_current_core_id() != 6)
     return -1;
   ejit_set_log_level(EJIT_LOG_INFO);
   return ejit_init_pgo(0);
 }
 
-int test_ejit_worker_verify_sample(void) {
+int test_ejit_asan_sample(void) {
   if (ejit_sre_current_core_id() != 16 || ejit_init_pgo(0) != EJIT_OK)
     return -1;
   for (uint32_t i = 0; i != 5; ++i)
-    __atomic_store_n(&gEJitWorkerVerifyCells[1].slot5[i].value, 7,
+    __atomic_store_n(&gEJitAsanCells[1].slot5[i].value, 7,
                      __ATOMIC_RELEASE);
   for (uint32_t i = 0; i != 10; ++i)
-    __atomic_store_n(&gEJitWorkerVerifyCells[1].slot10[i].value, 9,
+    __atomic_store_n(&gEJitAsanCells[1].slot10[i].value, 9,
                      __ATOMIC_RELEASE);
   ejit_taskpool_stats_t before = {0};
   if (ejit_taskpool_get_stats(&before) != EJIT_OK ||
-      ejit_activate("worker_verify_cell", 1) != EJIT_OK)
+      ejit_activate("asan_cell", 1) != EJIT_OK)
     return -2;
-  if (ejit_worker_verify_probe(1, 0, 0) != 16)
+  if (ejit_asan_probe(1, 0, 0) != 16)
     return -3;
   ejit_status_t publish = ejit_publish_pending_code();
   if (publish != EJIT_OK && publish != EJIT_ERR_DISABLED)
     return -4;
   for (uint32_t i = 1; i <= 65536; ++i) {
-    if (ejit_worker_verify_probe(1, (uint16_t)i, i) != i + 16)
+    if (ejit_asan_probe(1, (uint16_t)i, i) != i + 16)
       return -5;
     if ((i & 15) != 0)
       continue;
@@ -70,13 +70,13 @@ int test_ejit_worker_verify_sample(void) {
 }
 
 // Diagnostic injection. Leave the period active and do not call the probe.
-int test_ejit_worker_verify_inject(void) {
+int test_ejit_asan_inject(void) {
   if (ejit_sre_current_core_id() != 16 ||
-      !ejit_is_active("worker_verify_cell", 1))
+      !ejit_is_active("asan_cell", 1))
     return -1;
-  __atomic_store_n(&gEJitWorkerVerifyCells[1].slot5[4].value, 17,
+  __atomic_store_n(&gEJitAsanCells[1].slot5[4].value, 17,
                    __ATOMIC_RELEASE);
-  __atomic_store_n(&gEJitWorkerVerifyCells[1].slot10[9].value, 19,
+  __atomic_store_n(&gEJitAsanCells[1].slot10[9].value, 19,
                    __ATOMIC_RELEASE);
   return 0;
 }

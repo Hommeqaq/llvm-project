@@ -35,10 +35,10 @@ endif()
 
 # Worker-only substitution verifier tests: host-only build shape (no SRE
 # worker core pinning, no batched publish) mirroring the EJITTests gates above.
-if(EJIT_WORKER_VERIFY_SUBSTITUTION AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+if(EJIT_ASAN AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
    AND NOT EJIT_FREESTANDING AND NOT EJIT_CODE_POOL_BATCHED_PUBLISH AND
    EJIT_SRE_SHARED_TASKPOOL_WORKER_CORE STREQUAL "")
-  target_sources(EJITTests PRIVATE EJitWorkerVerifierTest.cpp)
+  target_sources(EJITTests PRIVATE EJitAsanTest.cpp)
   target_include_directories(EJITTests PRIVATE
     "${LLVM_MAIN_SRC_DIR}/lib/ExecutionEngine/EJIT")
 endif()

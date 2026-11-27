@@ -29,7 +29,7 @@ namespace llvm {
 class PHINode;
 namespace ejit {
 
-struct EJitWorkerVerifyCapture;
+struct EJitAsanCapture;
 
 struct GVPeriodInfo {
   std::string periodName;
@@ -119,9 +119,9 @@ public:
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  void setWorkerVerifyCapture(EJitWorkerVerifyCapture *Capture) {
-    workerVerify_ = Capture;
+#ifdef EJIT_ASAN
+  void setAsanCapture(EJitAsanCapture *Capture) {
+    asanCapture_ = Capture;
   }
 #endif
 
@@ -131,8 +131,8 @@ private:
   std::vector<EJitPeriodConstLoadSite> inventory(ModuleT &M, OnLoad Found) const;
 #endif
 
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  EJitWorkerVerifyCapture *workerVerify_ = nullptr;
+#ifdef EJIT_ASAN
+  EJitAsanCapture *asanCapture_ = nullptr;
 #endif
   PeriodArrayRegistry &registry_;
   SmallVector<EJitBoundPointerView, kEJitMaxBoundPointers> boundPointers_;

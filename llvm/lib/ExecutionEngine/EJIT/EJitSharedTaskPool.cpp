@@ -996,9 +996,9 @@ bool EJitSharedTaskPool::versionsCurrent(const EJitCompileRequest &req) const {
   return true;
 }
 
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-bool EJitSharedTaskPool::requestWorkerVerifyDump() {
-  if (!asyncServiceAvailable() || !workerVerifyFn_ ||
+#ifdef EJIT_ASAN
+bool EJitSharedTaskPool::requestAsanDump() {
+  if (!asyncServiceAvailable() || !asanFn_ ||
       state_->ownerCoreId.loadAcquire() != EJitCoreId::current())
     return false;
   // Synchronous report: print rows + stats in the CALLER's context (the
@@ -1006,12 +1006,12 @@ bool EJitSharedTaskPool::requestWorkerVerifyDump() {
   // the verifier lives on) and return only when the report is complete.
   // The verifier excludes the worker's periodic scan while the report
   // prints, so compile/publish work keeps the core but never the scan.
-  workerVerifyFn_(workerVerifyCtx_, true);
+  asanFn_(asanCtx_, true);
   return true;
 }
 
 std::optional<bool>
-EJitSharedTaskPool::workerVerifyLive(const EJitCompileRequest &Req,
+EJitSharedTaskPool::asanLive(const EJitCompileRequest &Req,
                                     uintptr_t Fn) const {
   if (!state_ || !Fn || Req.numDims > kEJitSharedMaxDims ||
       state_->initState.loadAcquire() != kReady ||
@@ -3401,9 +3401,9 @@ void EJitSharedTaskPool::runCompile(const EJitCompileRequest &req,
     return;
   }
   void *fn = nullptr;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  bool ok = workerVerifyCompileFn_
-                ? workerVerifyCompileFn_(workerVerifyCtx_, req, &fn)
+#ifdef EJIT_ASAN
+  bool ok = asanCompileFn_
+                ? asanCompileFn_(asanCtx_, req, &fn)
                 : compileFn_ && compileFn_(compileCtx_, req, &fn);
 #else
   bool ok = compileFn_ && compileFn_(compileCtx_, req, &fn);
@@ -3645,9 +3645,9 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
       return EJitWorkerStep::Consumed;
     if (serviceAutoTier2Publish())
       return EJitWorkerStep::Consumed;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-    if (workerVerifyFn_)
-      workerVerifyFn_(workerVerifyCtx_, false);
+#ifdef EJIT_ASAN
+    if (asanFn_)
+      asanFn_(asanCtx_, false);
 #endif
     return EJitWorkerStep::Idle;
   case EJitSharedInitState::Initializing:

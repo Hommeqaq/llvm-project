@@ -1,4 +1,4 @@
-//===-- EJitWorkerVerifierTest.cpp - Worker-only substitution checks ------===//
+//===-- EJitAsanTest.cpp - Worker-only substitution checks ------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "EJitWorkerVerifier.h"
+#include "EJitAsan.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOptimizer.h"
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
@@ -68,7 +68,7 @@ std::string printModule(const Module &M) {
 void codeMarker() {}
 } // namespace
 
-TEST(EJitWorkerVerifier, CapturesEveryResidueWithoutChangingIR) {
+TEST(EJitAsan, CapturesEveryResidueWithoutChangingIR) {
   for (bool Local : {false, true})
     for (unsigned Mod : {5u, 10u}) {
       SCOPED_TRACE(::testing::Message() << Local << ':' << Mod);
@@ -89,8 +89,8 @@ TEST(EJitWorkerVerifier, CapturesEveryResidueWithoutChangingIR) {
       Ctx.dimensions.push_back({"cell", 1});
       EJitOptimizer Reference(Registry);
       Reference.runPipeline(*Without, Ctx);
-      EJitWorkerVerifyCapture Capture;
-      Ctx.workerVerify = &Capture;
+      EJitAsanCapture Capture;
+      Ctx.asanCapture = &Capture;
       EJitOptimizer Observed(Registry);
       Observed.runPipeline(*With, Ctx);
       EXPECT_EQ(printModule(*With), printModule(*Without));
@@ -108,7 +108,7 @@ TEST(EJitWorkerVerifier, CapturesEveryResidueWithoutChangingIR) {
     }
 }
 
-TEST(EJitWorkerVerifier, CapturesPhiWitnessFoldUnderWitnessBinding) {
+TEST(EJitAsan, CapturesPhiWitnessFoldUnderWitnessBinding) {
   // A period_const load whose byte-offset GEP chain passes through a merge
   // PHI only folds via the phi-witness path: every feasible PHI binding
   // must fold to the same constant, and the fold exports the binding it
@@ -213,8 +213,8 @@ TEST(EJitWorkerVerifier, CapturesPhiWitnessFoldUnderWitnessBinding) {
   Ctx.tier = CompileTier::Baseline;
   EJitOptimizer Reference(Registry);
   Reference.runPipeline(*Without, Ctx);
-  EJitWorkerVerifyCapture Capture;
-  Ctx.workerVerify = &Capture;
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
   EJitOptimizer Observed(Registry);
   Observed.runPipeline(*With, Ctx);
   EXPECT_EQ(printModule(*With), printModule(*Without));
@@ -238,23 +238,23 @@ TEST(EJitWorkerVerifier, CapturesPhiWitnessFoldUnderWitnessBinding) {
                                          FieldOffset));
 }
 
-TEST(EJitWorkerVerifier, ReportsTailResidueOnlyAfterPublication) {
+TEST(EJitAsan, ReportsTailResidueOnlyAfterPublication) {
   auto State = std::make_unique<EJitSharedTaskPoolState>();
   EJitSharedTaskPool Pool;
   Pool.bind(State.get());
   Pool.setMode(EJitCompileMode::Async);
-  EJitWorkerVerifier Verifier;
+  EJitAsan Verifier;
   uint32_t Data[5] = {7, 7, 7, 7, 7};
   uintptr_t Root = reinterpret_cast<uintptr_t>(Data);
   struct Context {
-    EJitWorkerVerifier &verifier;
+    EJitAsan &verifier;
     uint32_t (&data)[5];
     uintptr_t &root;
   } Ctx{Verifier, Data, Root};
   Pool.setCompiler(
       [](void *Ptr, const EJitCompileRequest &Req, void **Out) {
         auto &C = *static_cast<Context *>(Ptr);
-        EJitWorkerVerifyCapture Capture;
+        EJitAsanCapture Capture;
         auto &W = Capture.watches.emplace_back();
         W.function = "probe";
         W.object = "cfg";
@@ -267,7 +267,7 @@ TEST(EJitWorkerVerifier, ReportsTailResidueOnlyAfterPublication) {
         W.littleEndian = *reinterpret_cast<uint8_t *>(&Endian) != 0;
         for (auto &Value : C.data)
           W.addresses.push_back(reinterpret_cast<uintptr_t>(&Value));
-        EJitWorkerVerifyWatch Leaf;
+        EJitAsanWatch Leaf;
         Leaf.function = "probe";
         Leaf.object = "pointer_cfg";
         Leaf.period = "cell";

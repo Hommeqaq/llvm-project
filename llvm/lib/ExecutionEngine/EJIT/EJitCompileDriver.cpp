@@ -2,8 +2,8 @@
 
 #include "llvm/ExecutionEngine/EJIT/EJitCompileDriver.h"
 #include "EJitCodePoolCounters.h"
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-#include "EJitWorkerVerifier.h"
+#ifdef EJIT_ASAN
+#include "EJitAsan.h"
 #endif
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -199,28 +199,28 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.setCompiler(&taskpoolCompileThunk, this);
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
   sharedPool_.setPeriodConstRankingCallback(&sharedPeriodConstRankingThunk, this);
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  sharedPool_.setWorkerVerifyCallbacks(
+#ifdef EJIT_ASAN
+  sharedPool_.setAsanCallbacks(
       [](void *Ctx, const EJitCompileRequest &Req, void **Fn) {
         auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
-        *Fn = Driver->compileNow(Req, /*CollectVerify=*/true);
+        *Fn = Driver->compileNow(Req, /*CollectAsan=*/true);
         return *Fn != nullptr;
       },
       [](void *Ctx, bool Dump) {
         auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
-        if (!Driver->workerVerifier_)
+        if (!Driver->asan_)
           return;
         // Same platform primitive as the worker loop's per-round yield, so a
         // verifier slice feeds the watchdog exactly like the loop; report
         // rows pace themselves with the verifier's fixed yield delay.
         auto Delay = [](void *, uint32_t Ticks) { EJitSreTask::delay(Ticks); };
         // The pool calls this either from its worker idle path (the periodic
-        // scan, Dump=false) or directly from ejit_worker_verify_dump() (the
+        // scan, Dump=false) or directly from ejit_asan_dump() (the
         // synchronous report, Dump=true, in the caller's context).
         if (Dump)
-          Driver->workerVerifier_->dumpNow(Driver->sharedPool_, Delay);
+          Driver->asan_->dumpNow(Driver->sharedPool_, Delay);
         else
-          Driver->workerVerifier_->idle(Driver->sharedPool_, Delay);
+          Driver->asan_->idle(Driver->sharedPool_, Delay);
       },
       this);
 #endif
@@ -319,16 +319,16 @@ bool EJitCompileDriver::sharedOwnerElected(void *ctx) {
   auto *Driver = static_cast<EJitCompileDriver *>(ctx);
   if (!Driver->ensureJitEngine())
     return false;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  Driver->workerVerifier_ = std::make_unique<EJitWorkerVerifier>();
+#ifdef EJIT_ASAN
+  Driver->asan_ = std::make_unique<EJitAsan>();
 #endif
   return true;
 }
 
 void EJitCompileDriver::sharedOwnerReleased(void *ctx) {
   auto *Driver = static_cast<EJitCompileDriver *>(ctx);
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  Driver->workerVerifier_.reset();
+#ifdef EJIT_ASAN
+  Driver->asan_.reset();
 #endif
   Driver->releaseJitEngine();
 }
@@ -417,7 +417,7 @@ void EJitCompileDriver::registerSymbol(const std::string &name, void *addr) {
 void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
                                      bool storeLru,
                                      const EJitCompileRequest *request,
-                                     [[maybe_unused]] bool CollectVerify) {
+                                     [[maybe_unused]] bool CollectAsan) {
   // ── Cold path: decode cacheKey, verify, compile ────────────────────────
   uint32_t funcIdx = static_cast<uint32_t>(cacheKey >> 32);
   uint8_t dims[4] = {
@@ -479,13 +479,13 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   ctx.optLevel = config_.optLevel;
   for (unsigned i = 0; i < dimCount; ++i)
     ctx.dimensions.push_back({periodNames[i], dims[i]});
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
   // All-period capture: every worker compile whose request collects verifier
   // data records every coverable fold of every registered period; each watch
   // carries its own source period for the dump rows.
-  EJitWorkerVerifyCapture VerifyCapture;
-  if (CollectVerify && request && workerVerifier_) {
-    ctx.workerVerify = &VerifyCapture;
+  EJitAsanCapture VerifyCapture;
+  if (CollectAsan && request && asan_) {
+    ctx.asanCapture = &VerifyCapture;
   }
 #endif
   if (request && request->boundCount) {
@@ -657,9 +657,9 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   }
 
   void *funcPtr = *addrOrErr;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  if (ctx.workerVerify)
-    workerVerifier_->onCompiled(*request, reinterpret_cast<uintptr_t>(funcPtr),
+#ifdef EJIT_ASAN
+  if (ctx.asanCapture)
+    asan_->onCompiled(*request, reinterpret_cast<uintptr_t>(funcPtr),
                                 std::move(VerifyCapture));
 #endif
 
@@ -774,14 +774,14 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
 }
 
 void *EJitCompileDriver::compileNow(const EJitCompileRequest &req,
-                                    bool CollectVerify) {
+                                    bool CollectAsan) {
   if (!EJitSharedTaskPool::validCompileRequest(req))
     return nullptr;
-  return compileNowValidated(req, CollectVerify);
+  return compileNowValidated(req, CollectAsan);
 }
 
 void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req,
-                                             bool CollectVerify) {
+                                             bool CollectAsan) {
   // PGO tier rides in req.funcIndex's top 2 bits (EJitTaskPoolTypes.h). Strip it to
   // recover the real funcIndex - the loader lookup and cacheKey must NOT carry
   // tier (Tier-1 and Tier-2 of the same (funcIndex, dims) share one cacheKey,
@@ -836,14 +836,14 @@ void *EJitCompileDriver::compileNowValidated(const EJitCompileRequest &req,
   EJIT_DIAG("compileNow dispatch func=%u key=0x%016lx dims=[%u,%u,%u,%u]",
             funcIdx, cacheKey, packedDims[0], packedDims[1], packedDims[2],
             packedDims[3]);
-  return compileCold(cacheKey, tier, /*storeLru=*/false, &req, CollectVerify);
+  return compileCold(cacheKey, tier, /*storeLru=*/false, &req, CollectAsan);
 }
 
 void EJitCompileDriver::notifyTaskpoolPublished(const EJitCompileRequest &req,
                                                 bool published) {
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  if (workerVerifier_)
-    workerVerifier_->onPublished(req, published);
+#ifdef EJIT_ASAN
+  if (asan_)
+    asan_->onPublished(req, published);
 #endif
 #if defined(EJIT_SRE_PGO_BRANCH_AUDIT) && defined(EJIT_DIAG_ENABLE)
   const uint32_t AuditTier = decodeReqTier(req.funcIndex);

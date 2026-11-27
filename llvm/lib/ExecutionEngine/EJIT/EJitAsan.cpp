@@ -1,4 +1,4 @@
-//===-- EJitWorkerVerifier.cpp - Worker-only substitution checks ----------===//
+//===-- EJitAsan.cpp - Worker-only substitution checks ----------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "EJitWorkerVerifier.h"
+#include "EJitAsan.h"
 #include "llvm/ExecutionEngine/EJIT/EJitDiag.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -42,7 +42,7 @@ uint64_t readWatch(uintptr_t Address, unsigned Width, bool LittleEndian) {
 }
 } // namespace
 
-bool EJitWorkerVerifier::sameRequest(const EJitCompileRequest &A,
+bool EJitAsan::sameRequest(const EJitCompileRequest &A,
                                      const EJitCompileRequest &B) {
   if (A.funcIndex != B.funcIndex || A.numDims != B.numDims ||
       A.generation != B.generation)
@@ -55,15 +55,15 @@ bool EJitWorkerVerifier::sameRequest(const EJitCompileRequest &A,
   return true;
 }
 
-void EJitWorkerVerifier::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
-                                   EJitWorkerVerifyCapture Capture) {
+void EJitAsan::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
+                                   EJitAsanCapture Capture) {
   if (Capture.watches.empty() && !Capture.uncovered && !Capture.dropped)
     return;
   if (pending_.size() + live_.size() >= MaxVersions) {
     dropped_ += Capture.watches.size() + Capture.uncovered + Capture.dropped;
     // Budget failures must be discoverable at compile time, not only in a
     // later dump: one line per dropped capture (rare anomaly, not scanning).
-    EJIT_DIAG("[WORKER-VERIFY] capture DROPPED: version budget full "
+    EJIT_DIAG("[EJIT-ASAN] capture DROPPED: version budget full "
               "(tracked=%zu cap=%u) fn=%u watches=%u uncovered=%u",
               pending_.size() + live_.size(), MaxVersions,
               stripReqTier(Req.funcIndex),
@@ -77,9 +77,9 @@ void EJitWorkerVerifier::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
     ++Trimmed;
   }
   if (Capture.dropped) {
-    // Either the per-capture fold cap (EJitWorkerVerifyCapture::MaxWatches)
+    // Either the per-capture fold cap (EJitAsanCapture::MaxWatches)
     // or the global watch budget trimmed this capture.
-    EJIT_DIAG("[WORKER-VERIFY] capture TRIMMED: dropped=%u (global watch "
+    EJIT_DIAG("[EJIT-ASAN] capture TRIMMED: dropped=%u (global watch "
               "budget trim=%u, retained=%u+%zu cap=%u) fn=%u",
               Capture.dropped, Trimmed, retainedWatches_,
               Capture.watches.size(), MaxWatches,
@@ -97,7 +97,7 @@ void EJitWorkerVerifier::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
   pending_.push_back({Identity, Fn, std::move(Capture)});
 }
 
-void EJitWorkerVerifier::onPublished(const EJitCompileRequest &Req,
+void EJitAsan::onPublished(const EJitCompileRequest &Req,
                                     bool Published) {
   for (auto I = pending_.begin(); I != pending_.end(); ++I) {
     if (!sameRequest(I->request, Req))
@@ -119,7 +119,7 @@ void EJitWorkerVerifier::onPublished(const EJitCompileRequest &Req,
   }
 }
 
-void EJitWorkerVerifier::dropCurrent() {
+void EJitAsan::dropCurrent() {
   auto &Current = live_[cursor_];
   for (const auto &W : Current.capture.watches) {
     activeProbes_ -= W.addresses.size();
@@ -135,12 +135,12 @@ void EJitWorkerVerifier::dropCurrent() {
   ++retired_;
 }
 
-void EJitWorkerVerifier::advance() {
+void EJitAsan::advance() {
   if (++cursor_ == live_.size())
     cursor_ = 0;
 }
 
-void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
+void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
                                            void *YieldCtx) const {
   // Dump-only console output. Every location that has EVER mismatched is
   // reported (sticky: recovery does not unregister it), with its saturating
@@ -180,7 +180,7 @@ void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
                                      : "value";
         if (W.freeArg != 0xFF)
           EJIT_DIAG_RAW(
-              "[WORKER-VERIFY] MISMATCH tier=%u gen=%u "
+              "[EJIT-ASAN] MISMATCH tier=%u gen=%u "
               "dims=%u:%u@%u,%u:%u@%u,%u:%u@%u,%u:%u@%u "
               "period=%s fn=%s object=%s@0x%llx offset=0x%llx src=arg%u "
               "residue=%u/%zu kind=%s expected=0x%llx first=0x%llx "
@@ -198,7 +198,7 @@ void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
               W.count[R], W.samples[R], Rate / 10u, Rate % 10u);
         else
           EJIT_DIAG_RAW(
-              "[WORKER-VERIFY] MISMATCH tier=%u gen=%u "
+              "[EJIT-ASAN] MISMATCH tier=%u gen=%u "
               "dims=%u:%u@%u,%u:%u@%u,%u:%u@%u,%u:%u@%u "
               "period=%s fn=%s object=%s@0x%llx offset=0x%llx src=const "
               "residue=%u/%zu kind=%s expected=0x%llx first=0x%llx "
@@ -219,7 +219,7 @@ void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
       }
 }
 
-void EJitWorkerVerifier::dump(VerifyYieldFn Yield, void *YieldCtx) const {
+void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
   unsigned Recorded = 0;
   for (const auto &V : live_)
     for (const auto &W : V.capture.watches)
@@ -232,7 +232,7 @@ void EJitWorkerVerifier::dump(VerifyYieldFn Yield, void *YieldCtx) const {
   if (GlobalRate > 1000)
     GlobalRate = 1000;
   EJIT_DIAG_RAW(
-      "[WORKER-VERIFY] versions=%zu staged=%zu watches=%u/%u%s "
+      "[EJIT-ASAN] versions=%zu staged=%zu watches=%u/%u%s "
       "checked_active=%llu/%llu checks=%llu mismatch_samples=%llu "
       "rate=%u.%u%% recorded=%u uncovered=%llu dropped=%llu "
       "blocked_root=%llu retired=%llu",
@@ -247,7 +247,7 @@ void EJitWorkerVerifier::dump(VerifyYieldFn Yield, void *YieldCtx) const {
     Yield(YieldCtx, YieldDelayTicks);
 }
 
-void EJitWorkerVerifier::scanSlice(const EJitSharedTaskPool &Pool,
+void EJitAsan::scanSlice(const EJitSharedTaskPool &Pool,
                                    VerifyYieldFn Yield, void *YieldCtx) {
   bool Worked = false;
   for (unsigned N = 0; N < StepBudget && !live_.empty(); ++N) {
@@ -255,15 +255,15 @@ void EJitWorkerVerifier::scanSlice(const EJitSharedTaskPool &Pool,
     // Interleave a platform tick inside one slice so a print-heavy dump or a
     // large configured step budget cannot starve the worker's heartbeat
     // (bare-metal watchdog) between the loop's own per-round yields.
-    if (Yield && EJIT_WORKER_VERIFY_YIELD_EVERY &&
-        N % EJIT_WORKER_VERIFY_YIELD_EVERY == 0 && N != 0)
+    if (Yield && EJIT_ASAN_YIELD_EVERY &&
+        N % EJIT_ASAN_YIELD_EVERY == 0 && N != 0)
       Yield(YieldCtx, YieldDelayTicks);
     // References are taken fresh every step: during a direct dump these
     // in-slice yields let the worker task consume compiles, and a completed
     // compile appends to live_ (reallocating it), so nothing may be held
     // across a yield.
     auto &V = live_[cursor_];
-    auto IsLive = Pool.workerVerifyLive(V.request, V.function);
+    auto IsLive = Pool.asanLive(V.request, V.function);
     if (!IsLive || !*IsLive) {
       if (IsLive)
         dropCurrent();
@@ -284,7 +284,7 @@ void EJitWorkerVerifier::scanSlice(const EJitSharedTaskPool &Pool,
       Root = __atomic_load_n(PointerSlot, __ATOMIC_ACQUIRE);
       ChangedRoot = Root != W.expectedRoot;
     }
-    IsLive = Pool.workerVerifyLive(V.request, V.function);
+    IsLive = Pool.asanLive(V.request, V.function);
     if (!IsLive || !*IsLive) {
       if (IsLive)
         dropCurrent();
@@ -333,7 +333,7 @@ void EJitWorkerVerifier::scanSlice(const EJitSharedTaskPool &Pool,
     Yield(YieldCtx, YieldDelayTicks);
 }
 
-void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool,
+void EJitAsan::idle(const EJitSharedTaskPool &Pool,
                               VerifyYieldFn Yield, void *YieldCtx) {
   // Periodic worker path: never prints, and stands down entirely while a
   // direct dump is printing on this core.
@@ -345,7 +345,7 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool,
   scanSlice(Pool, Yield, YieldCtx);
 }
 
-bool EJitWorkerVerifier::dumpNow(const EJitSharedTaskPool &Pool,
+bool EJitAsan::dumpNow(const EJitSharedTaskPool &Pool,
                                  VerifyYieldFn Yield, void *YieldCtx) {
   // Direct report: run in the CALLER's context (the worker core) and return
   // only when the whole report is out — one scan slice, then one row per

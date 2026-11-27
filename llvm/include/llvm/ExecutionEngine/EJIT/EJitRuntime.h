@@ -421,7 +421,7 @@ void ejit_print_mayconst_ranking(void);
 /// and only then return. EJIT_ERR_NOT_ACTIVE when called off the worker
 /// core or while another report is still printing. Debug builds with
 /// worker substitution verification only.
-ejit_status_t ejit_worker_verify_dump(void);
+ejit_status_t ejit_asan_dump(void);
 
 /// Print the currently-active time-window instances through the platform log:
 /// for each registered period, every active (period, cell) is listed. Works

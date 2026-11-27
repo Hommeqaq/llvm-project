@@ -1,4 +1,4 @@
-//===-- EJitWorkerVerifier.h - Worker-only substitution checks ---*- C++ -*-===//
+//===-- EJitAsan.h - Worker-only substitution checks ---*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIB_EXECUTIONENGINE_EJIT_EJITWORKERVERIFIER_H
-#define LLVM_LIB_EXECUTIONENGINE_EJIT_EJITWORKERVERIFIER_H
+#ifndef LLVM_LIB_EXECUTIONENGINE_EJIT_EJITASAN_H
+#define LLVM_LIB_EXECUTIONENGINE_EJIT_EJITASAN_H
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
@@ -17,38 +17,38 @@
 namespace llvm::ejit {
 
 // Scan pacing and budgets, overridable at build time (target-scoped
-// definitions on LLVMEJIT from the EJIT_WORKER_VERIFY_* CMake cache
+// definitions on LLVMEJIT from the EJIT_ASAN_* CMake cache
 // variables). The #ifndef defaults keep standalone consumers — including the
 // host unit tests, which drive idle() directly and rely on deterministic
 // budgets — independent of any board configuration.
 // Product clock calibration: 1 platform tick ~ 1 ms, so the default
 // IDLE_TICKS is one probe slice every ~5 seconds.
-#ifndef EJIT_WORKER_VERIFY_IDLE_TICKS
-#define EJIT_WORKER_VERIFY_IDLE_TICKS 5000
+#ifndef EJIT_ASAN_IDLE_TICKS
+#define EJIT_ASAN_IDLE_TICKS 5000
 #endif
-#ifndef EJIT_WORKER_VERIFY_STEP_BUDGET
-#define EJIT_WORKER_VERIFY_STEP_BUDGET 32
+#ifndef EJIT_ASAN_STEP_BUDGET
+#define EJIT_ASAN_STEP_BUDGET 32
 #endif
 // 0 disables in-slice yielding (tight-host builds only; leave >= 1 on the
 // board so a print-heavy dump slice cannot starve the watchdog heartbeat).
-#ifndef EJIT_WORKER_VERIFY_YIELD_EVERY
-#define EJIT_WORKER_VERIFY_YIELD_EVERY 8
+#ifndef EJIT_ASAN_YIELD_EVERY
+#define EJIT_ASAN_YIELD_EVERY 8
 #endif
 // Global budgets across all tracked versions: total watches (folded-load
 // sites, each with its residue addresses) and total simultaneous versions.
 // Overrun trims the NEWEST capture (existing watches are never evicted) and
 // counts into `dropped`; the stats line reports watches=<n>/<cap> with a FULL
 // marker once the budget is exhausted.
-#ifndef EJIT_WORKER_VERIFY_MAX_WATCHES
-#define EJIT_WORKER_VERIFY_MAX_WATCHES 81920
+#ifndef EJIT_ASAN_MAX_WATCHES
+#define EJIT_ASAN_MAX_WATCHES 81920
 #endif
-#ifndef EJIT_WORKER_VERIFY_MAX_VERSIONS
-#define EJIT_WORKER_VERIFY_MAX_VERSIONS 1024
+#ifndef EJIT_ASAN_MAX_VERSIONS
+#define EJIT_ASAN_MAX_VERSIONS 1024
 #endif
 
 class EJitSharedTaskPool;
 
-struct EJitWorkerVerifyWatch {
+struct EJitAsanWatch {
   // Widest remainder domain a watch may enumerate (compile-side cap in
   // EJitStructFieldPass.cpp; arrays below are sized to it).
   static constexpr unsigned MaxResidues = 16;
@@ -91,17 +91,17 @@ struct EJitWorkerVerifyWatch {
 };
 
 // Compile-side only. No LLVM IR or borrowed calling arguments survive capture.
-struct EJitWorkerVerifyCapture {
+struct EJitAsanCapture {
   static constexpr unsigned MaxWatches = 128;
-  std::vector<EJitWorkerVerifyWatch> watches;
+  std::vector<EJitAsanWatch> watches;
   unsigned uncovered = 0;
   unsigned dropped = 0;
 };
 
-class EJitWorkerVerifier {
+class EJitAsan {
 public:
   void onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
-                  EJitWorkerVerifyCapture Capture);
+                  EJitAsanCapture Capture);
   void onPublished(const EJitCompileRequest &Req, bool Published);
 
   /// One throttled probe slice on the worker's periodic idle path. Normal
@@ -109,7 +109,7 @@ public:
   /// records and the global counters. Skipped while a direct dump is
   /// printing on this core.
   /// \p Yield, when non-null, feeds the platform tick: once per
-  /// EJIT_WORKER_VERIFY_YIELD_EVERY completed steps while scanning. The
+  /// EJIT_ASAN_YIELD_EVERY completed steps while scanning. The
   /// driver maps it to EJitSreTask::delay, the same primitive the worker
   /// loop's own per-round yield uses.
   using VerifyYieldFn = void (*)(void *Ctx, uint32_t Ticks);
@@ -131,7 +131,7 @@ private:
   struct Version {
     EJitCompileRequest request;
     uintptr_t function;
-    EJitWorkerVerifyCapture capture;
+    EJitAsanCapture capture;
     unsigned watch = 0;
     unsigned residue = 0;
   };
@@ -144,12 +144,12 @@ private:
   void printRecordedRows(VerifyYieldFn Yield, void *YieldCtx) const;
   void dump(VerifyYieldFn Yield, void *YieldCtx) const;
 
-  static constexpr unsigned MaxVersions = EJIT_WORKER_VERIFY_MAX_VERSIONS;
-  static constexpr unsigned MaxWatches = EJIT_WORKER_VERIFY_MAX_WATCHES;
-  static constexpr unsigned IdleTicks = EJIT_WORKER_VERIFY_IDLE_TICKS;
-  static constexpr unsigned StepBudget = EJIT_WORKER_VERIFY_STEP_BUDGET;
+  static constexpr unsigned MaxVersions = EJIT_ASAN_MAX_VERSIONS;
+  static constexpr unsigned MaxWatches = EJIT_ASAN_MAX_WATCHES;
+  static constexpr unsigned IdleTicks = EJIT_ASAN_IDLE_TICKS;
+  static constexpr unsigned StepBudget = EJIT_ASAN_STEP_BUDGET;
   // Verifier yield pacing, deliberately fixed (not a CMake knob): every
-  // platform yield the verifier makes — one per EJIT_WORKER_VERIFY_YIELD_EVERY
+  // platform yield the verifier makes — one per EJIT_ASAN_YIELD_EVERY
   // completed scan steps, after every printed problem row, and once after the
   // stats line — pauses this many platform ticks, so neither a large step
   // budget nor a long report can stress the console or the system.

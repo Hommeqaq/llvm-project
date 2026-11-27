@@ -1,8 +1,8 @@
 //===-- EJitStructFieldPass.cpp - JIT Constant Substitution ---------------===//
 
 #include "llvm/ExecutionEngine/EJIT/EJitStructFieldPass.h"
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-#include "EJitWorkerVerifier.h"
+#ifdef EJIT_ASAN
+#include "EJitAsan.h"
 #endif
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -2386,11 +2386,11 @@ static void logReplaceFailure(LoadInst *LI, const GVPeriodMap &gvMap,
 }
 #endif
 
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
 namespace {
 // Widest remainder domain a watch may enumerate; the per-residue sticky
-// record arrays in EJitWorkerVerifyWatch are sized to this.
-constexpr unsigned MaxVerifyResidues = EJitWorkerVerifyWatch::MaxResidues;
+// record arrays in EJitAsanWatch are sized to this.
+constexpr unsigned MaxAsanResidues = EJitAsanWatch::MaxResidues;
 
 // A single free dim may appear repeatedly, but only behind the same urem.
 // Do not extrapolate the zero witness into a runtime-dependent raw index.
@@ -2431,7 +2431,7 @@ struct VerifyDomain {
         Assumed.values.contains(Op->getOperand(0))) {
       auto *Mod = dyn_cast<ConstantInt>(Op->getOperand(1));
       if (!Mod || Mod->getValue().getLimitedValue() < 2 ||
-          Mod->getValue().getLimitedValue() > MaxVerifyResidues)
+          Mod->getValue().getLimitedValue() > MaxAsanResidues)
         return false;
       unsigned M = Mod->getZExtValue();
       if (slot && (slot != Op->getOperand(0) || modulus != M))
@@ -2467,7 +2467,7 @@ std::optional<uint64_t> verifyBits(Constant *C) {
   return std::nullopt;
 }
 
-void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
+void captureAsan(EJitAsanCapture &Capture, LoadInst &LI,
                          Constant *Frozen, FoldSource Source, bool Absolute,
                          const GVPeriodMap &Periods, PeriodArrayRegistry &Reg,
                          const DataLayout &DL,
@@ -2476,12 +2476,12 @@ void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
 
   auto Uncovered = [&](const char *Reason) {
     ++Capture.uncovered;
-    EJIT_DIAG_VERBOSE("[WORKER-VERIFY] uncovered fn=%s reason=%s",
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] uncovered fn=%s reason=%s",
                       LI.getFunction()->getName().str().c_str(), Reason);
   };
   if (It == Periods.end())
     return Uncovered("no-shared-period-source");
-  if (Capture.watches.size() >= EJitWorkerVerifyCapture::MaxWatches) {
+  if (Capture.watches.size() >= EJitAsanCapture::MaxWatches) {
     ++Capture.dropped;
     return;
   }
@@ -2499,7 +2499,7 @@ void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
   const auto &Info = It->second;
   uintptr_t Base = 0;
   uint64_t Extent = 0;
-  EJitWorkerVerifyWatch Watch;
+  EJitAsanWatch Watch;
   Watch.function = LI.getFunction()->getName().take_front(128).str();
   Watch.object = GV->getName().take_front(128).str();
   Watch.period = It->second.periodName;
@@ -2577,7 +2577,7 @@ void captureWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
 // would be reused after return and produce false mismatches). The report row
 // pins the member with object=bound@<rawPtr> offset=<bytes> and kind=bound;
 // a runtime-borrowed buffer has no source symbol to name.
-void captureBoundWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
+void captureBoundAsan(EJitAsanCapture &Capture, LoadInst &LI,
                               Constant *Frozen, const uint8_t *Data,
                               uint32_t DataSize, StringRef PeriodName,
                               const AssumedArgMap &BoundArguments,
@@ -2585,10 +2585,10 @@ void captureBoundWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
                               const EJitFreeDimAssumptions &Assumed) {
   auto Uncovered = [&](const char *Reason) {
     ++Capture.uncovered;
-    EJIT_DIAG_VERBOSE("[WORKER-VERIFY] uncovered fn=%s reason=%s",
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] uncovered fn=%s reason=%s",
                       LI.getFunction()->getName().str().c_str(), Reason);
   };
-  if (Capture.watches.size() >= EJitWorkerVerifyCapture::MaxWatches) {
+  if (Capture.watches.size() >= EJitAsanCapture::MaxWatches) {
     ++Capture.dropped;
     return;
   }
@@ -2600,7 +2600,7 @@ void captureBoundWorkerVerify(EJitWorkerVerifyCapture &Capture, LoadInst &LI,
       (Width != 1 && Width != 8 && Width != 16 && Width != 32 && Width != 64))
     return Uncovered("unsupported-load-type");
   const unsigned Size = (Width + 7) / 8;
-  EJitWorkerVerifyWatch Watch;
+  EJitAsanWatch Watch;
   Watch.function = LI.getFunction()->getName().take_front(128).str();
   Watch.object = "bound";
   Watch.period = PeriodName.empty() ? StringRef("bound") : PeriodName;
@@ -2657,11 +2657,11 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<Replacement, 8> Roots;
   SmallVector<LoadInst *, 16> PendingFields;
   SmallVector<Replacement, 16> replacements;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
   auto Capture = [&](LoadInst &LI, Constant *C, FoldSource Source, bool Absolute,
                      const EJitFreeDimAssumptions *EffAssumed = nullptr) {
-    if (workerVerify_)
-      captureWorkerVerify(*workerVerify_, LI, C, Source, Absolute,
+    if (asanCapture_)
+      captureAsan(*asanCapture_, LI, C, Source, Absolute,
                           gvPeriodMap_, registry_, DL,
                           EffAssumed ? *EffAssumed : freeDimAssumptions_);
   };
@@ -2688,7 +2688,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       if (Constant *C = tryReplacePeriodPointerBase(
               LI, gvPeriodMap_, registry_, DL)) {
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
         Capture(*LI, C, {findRootGV(LI->getPointerOperand()), 0}, false);
 #endif
         Roots.push_back({LI, C});
@@ -2712,14 +2712,14 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
       // Try each access pattern in order.
       [[maybe_unused]] FoldSource Source;
       FoldSource *Observed = nullptr;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-      if (workerVerify_)
+#ifdef EJIT_ASAN
+      if (asanCapture_)
         Observed = &Source;
 #endif
       Constant *C = tryReplacePeriodAbsoluteAddress(
           LI, F, gvPeriodMap_, periodConstFieldMap_, registry_, DL,
           freeDimAssumptions_, Observed);
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
       const bool Absolute = C != nullptr;
 #endif
 
@@ -2733,9 +2733,9 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
                                      State.boundArguments, DL,
                                      freeDimAssumptions_);
           if (C) {
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-            if (workerVerify_) {
-              captureBoundWorkerVerify(*workerVerify_, *LI, C,
+#ifdef EJIT_ASAN
+            if (asanCapture_) {
+              captureBoundAsan(*asanCapture_, *LI, C,
                                         State.view.rawPtr, State.view.size,
                                         State.periodName,
                                         State.boundArguments, DL,
@@ -2776,7 +2776,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
         C = tryReplaceIndirect(LI, PtrOp, gvPeriodMap_, registry_, DL);
 
       if (C) {
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
         if (!BoundFold)
           Capture(*LI, C, Source, Absolute);
 #endif
@@ -2794,8 +2794,8 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
   for (LoadInst *LI : PendingFields) {
     [[maybe_unused]] FoldSource Source;
     FoldSource *Observed = nullptr;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-    if (workerVerify_)
+#ifdef EJIT_ASAN
+    if (asanCapture_)
       Observed = &Source;
 #endif
     Constant *C = Roots.empty() ? nullptr
@@ -2803,7 +2803,7 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
                                       LI, F, gvPeriodMap_, periodConstFieldMap_,
                                       registry_, DL, freeDimAssumptions_,
                                       Observed);
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
     const bool Absolute = C != nullptr;
     // PHI-witness exports: the fold's source and the PHI binding the
     // residue enumeration must evaluate under (each feasible edge agrees
@@ -2816,14 +2816,14 @@ EJitStructFieldPass::run(Function &F, FunctionAnalysisManager &AM) {
           LI, gvPeriodMap_, periodConstFieldMap_, registry_, DL,
           freeDimAssumptions_,
           F.getName() == boundRootFunction_ ? &localWitnessPeriods_ : nullptr
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
               ,
-              workerVerify_ ? &PhiSource : nullptr,
-              workerVerify_ ? &PhiAssumed : nullptr
+              asanCapture_ ? &PhiSource : nullptr,
+              asanCapture_ ? &PhiAssumed : nullptr
 #endif
       );
     if (C) {
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
+#ifdef EJIT_ASAN
       if (!Absolute)
         // Folded through the witness path: Source was never filled by the
         // absolute attempt, so use the exported witness source and binding.

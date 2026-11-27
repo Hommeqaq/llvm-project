@@ -518,20 +518,20 @@ public:
     periodConstRankingFn_ = fn;
     periodConstRankingCtx_ = ctx;
   }
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  using WorkerVerifyCallback = void (*)(void *, bool);
-  void setWorkerVerifyCallbacks(CompileCallback Compile, WorkerVerifyCallback Fn,
+#ifdef EJIT_ASAN
+  using AsanCallback = void (*)(void *, bool);
+  void setAsanCallbacks(CompileCallback Compile, AsanCallback Fn,
                                 void *Ctx) {
-    workerVerifyCompileFn_ = Compile;
-    workerVerifyFn_ = Fn;
-    workerVerifyCtx_ = Ctx;
+    asanCompileFn_ = Compile;
+    asanFn_ = Fn;
+    asanCtx_ = Ctx;
   }
   /// Print the verify report synchronously in the caller's context (this
   /// must be the owner core) and return when it is complete; false when
   /// called from another core or while another report is printing.
-  bool requestWorkerVerifyDump();
+  bool requestAsanDump();
   /// nullopt means the cache identity could not be snapshotted this time.
-  std::optional<bool> workerVerifyLive(const EJitCompileRequest &Req,
+  std::optional<bool> asanLive(const EJitCompileRequest &Req,
                                        uintptr_t Fn) const;
 #endif
   void setReleaser(ReleaseCallback fn, void *ctx) {
@@ -1332,10 +1332,10 @@ private:
   void *codePoolStatsCtx_ = nullptr;
   PeriodConstRankingCallback periodConstRankingFn_ = nullptr;
   void *periodConstRankingCtx_ = nullptr;
-#ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
-  CompileCallback workerVerifyCompileFn_ = nullptr;
-  WorkerVerifyCallback workerVerifyFn_ = nullptr;
-  void *workerVerifyCtx_ = nullptr;
+#ifdef EJIT_ASAN
+  CompileCallback asanCompileFn_ = nullptr;
+  AsanCallback asanFn_ = nullptr;
+  void *asanCtx_ = nullptr;
 #endif
   CodeReadyCallback codeReadyFn_ = nullptr;
   CodeBatchFlushCallback codeBatchFlushFn_ = nullptr;

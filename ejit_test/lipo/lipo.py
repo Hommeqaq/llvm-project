@@ -385,7 +385,7 @@ def doit_gc_merge(args):
         "ejit_taskpool_print_compiled", "ejit_dump_func", "ejit_print_dumped",
         "ejit_print_dumped_module",
         "ejit_print_period_const_ranking", "ejit_print_mayconst_ranking",
-        "ejit_worker_verify_dump",
+        "ejit_asan_dump",
         "ejit_vp_get_stats",
         # Inline-cache: ejit_register_icache_slot is called from
         # ejit_auto_register (AOT) when -ejit-inline-cache is on, not from the
