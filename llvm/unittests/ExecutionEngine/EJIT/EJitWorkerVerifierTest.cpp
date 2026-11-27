@@ -12,10 +12,14 @@
 #include "llvm/ExecutionEngine/EJIT/EJitOrcEngine.h"
 #include "llvm/ExecutionEngine/EJIT/EJitRuntime.h"
 #include "llvm/ExecutionEngine/EJIT/EJitSharedTaskPool.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Support/SourceMgr.h"
 #include "gtest/gtest.h"
+#include <array>
+#include <sstream>
 
 using namespace llvm;
 using namespace llvm::ejit;
@@ -102,6 +106,136 @@ TEST(EJitWorkerVerifier, CapturesEveryResidueWithoutChangingIR) {
       for (unsigned R = 0; R < Mod; ++R)
         EXPECT_EQ(W.addresses[R], reinterpret_cast<uintptr_t>(&Data[1][R]));
     }
+}
+
+TEST(EJitWorkerVerifier, CapturesPhiWitnessFoldUnderWitnessBinding) {
+  // A period_const load whose byte-offset GEP chain passes through a merge
+  // PHI only folds via the phi-witness path: every feasible PHI binding
+  // must fold to the same constant, and the fold exports the binding it
+  // proved. Capture must keep up — the residue-domain walk consults
+  // Assumed.phiInputs instead of rejecting every such fold as uncovered.
+  // The fixture mirrors the proven EJitPhiWitness shapes: a static-root
+  // object, a local-free-dim slot urem, and two constant PHI edges
+  // (records 0 and 1) whose members repeat, so both bindings agree.
+  constexpr unsigned RecordSize = 1240, Slots = 5;
+  constexpr unsigned FieldOffset = 12, FieldAlign = 4;
+  const uint64_t Expected = 1234;
+  alignas(64) std::array<uint8_t, 19 * RecordSize * Slots> Data{};
+  for (unsigned I = 0; I < 19; ++I)
+    for (unsigned S = 0; S < Slots; ++S)
+      for (unsigned B = 0; B < 4; ++B)
+        Data[I * RecordSize * Slots + S * RecordSize + FieldOffset + B] =
+            Expected >> (8 * B);
+
+  auto Build = [&](LLVMContext &C, std::unique_ptr<Module> &Out) {
+    std::ostringstream IR;
+    IR << "target datalayout = \"e-p:64:64-i64:64-n8:16:32:64-S128\"\n"
+          "%R = type { [12 x i8], i32, [5 x i8], i8, i8, [1217 x i8] }\n"
+          "@root = external global [18 x [5 x %R]], !ejit.metadata !0\n"
+          "declare i16 @__ejit_local_free_dim_v1_i16(i16) #0\n"
+          "declare void @consume(i32, i16, ptr)\n"
+          "define void @probe(i8 %cell, ptr %ctx, ptr %flags) !ejit.metadata "
+          "!5 { ret void }\n"
+          "attributes #0 = { nounwind willreturn memory(none) nocallback "
+          "nosync \"ejit.local_free_dim\"=\"v1\" }\n"
+          "!0 = !{!1";
+    for (unsigned I = 0; I < 18 * Slots; ++I)
+      IR << ", !" << 100 + I;
+    IR << "}\n"
+          "!1 = !{!\"ejit_group\", !\"static\"}\n"
+          "!5 = distinct !{!6, !7}\n"
+          "!6 = !{!\"ejit_entry\"}\n"
+          "!7 = !{!\"ejit_dim\", !\"cell\", i32 0}\n";
+    for (unsigned I = 0; I < 18 * Slots; ++I)
+      IR << "!" << 100 + I << " = !{!\"ejit_period_const_field\", i64 "
+         << I * RecordSize + FieldOffset << "}\n";
+    SMDiagnostic Err;
+    Out = parseAssemblyString(IR.str(), Err, C);
+    ASSERT_TRUE(Out);
+    Function *F = Out->getFunction("probe");
+    F->getEntryBlock().eraseFromParent();
+    IRBuilder<> B(C);
+    auto Block = [&](const char *Name) {
+      return BasicBlock::Create(C, Name, F);
+    };
+    BasicBlock *Entry = Block("entry"), *Default = Block("default"),
+               *Dynamic = Block("dynamic"), *Valid = Block("valid"),
+               *Merge = Block("merge"), *Exit = Block("exit");
+    B.SetInsertPoint(Entry);
+    Value *SlotP = B.CreateGEP(B.getInt8Ty(), F->getArg(1), B.getInt64(20));
+    Value *RawSlot = B.CreateAlignedLoad(B.getInt16Ty(), SlotP, Align(4));
+    Value *Slot = B.CreateCall(
+        Out->getFunction("__ejit_local_free_dim_v1_i16"), {RawSlot});
+    Slot = B.CreateZExt(B.CreateURem(Slot, B.getInt16(Slots)),
+                        B.getInt64Ty());
+    Value *Flag = B.CreateAlignedLoad(B.getInt8Ty(), F->getArg(2), Align(1));
+    Value *Cond = B.CreateICmpNE(Flag, B.getInt8(0));
+    B.CreateCondBr(Cond, Dynamic, Default);
+    B.SetInsertPoint(Default);
+    B.CreateBr(Merge);
+    B.SetInsertPoint(Dynamic);
+    Value *InputP = B.CreateGEP(B.getInt8Ty(), F->getArg(2), B.getInt64(17));
+    Value *Raw = B.CreateAlignedLoad(B.getInt8Ty(), InputP, Align(1));
+    B.CreateCondBr(B.CreateICmpULT(Raw, B.getInt8(18)), Valid, Exit);
+    B.SetInsertPoint(Valid);
+    B.CreateBr(Merge);
+    B.SetInsertPoint(Merge);
+    auto *Index = B.CreatePHI(B.getInt64Ty(), 2, "choice");
+    // Record 1 on the default edge, record 0 on the guarded edge: constant
+    // incoming values, so every feasible binding is enumerable, and the two
+    // records repeat the same field value so the fold proves them equal.
+    Index->addIncoming(B.getInt64(RecordSize * Slots), Default);
+    Index->addIncoming(B.getInt64(0), Valid);
+    Value *Ptr =
+        B.CreateInBoundsGEP(B.getInt8Ty(), Out->getGlobalVariable("root"),
+                            Index);
+    Ptr = B.CreateInBoundsGEP(StructType::getTypeByName(C, "R"), Ptr, Slot);
+    Ptr = B.CreateInBoundsGEP(B.getInt8Ty(), Ptr, B.getInt64(FieldOffset));
+    auto *Load = B.CreateAlignedLoad(B.getInt32Ty(), Ptr, Align(FieldAlign));
+    Load->setMetadata("ejit.period_const", MDNode::get(C, {}));
+    B.CreateCall(Out->getFunction("consume"), {Load, RawSlot, Ptr});
+    B.CreateBr(Exit);
+    B.SetInsertPoint(Exit);
+    B.CreateRetVoid();
+    ASSERT_FALSE(verifyModule(*Out, &errs()));
+  };
+
+  LLVMContext WithContext, WithoutContext;
+  std::unique_ptr<Module> With, Without;
+  Build(WithContext, With);
+  Build(WithoutContext, Without);
+  PeriodArrayRegistry Registry;
+  Registry.registerStaticVar("root", Data.data());
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 0});
+  Ctx.optLevel = OptimizationLevel::L2;
+  Ctx.tier = CompileTier::Baseline;
+  EJitOptimizer Reference(Registry);
+  Reference.runPipeline(*Without, Ctx);
+  EJitWorkerVerifyCapture Capture;
+  Ctx.workerVerify = &Capture;
+  EJitOptimizer Observed(Registry);
+  Observed.runPipeline(*With, Ctx);
+  EXPECT_EQ(printModule(*With), printModule(*Without));
+  EXPECT_EQ(Capture.uncovered, 0u);
+  ASSERT_EQ(Capture.watches.size(), 1u);
+  const auto &W = Capture.watches.front();
+  EXPECT_EQ(W.function, "probe");
+  EXPECT_EQ(W.period, "static");
+  EXPECT_EQ(W.object, "root");
+  EXPECT_EQ(W.objectBase, reinterpret_cast<uintptr_t>(Data.data()));
+  // The slot dimension is driven by a local free-dim marker wrapping a
+  // load, not a function argument: the row reports src=const.
+  EXPECT_EQ(W.freeArg, 0xFF);
+  EXPECT_EQ(W.expected, Expected);
+  // The residue enumeration evaluates under the exported witness binding
+  // (record 0), so the probed addresses are record 0's slots.
+  ASSERT_EQ(W.addresses.size(), Slots);
+  for (unsigned R = 0; R < Slots; ++R)
+    EXPECT_EQ(W.addresses[R],
+              reinterpret_cast<uintptr_t>(Data.data() + R * RecordSize +
+                                         FieldOffset));
 }
 
 TEST(EJitWorkerVerifier, ReportsTailResidueOnlyAfterPublication) {

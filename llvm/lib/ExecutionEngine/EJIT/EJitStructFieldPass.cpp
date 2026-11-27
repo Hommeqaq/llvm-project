@@ -2408,6 +2408,16 @@ struct VerifyDomain {
       return false;
     if (!visited.insert(V).second)
       return true;
+    // A PHI bound in Assumed.phiInputs stands for its bound incoming value
+    // under the witness the fold proved — the same binding evalWithAssumed
+    // resolves when evaluating trial addresses. Recurse on the binding so a
+    // phi-witness fold keeps its residue domain; an unbound PHI stays
+    // non-enumerable, like a Load or Call below.
+    if (const auto *PN = dyn_cast<PHINode>(V)) {
+      auto It = Assumed.phiInputs.find(PN);
+      return It != Assumed.phiInputs.end() &&
+             collect(It->second, Assumed, Depth + 1, AllowArgs);
+    }
     auto *Op = dyn_cast<Operator>(V);
     if (!Op) {
       // Bound-pointer capture only: a bare Argument outside Assumed.values is
@@ -2415,7 +2425,7 @@ struct VerifyDomain {
       // specialization — nothing to enumerate, so the domain stays valid.
       return AllowArgs && isa<Argument>(V);
     }
-    if (Assumed.values.contains(V) || isa<LoadInst, CallBase, PHINode>(V))
+    if (Assumed.values.contains(V) || isa<LoadInst, CallBase>(V))
       return false;
     if (Op->getOpcode() == Instruction::URem &&
         Assumed.values.contains(Op->getOperand(0))) {
