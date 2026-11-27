@@ -132,6 +132,19 @@ This branch is developing **EmbeddedJIT** — an embedded-scenario JIT compilati
 - **OrcJIT + JITLink**: runtime uses LLJIT with custom embedded memory manager (slab allocator, 512KB default)
 - **JIT pipeline order**: param substitution → InstCombine → Inline → EJitStructFieldPass → standard LLVM opts (L1/L2/L3)
 
+## Coding Style
+
+- **Internal linkage**: prefer `static` over anonymous namespaces for file-local functions and variables; reserve anonymous namespaces for type declarations that require internal linkage.
+- **Pointers**: use a pointer (`T *x`) only when null is legitimate or rebinding is required.
+- **File headers**: follow the standard LLVM rule, with no filename/description line. Leave existing banners alone.
+- **Formatting**: no whole-file `clang-format -i`. A PR changing a `.clang-format` option contains the config line only, not the tree-wide reformat.
+
+### Comments
+
+- **Default to no comment.** Agents' common failure mode is verbose explanatory comments that reviewers read as AI slop. If write comments, try 1 or 2 lines, only spend more lines when there is significant value.
+- **Write a comment when**: _(items lost in the paste)_
+- **Never write a comment that**: restates a well-named call that already reads clearly; _(other items lost in the paste)_
+
 ## Code Review
 
 After completing a non-trivial change, spawn a sub-agent to review the diff before committing:
@@ -146,3 +159,11 @@ Review focus areas:
 - **Simplicity**: reuse existing helpers, avoid duplication, prefer LLVM idioms.
 - **Tests**: cover new paths with lit tests (passes) or gtest (runtime); integration tests for end-to-end behavior.
 - **Control flow**: changes to branches/calls must not corrupt profile data or debug info. (From `.github/copilot-instructions.md`)
+
+## Commit Conventions
+
+- **Title**: _(first line lost in the paste)_ patch that only improves performance still qualifies); functional `[tag] title`.
+- **Wording**: describe the fix in imperative. Past tense only for truly historical context.
+- **Body bullets**: add only when the change is important enough to be highlighted.
+- **Omit**: statements that the change is minimal/safe/low-overhead, and rejected alternatives — the diff carries scope and safety. State such things only when genuinely non-obvious.
+- **Code blocks**: use them so GitHub preserves alignment.
