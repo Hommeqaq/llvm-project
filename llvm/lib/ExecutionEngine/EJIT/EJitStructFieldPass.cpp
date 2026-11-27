@@ -2449,7 +2449,11 @@ struct VerifyDomain {
       return true;
     }
     for (const Use &U : Op->operands())
-      if (!collect(U.get(), Assumed, Depth + 1))
+      // Propagate AllowArgs: a bound-pointer capture walks GEP chains down
+      // to the bound ARGUMENT leaf, which is only accepted as a fixed leaf
+      // under AllowArgs — dropping it here rejected every nonzero-offset
+      // bound fold's domain as unsupported.
+      if (!collect(U.get(), Assumed, Depth + 1, AllowArgs))
         return false;
     return true;
   }
