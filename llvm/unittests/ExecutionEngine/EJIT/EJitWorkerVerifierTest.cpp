@@ -300,7 +300,7 @@ TEST(EJitWorkerVerifier, ReportsTailResidueOnlyAfterPublication) {
   ejit_set_log_level(EJIT_LOG_INFO);
   auto Dump = [&] {
     testing::internal::CaptureStdout();
-    Verifier.idle(Pool, true);
+    EXPECT_TRUE(Verifier.dumpNow(Pool));
     return testing::internal::GetCapturedStdout();
   };
   EXPECT_NE(Dump().find("checks=0"), std::string::npos);

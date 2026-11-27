@@ -24,9 +24,9 @@ in Async mode: records are collected by the shared worker's own compiles.
   worker idle round. Each idle round already costs one platform tick
   (`SRE_TaskDelay` via the injected idle hook), so the two-check interval is
   N platform ticks plus poll overhead — with the product clock (1 tick ~ 1 ms)
-  the default is one scan every ~5 seconds. A dump request bypasses the
-  throttle on the next idle round, and compile/publish work always takes
-  priority.
+  the default is one scan every ~5 seconds. A dump call instead runs
+  immediately in the caller's context (see Output model), and compile/publish
+  work always takes priority over the periodic scan.
 - `EJIT_WORKER_VERIFY_STEP_BUDGET` (default 32): max probe/retirement steps
   per slice. A slice always ends with one fixed rest, and inside a slice the
   worker pauses `EJIT_WORKER_VERIFY_YIELD_EVERY` (default 8) completed steps
@@ -51,9 +51,10 @@ This is a work budget, not a time or detection guarantee.
 
 Normal scanning never prints: a mismatching probe only bumps the location's
 sticky record and the global counters. Output happens only when the worker
-core calls `ejit_worker_verify_dump()`:
+core calls `ejit_worker_verify_dump()` — synchronously, in the caller's
+context:
 
-1. one scan slice runs as usual (same pacing as any other slice);
+1. one scan slice runs (same pacing as any other slice);
 2. every location that has EVER mismatched is reported, one row each (nothing
    is re-read at print time):
 
@@ -91,9 +92,12 @@ core calls `ejit_worker_verify_dump()`:
    `mismatch_samples`, `rate` (global, clamped to 100%), `recorded`
    (recorded locations), `uncovered`, `dropped`, `blocked_root`, `retired`.
 
-`ejit_worker_verify_dump()` returns as soon as the request is queued; the
-rows appear on the worker later. `checks=0` is not a pass; `uncovered`
-counts folds whose shape the verifier cannot watch.
+`ejit_worker_verify_dump()` prints the whole report before returning — the
+call blocks through the slice, every row, and the stats line. A second call
+while a report is still printing returns `EJIT_ERR_NOT_ACTIVE`. While a
+report prints, the worker's periodic scan stands down; compile and publish
+work keep running. `checks=0` is not a pass; `uncovered` counts folds whose
+shape the verifier cannot watch.
 
 Registration failures are discoverable at compile time, not only via a
 dump: a capture fully dropped by the version budget logs one
@@ -157,8 +161,8 @@ and shared section configuration:
    to report, so no problem rows print.
 4. Core 16: `test_ejit_worker_verify_inject`. It changes only residues 4 and 9
    and does not call the optimized function — nothing prints on its own.
-5. Core 6: `ejit_worker_verify_dump` again. Wait for the two problem rows
-   (`residue=4/5` and `residue=9/10`, one printed every 20 ticks) followed by
-   the stats line, with `mismatch_samples` and `recorded` both non-zero.
-   A dump also advances one scan slice. Reboot before repeating; never use
-   the injection command in a production image.
+5. Core 6: `ejit_worker_verify_dump` again. The call returns only after the
+   two problem rows (`residue=4/5` and `residue=9/10`, one printed every 20
+   ticks) and the stats line are out, with `mismatch_samples` and `recorded`
+   both non-zero. A dump also advances one scan slice. Reboot before
+   repeating; never use the injection command in a production image.

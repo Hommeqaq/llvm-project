@@ -153,9 +153,18 @@ void EJitWorkerVerifier::printRecordedRows(VerifyYieldFn Yield,
   // the residue denominator. After every row the worker pauses
   // YieldDelayTicks so the report trickles out and never stresses the
   // console or the heartbeat.
-  for (const auto &V : live_)
-    for (const auto &W : V.capture.watches)
-      for (const auto &Rec : W.first) {
+  // Index-based iteration, re-fetched every row: the direct dump prints in
+  // the caller's context, and each row's platform yield lets the worker
+  // task run compiles that append to live_ (a reallocation). live_ is
+  // append-only while the dump holds printActive_, so indices stay valid;
+  // references held across a yield do not.
+  for (size_t Vi = 0; Vi < live_.size(); ++Vi)
+    for (size_t Wi = 0; Wi < live_[Vi].capture.watches.size(); ++Wi)
+      for (size_t Fi = 0; Fi < live_[Vi].capture.watches[Wi].first.size();
+           ++Fi) {
+        const auto &V = live_[Vi];
+        const auto &W = V.capture.watches[Wi];
+        const auto &Rec = W.first[Fi];
         const unsigned R = Rec.residue;
         const unsigned Rate =
             W.samples[R] ? (W.count[R] * 1000u) / W.samples[R] : 0;
@@ -238,11 +247,8 @@ void EJitWorkerVerifier::dump(VerifyYieldFn Yield, void *YieldCtx) const {
     Yield(YieldCtx, YieldDelayTicks);
 }
 
-void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested,
-                              VerifyYieldFn Yield, void *YieldCtx) {
-  if (++idleTicks_ < IdleTicks && !DumpRequested)
-    return;
-  idleTicks_ = 0;
+void EJitWorkerVerifier::scanSlice(const EJitSharedTaskPool &Pool,
+                                   VerifyYieldFn Yield, void *YieldCtx) {
   bool Worked = false;
   for (unsigned N = 0; N < StepBudget && !live_.empty(); ++N) {
     Worked = true;
@@ -252,6 +258,10 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested
     if (Yield && EJIT_WORKER_VERIFY_YIELD_EVERY &&
         N % EJIT_WORKER_VERIFY_YIELD_EVERY == 0 && N != 0)
       Yield(YieldCtx, YieldDelayTicks);
+    // References are taken fresh every step: during a direct dump these
+    // in-slice yields let the worker task consume compiles, and a completed
+    // compile appends to live_ (reallocating it), so nothing may be held
+    // across a yield.
     auto &V = live_[cursor_];
     auto IsLive = Pool.workerVerifyLive(V.request, V.function);
     if (!IsLive || !*IsLive) {
@@ -317,12 +327,39 @@ void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool, bool DumpRequested
   }
   // Work/rest rhythm: a finished slice always ends with one fixed rest. A
   // light slice's probe work is microseconds per step (far under the work
-  // window), so in practice the rest dominates; dump printing pauses
+  // window), so in practice the rest dominates; report rows pause
   // separately, once per row.
   if (Worked && Yield)
     Yield(YieldCtx, YieldDelayTicks);
-  if (DumpRequested) {
-    printRecordedRows(Yield, YieldCtx);
-    dump(Yield, YieldCtx);
-  }
+}
+
+void EJitWorkerVerifier::idle(const EJitSharedTaskPool &Pool,
+                              VerifyYieldFn Yield, void *YieldCtx) {
+  // Periodic worker path: never prints, and stands down entirely while a
+  // direct dump is printing on this core.
+  if (printActive_)
+    return;
+  if (++idleTicks_ < IdleTicks)
+    return;
+  idleTicks_ = 0;
+  scanSlice(Pool, Yield, YieldCtx);
+}
+
+bool EJitWorkerVerifier::dumpNow(const EJitSharedTaskPool &Pool,
+                                 VerifyYieldFn Yield, void *YieldCtx) {
+  // Direct report: run in the CALLER's context (the worker core) and return
+  // only when the whole report is out — one scan slice, then one row per
+  // recorded location, then the stats line, each paced by fixed yields.
+  // printActive_ is a plain bool on purpose: every context touching the
+  // verifier runs on the same core, where cooperative tasks only interleave
+  // at platform yields, so a task switch always observes the flag.
+  if (printActive_)
+    return false;
+  printActive_ = true;
+  idleTicks_ = 0;
+  scanSlice(Pool, Yield, YieldCtx);
+  printRecordedRows(Yield, YieldCtx);
+  dump(Yield, YieldCtx);
+  printActive_ = false;
+  return true;
 }

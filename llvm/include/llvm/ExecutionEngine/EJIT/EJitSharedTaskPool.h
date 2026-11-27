@@ -526,6 +526,9 @@ public:
     workerVerifyFn_ = Fn;
     workerVerifyCtx_ = Ctx;
   }
+  /// Print the verify report synchronously in the caller's context (this
+  /// must be the owner core) and return when it is complete; false when
+  /// called from another core or while another report is printing.
   bool requestWorkerVerifyDump();
   /// nullopt means the cache identity could not be snapshotted this time.
   std::optional<bool> workerVerifyLive(const EJitCompileRequest &Req,
@@ -1333,7 +1336,6 @@ private:
   CompileCallback workerVerifyCompileFn_ = nullptr;
   WorkerVerifyCallback workerVerifyFn_ = nullptr;
   void *workerVerifyCtx_ = nullptr;
-  EJitAtomicU32 workerVerifyDump_{};
 #endif
   CodeReadyCallback codeReadyFn_ = nullptr;
   CodeBatchFlushCallback codeBatchFlushFn_ = nullptr;

@@ -104,16 +104,28 @@ public:
                   EJitWorkerVerifyCapture Capture);
   void onPublished(const EJitCompileRequest &Req, bool Published);
 
-  /// One probe slice on the worker. Normal slices never print: mismatches
-  /// only bump the per-residue sticky records and the global counters.
+  /// One throttled probe slice on the worker's periodic idle path. Normal
+  /// slices never print: mismatches only bump the per-residue sticky
+  /// records and the global counters. Skipped while a direct dump is
+  /// printing on this core.
   /// \p Yield, when non-null, feeds the platform tick: once per
-  /// EJIT_WORKER_VERIFY_YIELD_EVERY completed steps while scanning, and
-  /// YieldDelayTicks after every row printed by a dump request (plus once
-  /// after the stats line). The driver maps it to EJitSreTask::delay, the
-  /// same primitive the worker loop's own per-round yield uses.
+  /// EJIT_WORKER_VERIFY_YIELD_EVERY completed steps while scanning. The
+  /// driver maps it to EJitSreTask::delay, the same primitive the worker
+  /// loop's own per-round yield uses.
   using VerifyYieldFn = void (*)(void *Ctx, uint32_t Ticks);
-  void idle(const EJitSharedTaskPool &Pool, bool DumpRequested,
-            VerifyYieldFn Yield = nullptr, void *YieldCtx = nullptr);
+  void idle(const EJitSharedTaskPool &Pool, VerifyYieldFn Yield = nullptr,
+            void *YieldCtx = nullptr);
+
+  /// Print the report NOW, in the caller's context (the worker core): one
+  /// probe slice, then one row per recorded location (nothing re-read at
+  /// print time), then the stats line — each paced with fixed yields — and
+  /// only then return. Returns false when another dump is already printing
+  /// on this core. While printing, the worker's periodic scan stands down;
+  /// the row yields still let the worker consume compiles, and live_ is
+  /// append-only during the print, so row data is re-fetched by index
+  /// across every yield.
+  bool dumpNow(const EJitSharedTaskPool &Pool, VerifyYieldFn Yield = nullptr,
+               void *YieldCtx = nullptr);
 
 private:
   struct Version {
@@ -127,6 +139,8 @@ private:
                           const EJitCompileRequest &B);
   void dropCurrent();
   void advance();
+  void scanSlice(const EJitSharedTaskPool &Pool, VerifyYieldFn Yield,
+                 void *YieldCtx);
   void printRecordedRows(VerifyYieldFn Yield, void *YieldCtx) const;
   void dump(VerifyYieldFn Yield, void *YieldCtx) const;
 
@@ -144,6 +158,11 @@ private:
   size_t cursor_ = 0;
   unsigned retainedWatches_ = 0;
   unsigned idleTicks_ = 0;
+  // Direct-dump in-progress flag (see dumpNow): plain bool, not atomic —
+  // every context touching the verifier runs on one core, where cooperative
+  // tasks only interleave at platform yields, so a task switch always
+  // observes the flag.
+  bool printActive_ = false;
   uint64_t checks_ = 0;
   uint64_t activeProbes_ = 0;
   uint64_t checkedActiveProbes_ = 0;

@@ -415,8 +415,12 @@ void ejit_print_period_const_ranking(void);
 /// New code should use ejit_print_period_const_ranking().
 void ejit_print_mayconst_ranking(void);
 
-/// Queue a summary on the designated shared worker's idle loop. Debug builds
-/// with worker substitution verification only; call from the worker core.
+/// Print the worker substitution-verification report NOW, synchronously in
+/// the caller's context: one probe slice, one row per recorded mismatching
+/// location, then the stats line — each paced with fixed 20-tick yields —
+/// and only then return. EJIT_ERR_NOT_ACTIVE when called off the worker
+/// core or while another report is still printing. Debug builds with
+/// worker substitution verification only.
 ejit_status_t ejit_worker_verify_dump(void);
 
 /// Print the currently-active time-window instances through the platform log:

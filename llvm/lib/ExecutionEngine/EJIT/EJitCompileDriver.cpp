@@ -208,13 +208,19 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
       },
       [](void *Ctx, bool Dump) {
         auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
-        if (Driver->workerVerifier_)
-          Driver->workerVerifier_->idle(
-              Driver->sharedPool_, Dump,
-              // Same platform primitive as the worker loop's per-round yield,
-              // so a verifier slice feeds the watchdog exactly like the loop;
-              // dump rows pace themselves with DumpRowDelayTicks.
-              [](void *, uint32_t Ticks) { EJitSreTask::delay(Ticks); });
+        if (!Driver->workerVerifier_)
+          return;
+        // Same platform primitive as the worker loop's per-round yield, so a
+        // verifier slice feeds the watchdog exactly like the loop; report
+        // rows pace themselves with the verifier's fixed yield delay.
+        auto Delay = [](void *, uint32_t Ticks) { EJitSreTask::delay(Ticks); };
+        // The pool calls this either from its worker idle path (the periodic
+        // scan, Dump=false) or directly from ejit_worker_verify_dump() (the
+        // synchronous report, Dump=true, in the caller's context).
+        if (Dump)
+          Driver->workerVerifier_->dumpNow(Driver->sharedPool_, Delay);
+        else
+          Driver->workerVerifier_->idle(Driver->sharedPool_, Delay);
       },
       this);
 #endif

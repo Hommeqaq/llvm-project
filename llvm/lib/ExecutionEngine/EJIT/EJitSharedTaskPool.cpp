@@ -1001,7 +1001,12 @@ bool EJitSharedTaskPool::requestWorkerVerifyDump() {
   if (!asyncServiceAvailable() || !workerVerifyFn_ ||
       state_->ownerCoreId.loadAcquire() != EJitCoreId::current())
     return false;
-  workerVerifyDump_.storeRelease(1);
+  // Synchronous report: print rows + stats in the CALLER's context (the
+  // guard above already pins that context to the owner core, the same core
+  // the verifier lives on) and return only when the report is complete.
+  // The verifier excludes the worker's periodic scan while the report
+  // prints, so compile/publish work keeps the core but never the scan.
+  workerVerifyFn_(workerVerifyCtx_, true);
   return true;
 }
 
@@ -3642,8 +3647,7 @@ EJitWorkerStep EJitSharedTaskPool::workerPollOnce() {
       return EJitWorkerStep::Consumed;
 #ifdef EJIT_WORKER_VERIFY_SUBSTITUTION
     if (workerVerifyFn_)
-      workerVerifyFn_(workerVerifyCtx_, workerVerifyDump_.loadRelaxed() &&
-                                           workerVerifyDump_.exchange(0));
+      workerVerifyFn_(workerVerifyCtx_, false);
 #endif
     return EJitWorkerStep::Idle;
   case EJitSharedInitState::Initializing:
