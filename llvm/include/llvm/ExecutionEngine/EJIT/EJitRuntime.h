@@ -415,12 +415,12 @@ void ejit_print_period_const_ranking(void);
 /// New code should use ejit_print_period_const_ranking().
 void ejit_print_mayconst_ranking(void);
 
-/// Print the worker substitution-verification report NOW, synchronously in
-/// the caller's context: one probe slice, one row per recorded mismatching
+/// Print the EJIT-ASAN substitution report NOW, synchronously in the
+/// caller's context: one probe slice, one row per recorded mismatching
 /// location, then the stats line — each paced with fixed 20-tick yields —
 /// and only then return. EJIT_ERR_NOT_ACTIVE when called off the worker
-/// core or while another report is still printing. Debug builds with
-/// worker substitution verification only.
+/// core or while another report is still printing. Builds with EJIT_ASAN
+/// only (EJIT_ERR_DISABLED otherwise).
 ejit_status_t ejit_asan_dump(void);
 
 /// Opt into EJIT-ASAN entry instrumentation BEFORE ejit_init: after this

@@ -2643,6 +2643,7 @@ void captureBoundAsan(EJitAsanCapture &Capture, LoadInst &LI,
     if (Domain.modulus == 1 && R == 0) {
       if (const auto *RootArg = findRootArgument(Ptr)) {
         EJitAsanEntryFold &EF = Capture.entryFolds.emplace_back();
+        EF.function = Watch.function;
         EF.period = Watch.period;
         EF.argNo = static_cast<uint32_t>(RootArg->getArgNo());
         EF.byteOffset = static_cast<uint64_t>(*Offset);

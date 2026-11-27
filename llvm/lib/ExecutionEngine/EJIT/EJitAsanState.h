@@ -44,7 +44,8 @@ static_assert(EJIT_ASAN_MAX_CORES >= 1 && EJIT_ASAN_MAX_CORES <= 256,
 // Function-slot table capacity and emitted-site budget. Slots are claimed by
 // the emitting worker, never freed (dead-slot reuse only once the table is
 // full); sites are monotonic in v1 (version retirement does not reclaim
-// them) and a full budget drops the NEWEST capture with a discoverable log.
+// them) and a full budget skips the capture's REMAINING folds with one log
+// (partial emission: already-published folds of that compile stay checked).
 #ifndef EJIT_ASAN_MAX_SLOTS
 #define EJIT_ASAN_MAX_SLOTS 64
 #endif
@@ -128,6 +129,11 @@ static_assert(std::is_standard_layout_v<EJitAsanState>,
               "gEJitAsanState must have a stable shared-memory layout");
 static_assert(std::is_trivially_destructible_v<EJitAsanState>,
               "gEJitAsanState must never run a destructor");
+// The blob lands in the inter-core shared window (.mc_shared on the board);
+// keep its footprint visible at compile time and shrink it via the
+// EJIT_ASAN_* knobs rather than silently growing past the budget.
+static_assert(sizeof(EJitAsanState) <= 256 * 1024,
+              "gEJitAsanState exceeds the documented 256KB shared budget");
 
 // The single process-global blob. EJIT_SHARED_SECTION places it in
 // inter-core shared memory on real multi-core builds; on host it is ordinary

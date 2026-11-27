@@ -1245,7 +1245,7 @@ ejit_status_t ejit_asan_rotation_status(void) {
   // Read-only snapshot of the shared rotation state, callable from any core
   // at any time (the blob is static storage; no owner or init gate). Cores
   // that never served a check stay silent to keep the serial ring small.
-  const uint32_t UsedSlots = gEJitAsanState.slotsUsed.loadRelaxed();
+  const uint32_t UsedSlots = gEJitAsanState.slotsUsed.loadAcquire();
   EJIT_DIAG_RAW("[EJIT-ASAN] rotation slots=%u/%d sites=%u",
                 UsedSlots, EJIT_ASAN_MAX_SLOTS,
                 gEJitAsanState.siteCounter.loadRelaxed());

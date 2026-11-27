@@ -141,9 +141,9 @@ int test_ejit_asan_bound_sample(void) {
 // The family break: call the bound probe with the divergent member
 // FamilyB. Report-only: every call still returns the BAKED computation
 // (scale=7), which is exactly the wrong-answer symptom the entry stub is
-// there to surface. The rotation window (EJIT_ASAN_ROTATION_WINDOW=128,
-// two slots) means a few hundred calls guarantee at least one check lands
-// on this function's slot.
+// there to surface. Only this function is instrumented in the demo, so its
+// slot is the only one: the rotation serves it a check on the very first
+// call after any re-arm, regardless of window state.
 int test_ejit_asan_bound_inject(void) {
   if (ejit_sre_current_core_id() != 16 ||
       !ejit_is_active("asan_cell", 1))

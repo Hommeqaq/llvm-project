@@ -70,7 +70,7 @@ uint32_t ejitAsanClaimSlot(StringRef FunctionName) {
     EJitAsanSlot &S = St.slots[Used];
     ejitAsanCopyName(S.name, sizeof(S.name), FunctionName);
     S.activeSites.storeRelaxed(0);
-    St.slotsUsed.storeRelaxed(Used + 1);
+    St.slotsUsed.storeRelease(Used + 1);
     return Used;
   }
   // Table full: reuse a dead slot (one with no published sites). v1 never
@@ -372,10 +372,10 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
   const uint32_t Sites = gEJitAsanState.siteCounter.loadRelaxed();
   for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si) {
     const EJitAsanSite &S = gEJitAsanState.sites[Si];
-    if (S.published.loadRelaxed() == 0)
+    if (S.published.loadAcquire() == 0)
       continue;
     const EJitAsanSticky &R = gEJitAsanState.sticky[Si];
-    if (R.recorded.loadRelaxed() < 2)
+    if (R.recorded.loadAcquire() < 2)
       continue; // Never mismatched, or caught mid-freeze (== 1).
     unsigned Count = R.count.loadRelaxed();
     if (Count > 0xFFFF)
@@ -412,8 +412,8 @@ void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
     EntryChecks += Cell.checks;
   const uint32_t Sites = gEJitAsanState.siteCounter.loadRelaxed();
   for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si)
-    if (gEJitAsanState.sites[Si].published.loadRelaxed() &&
-        gEJitAsanState.sticky[Si].recorded.loadRelaxed() >= 2)
+    if (gEJitAsanState.sites[Si].published.loadAcquire() &&
+        gEJitAsanState.sticky[Si].recorded.loadAcquire() >= 2)
       ++EntrySites;
   EJIT_DIAG_RAW(
       "[EJIT-ASAN] versions=%zu staged=%zu watches=%u/%u%s "

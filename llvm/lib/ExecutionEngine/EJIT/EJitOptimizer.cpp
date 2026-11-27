@@ -207,6 +207,23 @@ void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
   Function *F = M.getFunction(Ctx.fnName);
   if (!F || F->isDeclaration())
     return;
+  // A bound fold captured from another function of the module (a second
+  // ejit_entry's own bound formal, or a callee formal that survived
+  // internalization) belongs to THAT function's entry and its argument
+  // list — emitting it here would index this function's arguments with a
+  // foreign index (out-of-range read, wrong-parameter check, or invalid
+  // IR). Only folds owned by the specialized function are emittable.
+  unsigned Foreign = 0;
+  for (const EJitAsanEntryFold &EF : Cap->entryFolds)
+    if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
+      ++Foreign;
+  if (Foreign) {
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] entry stub skipped %u fold(s) owned by "
+                      "other module functions fn=%s",
+                      Foreign, Ctx.fnName.c_str());
+    if (Foreign == Cap->entryFolds.size())
+      return; // Nothing emittable for this function.
+  }
   const uint32_t Slot = ejitAsanClaimSlot(Ctx.fnName);
   if (Slot == kEJitAsanNoSlot) {
     EJIT_DIAG("[EJIT-ASAN] capture DROPPED: slot table full (cap=%d) fn=%s",
@@ -237,15 +254,16 @@ void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
   B.CreateCondBr(Active, Check, Cont);
 
   BasicBlock *Next = Check;
+  unsigned BudgetSkipped = 0;
   for (EJitAsanEntryFold &EF : Cap->entryFolds) {
+    if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
+      continue; // Counted and logged above.
     const uint32_t Site =
         ejitAsanPublishSite(Slot, Ctx.fnName, EF.period,
                             static_cast<uint8_t>(Ctx.tier), EF.argNo,
                             EF.width, EF.align, EF.byteOffset, EF.expected);
     if (Site == kEJitAsanNoSite) {
-      EJIT_DIAG("[EJIT-ASAN] capture DROPPED: site budget full (cap=%d) "
-                "fn=%s",
-                EJIT_ASAN_MAX_SITES, Ctx.fnName.c_str());
+      ++BudgetSkipped;
       continue;
     }
     EF.siteId = Site;
@@ -267,6 +285,12 @@ void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
     B.CreateBr(GoOn);
     Next = GoOn;
   }
+  if (BudgetSkipped)
+    // One line per compile, mirroring the version-budget discipline — this
+    // capture's remaining folds stay worker-probe-only.
+    EJIT_DIAG("[EJIT-ASAN] capture DROPPED: site budget full (cap=%d) "
+              "fn=%s folds=%u",
+              EJIT_ASAN_MAX_SITES, Ctx.fnName.c_str(), BudgetSkipped);
   B.SetInsertPoint(Next);
   B.CreateBr(Cont);
 }

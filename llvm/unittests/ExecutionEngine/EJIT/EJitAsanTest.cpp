@@ -719,6 +719,69 @@ TEST(EJitAsan, DumpReportsEntryRowsAndStats) {
   EXPECT_NE(Out.find("entry_sites=1"), std::string::npos);
 }
 
+TEST(EJitAsan, SkipsEntryFoldsOwnedByOtherEntries) {
+  // The capture pass runs over every defined function of the module, and a
+  // fold reached through a second ejit_entry's bound FORMAL belongs to
+  // THAT function's argument list, not to the specialized entry's. The
+  // emitter must not index the specialized function's arguments with it:
+  // pin the regression where this shape crashed the worker compile
+  // (review P1: probe, bound arg 1, calls helper — a second entry whose
+  // bound formal is index 2; helper's fold used to be emitted into probe).
+  resetAsanBlob();
+  LLVMContext C;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    declare void @observe(i32)
+    define i32 @probe(i8 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %r = call i32 @helper(i8 %cell, ptr %cfg, ptr %cfg)
+      ret i32 %r
+    }
+    define i32 @helper(i8 %cell, ptr %cfg, ptr %h) !ejit.metadata !5 {
+    entry:
+      %p = getelementptr inbounds i8, ptr %h, i64 4
+      %v = load i32, ptr %p, !ejit.period_const !7
+      ret i32 %v
+    }
+    !0 = !{!1, !2, !8}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
+    !5 = !{!6, !2, !10}
+    !6 = !{!"ejit_entry"}
+    !7 = !{}
+    !8 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !9}
+    !9 = !{i64 4, i64 4}
+    !10 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, !9}
+  )",
+                               Err, C);
+  ASSERT_TRUE(M);
+  uint64_t Object[1] = {uint64_t(kBoundExpected) << 32};
+  PeriodArrayRegistry Registry;
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe"; // The specialized entry: helper is NOT it.
+  Ctx.dimensions.push_back({"cell", 1});
+  Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Object),
+                                /*size=*/8, /*argIndex=*/1, /*instance=*/1});
+  Ctx.asanEntryChecks = true;
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  // Helper's fold IS captured (with its own function name and argument
+  // index), and NOTHING is emitted into probe: no site, no stub. (Before
+  // the fix this crashed inside the emitter with F->getArg(2) on probe's
+  // two-argument list.)
+  ASSERT_EQ(Capture.entryFolds.size(), 1u);
+  const auto &EF = Capture.entryFolds.front();
+  EXPECT_EQ(EF.function, "helper");
+  EXPECT_EQ(EF.argNo, 2u);
+  EXPECT_EQ(EF.siteId, kEJitAsanNoSite);
+  EXPECT_EQ(countCallsTo(*M, "__ejit_asan_gate"), 0u);
+  EXPECT_EQ(countCallsTo(*M, "__ejit_asan_mismatch"), 0u);
+  EXPECT_EQ(gEJitAsanState.siteCounter.loadRelaxed(), 0u);
+}
+
 TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
   resetAsanBlob();
   const uint32_t Slot = ejitAsanClaimSlot("probe");

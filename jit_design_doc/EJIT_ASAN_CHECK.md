@@ -220,9 +220,10 @@ still defines them (`nm -g board.elf | grep ejit_asan`).
    the family exemplar (FamilyA, scale=7).
 5. Core 16: `test_ejit_asan_bound_inject` — 512 calls with the divergent
    member FamilyB. Every call returns the BAKED computation (7·input+1),
-   which is the wrong-answer symptom itself; with two slots and window
-   128 the rotation guarantees at least one entry check lands on the
-   bound probe's slot.
+   which is the wrong-answer symptom itself. Only the bound probe is
+   instrumented in this demo, so its slot is the only one: the rotation
+   serves it a check on the very first call after any re-arm, regardless
+   of window state.
 6. Core 6: `ejit_asan_dump` again — exactly one `kind=entry` row for
    `ejit_asan_bound_probe`: `object=bound@<address of FamilyB>`,
    `expected=0x7 first=0x9`, count > 0; `entry_checks>0` and

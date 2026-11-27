@@ -97,9 +97,10 @@ struct EJitAsanWatch {
 // family member is observable. siteId stays kEJitAsanNoSite until the
 // pipeline-end emitter publishes it (EJitOptimizer emitAsanEntryChecks).
 struct EJitAsanEntryFold {
+  std::string function; // Owning function: the fold's load site lives here.
   std::string period;
   uint32_t siteId = 0; // kEJitAsanNoSite until published
-  uint32_t argNo = 0;  // Bound-pointer argument index.
+  uint32_t argNo = 0;  // Bound-pointer argument index (of `function`).
   uint64_t byteOffset = 0;
   uint64_t expected = 0;
   uint8_t width = 0;
