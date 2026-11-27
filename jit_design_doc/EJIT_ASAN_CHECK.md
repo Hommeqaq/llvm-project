@@ -1,168 +1,233 @@
-# EJIT worker-only substitution verifier
+# EJIT-ASAN: live substitution checking
 
-This optional diagnostic checks values actually folded by the normal
-specialization pass. It emits no verifier IR, call, load, or hit counter into
-business or JIT code. The old instrumented verifier instead checked the load
-that a business call actually executed and left the original value in use.
-The worker check is not a replacement for that coverage or a correctness guard.
+EJIT-ASAN checks, at runtime, that the constants the JIT baked into
+specialized code still hold. It is a read-only diagnostic: nothing gates on
+it and no specialized code is diverted on a mismatch — a mismatch is
+recorded and reported, the call always continues with its baked values.
 
-Configure the runtime (not the business Clang):
+It has two complementary halves:
+
+- **The worker probe** re-reads, on the shared worker's own idle rounds, the
+  shared-RAM locations whose values the fold actually baked, comparing them
+  against the constants in the JIT code. It watches the compile-time
+  snapshot of every fold — including the exemplar pointee of a bound_ptr
+  fold — but it can only ever see the addresses captured at compile time.
+- **The entry stub** (the bound_ptr half) answers the question the probe
+  structurally cannot: whether the pointer a call passes *now* still honors
+  the bound_ptr promise. A `bound_ptr` parameter is a promise that certain
+  period_const members are CONSISTENT across every pointer the product may
+  pass for the specialization's lifetime — different pointers, same folded
+  fields, no recompile on pointer change. Only the entry of the specialized
+  function can see the current pointer, so the stub loads the folded
+  fields through the ACTUAL argument and compares them with the baked
+  constants on a rotating sample of calls. The first divergence freezes
+  both the seen value and the argument pointer — the family member that
+  broke the invariant — and the row names it directly.
+
+Both halves report through the same dump; rows carry their source (`kind=`).
+
+## Configure and enable
 
 ```text
--DEJIT_ASAN=ON
+-DEJIT_ASAN=ON            (requires EJIT_DIAG_ENABLE; defaults OFF)
 ```
 
-The feature defaults to OFF. It requires diagnostics (`EJIT_DIAG_ENABLE`) and
-monitors **all periods at once**: every worker compile records every coverable
-period_const fold of every registered period, and each watch carries its own
-source period for the report rows. Use the normal `ejit_init` / `ejit_init_pgo`
-in Async mode: records are collected by the shared worker's own compiles.
+| CMake knob | default | meaning |
+|---|---|---|
+| `EJIT_ASAN_IDLE_TICKS` | 5000 | worker-probe: one probe slice every Nth worker idle round (~5 s at 1 tick ~ 1 ms) |
+| `EJIT_ASAN_STEP_BUDGET` | 32 | worker-probe: max probe/retirement steps per slice |
+| `EJIT_ASAN_YIELD_EVERY` | 8 | worker-probe: in-slice yield cadence |
+| `EJIT_ASAN_MAX_WATCHES` | 81920 | worker-probe: global watch budget; overrun trims the NEWEST capture |
+| `EJIT_ASAN_MAX_VERSIONS` | 1024 | worker-probe: simultaneous tracked-version budget |
+| `EJIT_ASAN_ROTATION_WINDOW` | 128 | entry stub: calls per function window before rotating |
+| `EJIT_ASAN_MAX_SLOTS` | 64 | entry stub: rotation function-slot table capacity |
+| `EJIT_ASAN_MAX_CORES` | 64 | entry stub: per-core rotation cell capacity (in [1, 256]; cores above it never check) |
+| `EJIT_ASAN_MAX_SITES` | 512 | entry stub: emitted-site budget; monotonic per boot, overrun drops the NEWEST capture with a log |
 
-## Pacing and budgets
+The aarch64_be preset pins all of the above. The worker probe needs no
+runtime opt-in; the entry stub does:
 
-- `EJIT_ASAN_IDLE_TICKS` (default 5000): one probe slice every Nth
-  worker idle round. Each idle round already costs one platform tick
-  (`SRE_TaskDelay` via the injected idle hook), so the two-check interval is
-  N platform ticks plus poll overhead — with the product clock (1 tick ~ 1 ms)
-  the default is one scan every ~5 seconds. A dump call instead runs
-  immediately in the caller's context (see Output model), and compile/publish
-  work always takes priority over the periodic scan.
-- `EJIT_ASAN_STEP_BUDGET` (default 32): max probe/retirement steps
-  per slice. A slice always ends with one fixed rest, and inside a slice the
-  worker pauses `EJIT_ASAN_YIELD_EVERY` (default 8) completed steps
-  for the fixed yield below, so a large budget cannot starve the bare-metal
-  watchdog heartbeat. Work/rest scale: one probe step is microseconds
-  (well under a tick), so a 32-step slice's work is far below the ~50-tick
-  work window; the fixed rests dominate by design.
-- `EJIT_ASAN_MAX_WATCHES` (default 81920) /
-  `EJIT_ASAN_MAX_VERSIONS` (default 1024): global budgets across all
-  tracked versions (watch = one folded-load site with its residue addresses).
-  Overrun trims the NEWEST capture and counts into `dropped`; existing
-  watches are never evicted.
-- Verifier yield pacing is fixed (not configurable): every platform pause the
-  verifier makes — one per `EJIT_ASAN_YIELD_EVERY` completed scan
-  steps, after every printed problem row, and once after the stats line —
-  lasts 20 platform ticks, so neither scanning nor a report ever stresses the
-  console or the system.
+```c
+ejit_enable_asan_mode();   // BEFORE ejit_init; every later worker compile
+                           // of a function with bound folds emits the stub
+```
 
-This is a work budget, not a time or detection guarantee.
+`ejit_enable_asan_mode()` must be called before `ejit_init`: after init it
+logs an error and returns `EJIT_ERR_INVALID_PARAM`; without the feature it
+returns `EJIT_ERR_DISABLED`. It is irreversible for the boot: emitted
+stubs stay in their versions.
+
+Business code needs no new Clang flag — normal spec5 annotations
+(`ejit_entry`, `ejit_dim`, `ejit_bound_ptr`, `ejit_period_const`) suffice.
+
+## Worker probe
+
+Pacing and mechanics are unchanged from the original feature: one bounded
+probe slice every `EJIT_ASAN_IDLE_TICKS` idle rounds; a mismatching probe
+only bumps the location's sticky record (the first mismatch freezes the
+seen value; later mismatches only grow saturating counters); normal
+scanning never prints. Every fold the capture could not watch counts into
+`uncovered`; dropped or trimmed captures log at compile time
+(`capture DROPPED` / `capture TRIMMED`, plus `capture DROPPED: site
+budget full` for the entry-stub budget).
+
+One capture bug is fixed in this version: the domain walk previously
+dropped its AllowArgs flag while walking GEP chains, so every bound fold
+at a nonzero offset was reported `uncovered: unsupported-index-domain`
+instead of being watched. Only bare offset-0 bound loads ever captured;
+all constant-offset bound folds now capture.
+
+## Entry stub
+
+**Emission.** At worker compile, a bound fold whose byte offset is fully
+constant (`modulus == 1`) is recorded in the compile's capture regardless
+of the mode. When the mode is enabled, the very END of the optimization
+pipeline — after the last StructFieldPass run and after the audit
+snapshot, so no later fold pass can recognize the check loads as
+period_const and re-fold them into the constants they compare against —
+emits at the specialized function's entry:
+
+```text
+head:   %active = call i1 @__ejit_asan_gate(i32 %slot)
+        br %active, check, cont
+check:  per folded field: load <field> through the CURRENT bound argument;
+        compare with the baked constant
+fail:   call @__ejit_asan_mismatch(i32 %site, ptr %arg, i64 %value)
+        br cont                        -- report-only: the call continues
+cont:   <original body>
+```
+
+The stub resolves `__ejit_asan_gate`/`__ejit_asan_mismatch` through the
+same absolute-symbol path as the value-profiling hooks (registered by
+`ejit_init`; same-image/same-VA cross-core precondition). Residue-driven
+bound folds (`modulus > 1` — a free-dim index in the address) get NO
+entry stub in v1: the stub would have to recompute the index per call;
+those folds keep their full worker-probe coverage instead. Functions with
+no bound folds emit nothing; the dormant cost of an instrumented entry is
+one gate call.
+
+**Rotation.** One shared rotation state (`gEJitAsanState`, inter-core
+shared memory; an independent blob — the taskpool state and its ABI are
+untouched): a function-slot table claimed by the emitting worker (a slot
+is never freed; a dead slot — no published sites — may only be renamed
+once the table is full), and one cell per core. At most ONE function slot
+is active per core at a time: `EJIT_ASAN_ROTATION_WINDOW` consecutive
+calls of the active function are checked, then the next gate call
+advances to the next slot. Each core rotates independently (a cold core
+stalls only its own rotation). By product decision v1 has NO dead-slot
+skip and NO tick backstop: if a slot with no live versions (or a
+function nobody calls) is reached, that core's rotation rests on it
+until some instrumented call arrives; `ejit_asan_rotation_status()` makes
+the stall visible. The gate reads only its own core's cell — plain loads
+and stores, no atomics on the hot path — and cores beyond
+`EJIT_ASAN_MAX_CORES` are safely degraded (never check).
+
+**Records.** The mismatch hook freezes, on the FIRST divergence per site,
+the seen value and the actual argument pointer (a CAS elects the single
+freezing writer; losers only grow a saturating count). Entry rows carry
+no rate: counting every executed check would put an atomic in the hot
+stub; the per-core `checks` counter covers the volume and is reported in
+the stats. Sites are monotonic per boot (version retirement does not
+reclaim them); when the site budget is full the newest capture is dropped
+with a discoverable log and its folds keep the worker-probe coverage.
 
 ## Output model
 
-Normal scanning never prints: a mismatching probe only bumps the location's
-sticky record and the global counters. Output happens only when the worker
-core calls `ejit_asan_dump()` — synchronously, in the caller's
-context:
+`ejit_asan_dump()` prints the report NOW, synchronously in the caller's
+context (owner/worker core only): one probe slice, one row per recorded
+location, then the stats line, each paced with fixed 20-tick yields; a
+second call while printing returns `EJIT_ERR_NOT_ACTIVE`.
 
-1. one scan slice runs (same pacing as any other slice);
-2. every location that has EVER mismatched is reported, one row each (nothing
-   is re-read at print time):
+Worker-probe row (unchanged semantics; `kind` is `value`, `pointer-root`,
+or `bound`):
 
-   ```text
-   [EJIT-ASAN] MISMATCH tier=0 gen=1 dims=0:1@1,0:0@0,0:0@0,0:0@0
-     period=asan_cell fn=ejit_asan_probe
-     object=gEJitAsanCells@0x82f40000 offset=0x14 src=arg1
-     residue=4/5 kind=value expected=0x7 first=0x11 count=7/7 rate=100.0%
-   ```
-
-   - `tier/gen/dims` — which specialization version (tier, generation,
-     dimType:instance@version).
-   - `period/fn` — the fold's source period and function.
-   - `object=<symbol>@<base> offset=<bytes>` — the watched member's exact
-     position: the fold's source global (C symbol) with its base address,
-     and the member's byte offset inside it. For a changed pointer root the
-     compared member is the slot itself (`object=<ptr>@<slot> offset=0x0`).
-   - `src` — the driving free-dim parameter of the remainder domain
-     (`arg<N>`, or `const` for fully constant indices); the domain size is
-     the residue denominator.
-   - `residue=r/n` — which slot of the free-dim domain (e.g. `slot % 5`
-     folds watch all 5 candidate addresses; each slot is probed and reported
-     independently).
-   - `kind` — what the row compares: `value` (shared bytes vs the constant
-     baked into the code) or `pointer-root` (the shared pointer slot vs the
-     pointer baked into the code).
-   - `expected`/`first` — the value baked into the code and the value seen at
-     the FIRST mismatch (frozen; later mismatches do not update it).
-   - `count=m/s rate=x.y%` — saturating per-location counters (mismatches /
-     probe attempts); recovery does NOT unregister a recorded location: the
-     row stays listed with its frozen count while samples keep growing, so
-     the rate decays after recovery.
-3. the stats line: `versions`, `staged`, `watches=<used>/<cap>` (with a FULL
-   marker once the budget is exhausted), `checked_active=A/B`, `checks`,
-   `mismatch_samples`, `rate` (global, clamped to 100%), `recorded`
-   (recorded locations), `uncovered`, `dropped`, `blocked_root`, `retired`.
-
-`ejit_asan_dump()` prints the whole report before returning — the
-call blocks through the slice, every row, and the stats line. A second call
-while a report is still printing returns `EJIT_ERR_NOT_ACTIVE`. While a
-report prints, the worker's periodic scan stands down; compile and publish
-work keep running. `checks=0` is not a pass; `uncovered` counts folds whose
-shape the verifier cannot watch.
-
-Registration failures are discoverable at compile time, not only via a
-dump: a capture fully dropped by the version budget logs one
-`[EJIT-ASAN] capture DROPPED` line, and any trimmed capture (per-capture
-fold cap or global watch budget) logs one
-`[EJIT-ASAN] capture TRIMMED` line, both from the worker at INFO level.
-Uncoverable fold shapes additionally log at VERBOSE level during capture.
-
-### Mapping offsets to source-level members
-
-The embedded bitcode carries IR-level layouts only: struct member NAMES are
-stripped during lowering, so the runtime cannot print `slot5[4].value`
-directly. To resolve `object=...@0x... offset=0x14` to a field, build a `-g`
-(full debug info, not `-gline-tables-only`) image once and read the DWARF:
-
-```bash
-llvm-dwarfdump --name=gEJitAsanCells board.elf
+```text
+[EJIT-ASAN] MISMATCH tier=0 gen=1 dims=... period=asan_cell
+  fn=ejit_asan_probe object=gEJitAsanCells@0x82f40000 offset=0x14 src=arg1
+  residue=4/5 kind=value expected=0x7 first=0x11 count=7/7 rate=100.0%
 ```
 
-The struct type tree lists every member with its byte offset and size; the
-row's offset picks the member (and the residue picks the array slot) without
-any runtime support. This mapping stays offline tooling by design.
+Entry row (new; `kind=entry`; `object=bound@<arg>` names the diverging
+family member; `src=boundN` names the bound-pointer argument; no
+residue/rate by design):
+
+```text
+[EJIT-ASAN] MISMATCH tier=0 gen=3 period=asan_cell fn=ejit_asan_bound_probe
+  object=bound@0x82f50020 offset=0x0 src=bound1 kind=entry
+  expected=0x7 first=0x9 count=N
+```
+
+Stats line: `versions`, `staged`, `watches=<n>/<cap>` (FULL marker),
+`checked_active`, `checks`, `mismatch_samples`, `rate`, `recorded`,
+`uncovered`, `dropped`, `blocked_root`, `retired`, plus `entry_checks`
+(per-core served checks, summed) and `entry_sites` (sites with a frozen
+record). `checks=0` is not a pass.
+
+`ejit_asan_rotation_status()`: read-only, any core, any time. Prints the
+claimed-slot count and site count, then one line per core that ever served
+a check — slot (with function name), window progress, completed
+rotations, checks served:
+
+```text
+[EJIT-ASAN] rotation slots=2/64 sites=5
+[EJIT-ASAN] rotation core=16 slot=1(ejit_asan_bound_probe) window=37/128 cycles=12 checks=1543
+```
+
+### Mapping offsets to source members
+
+Unchanged: embedded bitcode carries IR-level layouts only, so resolve
+`object=...@0x... offset=0x14` offline via DWARF on a `-g` image
+(`llvm-dwarfdump --name=<symbol> board.elf`). This stays offline tooling.
 
 ## Coverage and contract
 
-Coverage is limited to scalar integer/pointer folds with a registered source,
-constant offsets and one fully enumerable unsigned remainder (residues <= 16),
-including `%5` and `%10`. For root pointers it compares the current shared
-slot against the materialized pointer. For bounded fields behind them it
-double-checks the root and does not follow a newly installed pointer.
-Borrowed bound-pointer pointees are watched as `kind=bound` rows
-(`object=bound@<rawPtr> offset=...`, period from the ejit_bound_ptr
-annotation): product discipline is that a bound pointee is HEAP memory whose
-lifetime spans the active specialization version — a stack address would be
-reused after return and produce false mismatches. PHI-witness folds are
-watched like the period fold they resolve to (the row carries the witness's
-source object; the residue enumeration evaluates under the same PHI binding
-the fold proved). A load that never folded is not a verifier failure.
+Worker-probe coverage: scalar integer/pointer folds with a registered
+source, constant offsets, one fully enumerable unsigned remainder
+(residues <= 16), pointer roots double-checked, bound exemplars probed at
+their frozen snapshot address.
 
-The selected source ranges must be coherent shared RAM with the same contents
-on worker and producer. The globals and registered objects of every monitored
-period must remain mapped and resident through shutdown; shared mapping alone
-does not make a freed or reused allocation readable. Updates must not tear or
-race ordinary loads; deliberate diagnostic mutations use naturally aligned
-atomic stores. Do not opt volatile/MMIO or moving pointees into this feature.
-A generation check discards a sample that overlaps a lifecycle change; it does
-not pin storage.
+Entry-stub coverage: bound folds with a fully constant offset inside the
+pointee (width 1/8/16/32/64). The typed IR load makes endianness the
+codegen's job — no manual byte-order handling. Not covered by the stub
+(v1): residue-driven bound addresses, non-bound folds, and anything whose
+pointee is not live shared memory.
+
+The product contract for bound pointers is unchanged (heap memory,
+lifetime spanning the version, updates coherent across cores) plus the
+family rule the stub enforces empirically: all pointers passed during a
+version's lifetime must agree on the folded members. Report-only means a
+family break is OBSERVED, not corrected — the call still uses the baked
+constant, so a persistent `kind=entry` row is a live wrong-answer bug in
+the business results until the product restores consistency (or
+recompiles).
 
 ## Board smoke
 
-Link only `ejit_test/ejit_asan_sre_test.c` using normal spec5
-annotations and build flags (the verifier runtime requires no new Clang flag).
-Enable stats for the runtime build. Follow the product's existing init-array
-and shared section configuration:
+Link only `ejit_test/ejit_asan_sre_test.c` with normal spec5 build flags
+(board-only demo; not enrolled in `build.sh ALL_TESTS`). The new EJIT-ASAN
+runtime entry symbols are lipo GC roots (`ejit_asan_dump`,
+`ejit_enable_asan_mode`, `ejit_asan_rotation_status`,
+`__ejit_asan_gate`, `__ejit_asan_mismatch`) — verify the trimmed image
+still defines them (`nm -g board.elf | grep ejit_asan`).
 
-1. Core 6: `test_ejit_asan_start`.
-2. Core 16: `test_ejit_asan_sample` (waits for T1 and T2).
-3. Core 6: `ejit_asan_dump`. The stats line must show full checked
-   coverage (`checked_active=15/15`, `watches=2/81920`) with zero recorded
-   locations and zero mismatch_samples. With just this demo there is nothing
-   to report, so no problem rows print.
-4. Core 16: `test_ejit_asan_inject`. It changes only residues 4 and 9
-   and does not call the optimized function — nothing prints on its own.
-5. Core 6: `ejit_asan_dump` again. The call returns only after the
-   two problem rows (`residue=4/5` and `residue=9/10`, one printed every 20
-   ticks) and the stats line are out, with `mismatch_samples` and `recorded`
-   both non-zero. A dump also advances one scan slice. Reboot before
-   repeating; never use the injection command in a production image.
+1. Core 6: `test_ejit_asan_start` — enables the entry mode (before
+   `ejit_init`) and initializes.
+2. Core 16: `test_ejit_asan_sample` — worker-probe demo (waits for the
+   global probe's compile; full coverage of the demo folds).
+3. Core 6: `ejit_asan_dump` — stats line shows full probe coverage, zero
+   recorded rows, `entry_checks=0`.
+4. Core 16: `test_ejit_asan_bound_sample` — compiles the bound probe from
+   the family exemplar (FamilyA, scale=7).
+5. Core 16: `test_ejit_asan_bound_inject` — 512 calls with the divergent
+   member FamilyB. Every call returns the BAKED computation (7·input+1),
+   which is the wrong-answer symptom itself; with two slots and window
+   128 the rotation guarantees at least one entry check lands on the
+   bound probe's slot.
+6. Core 6: `ejit_asan_dump` again — exactly one `kind=entry` row for
+   `ejit_asan_bound_probe`: `object=bound@<address of FamilyB>`,
+   `expected=0x7 first=0x9`, count > 0; `entry_checks>0` and
+   `entry_sites=1` in the stats. The worker-probe watch for the FamilyA
+   exemplar records nothing (FamilyA never changed).
+7. Any core: `ejit_asan_rotation_status` — per-core window/cycles/checks.
+
+Reboot before repeating; the injection commands are diagnostic-only.

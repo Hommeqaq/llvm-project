@@ -26,10 +26,38 @@ uint32_t ejit_asan_probe(EJIT_DIM(asan_cell) uint8_t cell,
          gEJitAsanCells[cell].slot10[slot % 10].value + token;
 }
 
+// Entry-instrumentation demo: a bound_ptr "family" of objects whose
+// period_const members are promised consistent across every pointer the
+// product may pass. FamilyA is the compile-time exemplar (scale=7); FamilyB
+// carries the same layout but a divergent scale (9) — the family-consistency
+// break the entry stub exists to catch at the call site.
+struct AsanBoundCfg {
+  EJIT_PERIOD_CONST uint32_t scale; // +0: family-consistent, folded
+  uint32_t runtimeBias;             // +4: per-member, never folded
+};
+
+__attribute__((section(".mc_shared"), aligned(64)))
+struct AsanBoundCfg gAsanFamilyA = {7u, 100u};
+__attribute__((section(".mc_shared"), aligned(64)))
+struct AsanBoundCfg gAsanFamilyB = {9u, 100u};
+
+EJIT_ENTRY __attribute__((noinline))
+uint32_t ejit_asan_bound_probe(EJIT_DIM(asan_cell) uint8_t cell,
+                               EJIT_BOUND_PTR(asan_cell)
+                                   const struct AsanBoundCfg *cfg,
+                               uint32_t input) {
+  return cfg->scale * input + cell;
+}
+
 int test_ejit_asan_start(void) {
   if (ejit_sre_current_core_id() != 6)
     return -1;
   ejit_set_log_level(EJIT_LOG_INFO);
+  // Must precede ejit_init: subsequent worker compiles emit the
+  // bound_ptr entry stubs (see EJIT_ASAN_CHECK.md).
+  ejit_status_t st = ejit_enable_asan_mode();
+  if (st != EJIT_OK)
+    return st;
   return ejit_init_pgo(0);
 }
 
@@ -78,5 +106,50 @@ int test_ejit_asan_inject(void) {
                    __ATOMIC_RELEASE);
   __atomic_store_n(&gEJitAsanCells[1].slot10[9].value, 19,
                    __ATOMIC_RELEASE);
+  return 0;
+}
+
+// Compile the bound probe from the family exemplar (FamilyA). The AOT body
+// and the specialization agree on FamilyA, so the return value cannot tell
+// them apart; completion is observed through the taskpool stats.
+int test_ejit_asan_bound_sample(void) {
+  if (ejit_sre_current_core_id() != 16 ||
+      !ejit_is_active("asan_cell", 1))
+    return -1;
+  ejit_taskpool_stats_t before = {0};
+  if (ejit_taskpool_get_stats(&before) != EJIT_OK)
+    return -2;
+  (void)ejit_asan_bound_probe(1, &gAsanFamilyA, 3);
+  for (uint32_t i = 1; i <= 65536; ++i) {
+    if (ejit_asan_bound_probe(1, &gAsanFamilyA, i) != 7u * i + 1u)
+      return -3;
+    if ((i & 15) != 0)
+      continue;
+    ejit_taskpool_stats_t now = {0};
+    if (ejit_taskpool_get_stats(&now) != EJIT_OK ||
+        now.compileFailed != before.compileFailed ||
+        now.publishFailed != before.publishFailed)
+      return -4;
+    if (now.asyncCompiles >= before.asyncCompiles + 1 &&
+        now.cacheHits > before.cacheHits)
+      return 0;
+    (void)SRE_TaskDelay(1);
+  }
+  return -5;
+}
+
+// The family break: call the bound probe with the divergent member
+// FamilyB. Report-only: every call still returns the BAKED computation
+// (scale=7), which is exactly the wrong-answer symptom the entry stub is
+// there to surface. The rotation window (EJIT_ASAN_ROTATION_WINDOW=128,
+// two slots) means a few hundred calls guarantee at least one check lands
+// on this function's slot.
+int test_ejit_asan_bound_inject(void) {
+  if (ejit_sre_current_core_id() != 16 ||
+      !ejit_is_active("asan_cell", 1))
+    return -1;
+  for (uint32_t i = 1; i <= 512; ++i)
+    if (ejit_asan_bound_probe(1, &gAsanFamilyB, i) != 7u * i + 1u)
+      return -2;
   return 0;
 }
