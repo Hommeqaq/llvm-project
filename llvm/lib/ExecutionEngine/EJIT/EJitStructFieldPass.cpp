@@ -2808,6 +2808,7 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
           EF.width = static_cast<uint8_t>(Width);
           EF.align = static_cast<uint8_t>(LI->getAlign().value());
           EF.folded = false;
+          EF.atomic = LI->isAtomic();
           EF.siteId = kEJitAsanNoSite;
           continue;
         }

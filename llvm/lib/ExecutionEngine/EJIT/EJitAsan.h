@@ -109,6 +109,7 @@ struct EJitAsanEntryFold {
   uint8_t width = 0;
   uint8_t align = 0; // Field alignment in bytes.
   bool folded = true;
+  bool atomic = false; // Original load was atomic: observe with Acquire.
 };
 
 // One annotated field of a registered object, enumerated from GV metadata for

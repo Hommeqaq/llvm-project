@@ -792,7 +792,7 @@ TEST(EJitAsan, DumpReportsEntryRowsAndStats) {
   EXPECT_NE(Out.find("expected=0x11223344"), std::string::npos);
   EXPECT_NE(Out.find("first=0xdeadbeef"), std::string::npos);
   EXPECT_NE(Out.find("entry_checks=1"), std::string::npos);
-  EXPECT_NE(Out.find("entry_sites=1"), std::string::npos);
+  EXPECT_NE(Out.find("entry_folded_sites=1"), std::string::npos);
 }
 
 TEST(EJitAsan, SkipsEntryFoldsOwnedByOtherEntries) {
@@ -1001,6 +1001,195 @@ TEST(EJitAsan, DriftWalkClassifiesUncoveredSurvivors) {
   EXPECT_EQ(Capture.driftUncovered, 2u);
   ASSERT_EQ(Capture.annotatedFields.size(), 1u);
   EXPECT_EQ(Capture.annotatedFields.front().object, "cfg");
+}
+
+TEST(EJitAsan, EmitsMergedStubForFoldedAndDriftFolds) {
+  // One entry, two annotated fields through the same bound argument: one
+  // folds (plain load, baked constant), one survives as atomic (a drift
+  // observation). The merged stub has ONE gate, ONE switch case for the
+  // single bound argument, a comparison for the folded field, and an
+  // unconditional observation call for the drift field.
+  resetAsanBlob();
+  auto C = std::make_unique<LLVMContext>();
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    declare void @observe(i32)
+    define i32 @probe(i8 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %p = getelementptr inbounds i8, ptr %cfg, i64 4
+      %v = load i32, ptr %p, !ejit.period_const !7
+      %q = getelementptr inbounds i8, ptr %cfg, i64 0
+      %w = load atomic i32, ptr %q acquire, align 4, !ejit.period_const !7
+      %r = add i32 %v, %w
+      ret i32 %r
+    }
+    !0 = !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !4, !5}
+    !4 = !{i64 0, i64 4}
+    !5 = !{i64 4, i64 4}
+    !7 = !{}
+  )",
+                               Err, *C);
+  ASSERT_TRUE(M);
+  // Field at +0 = drift baseline, field at +4 = folded constant.
+  uint64_t Object[1] = {0x1122334400000000ULL | 0xCAFEBABE};
+  PeriodArrayRegistry Registry;
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Object),
+                                /*size=*/8, /*argIndex=*/1, /*instance=*/1});
+  Ctx.asanEntryChecks = true;
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  ASSERT_EQ(Capture.entryFolds.size(), 2u);
+  const EJitAsanEntryFold *Folded = nullptr, *Drift = nullptr;
+  for (const auto &EF : Capture.entryFolds) {
+    if (EF.folded)
+      Folded = &EF;
+    else
+      Drift = &EF;
+  }
+  ASSERT_NE(Folded, nullptr);
+  ASSERT_NE(Drift, nullptr);
+  EXPECT_EQ(Folded->byteOffset, 4u);
+  EXPECT_EQ(Folded->expected, 0x11223344u);
+  EXPECT_EQ(Drift->byteOffset, 0u);
+  EXPECT_EQ(Drift->expected, 0xCAFEBABEu);
+  EXPECT_TRUE(Drift->atomic);
+
+  EXPECT_EQ(countCallsTo(*M, "__ejit_asan_gate"), 1u);
+  EXPECT_EQ(countCallsTo(*M, "__ejit_asan_mismatch"), 2u);
+  EXPECT_NE(Folded->siteId, kEJitAsanNoSite);
+  EXPECT_NE(Drift->siteId, kEJitAsanNoSite);
+  EXPECT_EQ(gEJitAsanState.sites[Folded->siteId].kind, kEJitAsanKindFolded);
+  EXPECT_EQ(gEJitAsanState.sites[Drift->siteId].kind, kEJitAsanKindDrift);
+  EXPECT_EQ(gEJitAsanState.slots[0].boundCount.loadRelaxed(), 1u);
+  EXPECT_EQ(gEJitAsanState.slots[0].activeSites.loadRelaxed(), 2u);
+  // Publish seeded the drift baseline so the first observation cannot
+  // report a pseudo-change.
+  EXPECT_EQ(gEJitAsanState.sticky[Drift->siteId].lastSeen.loadRelaxed(),
+            0xCAFEBABEu);
+  // One switch with one case (a single bound argument), keeping the
+  // per-call cost to exactly one argument's checks.
+  SwitchInst *Rot = nullptr;
+  for (Instruction &I : instructions(M->getFunction("probe")))
+    if (auto *Sw = dyn_cast<SwitchInst>(&I))
+      Rot = Sw;
+  ASSERT_NE(Rot, nullptr);
+  EXPECT_EQ(Rot->getNumCases(), 1u);
+}
+
+TEST(EJitAsan, DriftStubEndToEndRecordsDivergentBuffer) {
+  // The drift half of the stub, end to end: the observation call reports
+  // the field value seen through the CURRENT bound argument on every
+  // activated call, and the hook judges it against the baseline. The
+  // unfolded load still feeds the body, so the call returns the REAL
+  // value — unlike a folded mismatch, nothing is masked.
+  resetAsanBlob();
+  EJitCoreId::setCurrentForTest(0);
+  auto C = std::make_unique<LLVMContext>();
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    declare void @observe(i32)
+    define i32 @probe(i8 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %p = getelementptr inbounds i8, ptr %cfg, i64 4
+      %v = load atomic i32, ptr %p acquire, align 4, !ejit.period_const !7
+      ret i32 %v
+    }
+    !0 = !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !4}
+    !4 = !{i64 4, i64 4}
+    !7 = !{}
+  )",
+                               Err, *C);
+  ASSERT_TRUE(M);
+  uint64_t Good[1] = {uint64_t(0x11223344) << 32};
+  uint64_t Bad[1] = {uint64_t(0x55aa55aa) << 32};
+
+  PeriodArrayRegistry Registry;
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Good),
+                                /*size=*/8, /*argIndex=*/1, /*instance=*/1});
+  Ctx.asanEntryChecks = true;
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  ASSERT_EQ(Capture.entryFolds.size(), 1u);
+  const uint32_t Site = Capture.entryFolds.front().siteId;
+  ASSERT_NE(Site, kEJitAsanNoSite);
+  ASSERT_EQ(gEJitAsanState.sites[Site].kind, kEJitAsanKindDrift);
+
+  auto J = cantFail(orc::LLJITBuilder().create());
+  orc::SymbolMap Syms;
+  Syms[J->mangleAndIntern("__ejit_asan_gate")] = orc::ExecutorSymbolDef(
+      orc::ExecutorAddr::fromPtr(&__ejit_asan_gate), JITSymbolFlags::Exported);
+  Syms[J->mangleAndIntern("__ejit_asan_mismatch")] =
+      orc::ExecutorSymbolDef(orc::ExecutorAddr::fromPtr(&__ejit_asan_mismatch),
+                             JITSymbolFlags::Exported);
+  cantFail(J->getMainJITDylib().define(orc::absoluteSymbols(std::move(Syms))));
+  cantFail(J->addIRModule(
+      orc::ThreadSafeModule(std::move(M), std::move(C))));
+  auto Sym = cantFail(J->lookup("probe"));
+  auto *Probe =
+      jitTargetAddressToFunction<int32_t (*)(uint8_t, void *)>(Sym.getValue());
+
+  // Divergent member observed on the first activated call.
+  EXPECT_EQ(Probe(1, Bad), 0x55aa55aa);
+  const EJitAsanSticky &R = gEJitAsanState.sticky[Site];
+  EXPECT_EQ(R.recorded.loadRelaxed(), 2u);
+  EXPECT_EQ(R.firstValue, 0x55aa55aau);
+  EXPECT_EQ(R.firstArg, reinterpret_cast<uint64_t>(Bad));
+  EXPECT_EQ(R.driftChanges.loadRelaxed(), 1u);
+  EXPECT_EQ(R.samples.loadRelaxed(), 1u);
+  EXPECT_EQ(R.lastSeen.loadRelaxed(), 0x55aa55aau);
+  // Same value again: a sample, no new change.
+  EXPECT_EQ(Probe(1, Bad), 0x55aa55aa);
+  EXPECT_EQ(R.samples.loadRelaxed(), 2u);
+  EXPECT_EQ(R.driftChanges.loadRelaxed(), 1u);
+  // Back to the baseline member: a second transfer.
+  EXPECT_EQ(Probe(1, Good), 0x11223344);
+  EXPECT_EQ(R.driftChanges.loadRelaxed(), 2u);
+  EXPECT_EQ(R.lastSeen.loadRelaxed(), 0x11223344u);
+
+  EJitSharedTaskPool Pool;
+  EJitAsan Verifier;
+  auto Level = ejit_get_log_level();
+  ejit_set_log_level(EJIT_LOG_INFO);
+  testing::internal::CaptureStdout();
+  EXPECT_TRUE(Verifier.dumpNow(Pool));
+  const std::string Out = testing::internal::GetCapturedStdout();
+  ejit_set_log_level(Level);
+  EXPECT_NE(Out.find("kind=drift"), std::string::npos);
+  EXPECT_NE(Out.find("object=bound@0x"), std::string::npos);
+  EXPECT_NE(Out.find("initial=0x11223344 last=0x11223344"), std::string::npos);
+  EXPECT_NE(Out.find("changes=2 samples=3"), std::string::npos);
+  EXPECT_NE(Out.find("entry_drift_sites=1"), std::string::npos);
+  EXPECT_NE(Out.find("entry_drift_checks=3"), std::string::npos);
+  EXPECT_NE(Out.find("entry_folded_sites=0"), std::string::npos);
+  // The forensic detail line is VERBOSE-only.
+  EXPECT_EQ(Out.find("DRIFT-DETAIL"), std::string::npos);
+
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
+  testing::internal::CaptureStdout();
+  EXPECT_TRUE(Verifier.dumpNow(Pool));
+  const std::string Verbose = testing::internal::GetCapturedStdout();
+  ejit_set_log_level(Level);
+  EXPECT_NE(Verbose.find("DRIFT-DETAIL"), std::string::npos);
+  EXPECT_NE(Verbose.find("first=0x55aa55aa"), std::string::npos);
+
+  EJitCoreId::resetForTest();
 }
 
 TEST(EJitAsan, RotationStatusPrintsPerCoreState) {

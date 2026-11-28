@@ -415,20 +415,60 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
         if (Yield)
           Yield(YieldCtx, YieldDelayTicks);
       }
-  // Entry-instrumentation rows, read from the shared blob: sites whose
-  // sticky record ever froze a mismatch. object=bound@<arg> carries the
-  // actual bound-pointer argument of the first diverging call — the family
-  // member that broke the fold's consistency, which no worker-side probe
-  // can name. Entry rows have no residue (the stub reads the current
-  // pointer's field directly, nothing to enumerate) and no rate (counting
-  // every executed check would put an atomic in the hot path); `src=boundN`
-  // names the bound-pointer argument the field was reached through.
+  // Entry-instrumentation rows, read from the shared blob. object=bound@<arg>
+  // carries the actual bound-pointer argument of the first diverging call —
+  // the family member that broke the fold's consistency, which no
+  // worker-side probe can name. Entry rows have no residue (the stub reads
+  // the current pointer's field directly, nothing to enumerate) and no rate
+  // (counting every executed check would put an atomic in the hot path);
+  // `src=boundN` names the bound-pointer argument the field was reached
+  // through. Drift rows are evidence, not faults: a changed value means the
+  // annotation does not hold. A changed site prints its core row at INFO
+  // plus a forensic detail line at VERBOSE; a never-changed site prints at
+  // VERBOSE only (the stats line carries the aggregate).
   const uint32_t Sites = gEJitAsanState.siteCounter.loadRelaxed();
   for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si) {
     const EJitAsanSite &S = gEJitAsanState.sites[Si];
     if (S.published.loadAcquire() == 0)
       continue;
     const EJitAsanSticky &R = gEJitAsanState.sticky[Si];
+    if (S.kind == kEJitAsanKindDrift) {
+      const unsigned Recorded = R.recorded.loadAcquire();
+      if (Recorded == 1)
+        continue; // Caught mid-freeze.
+      const unsigned Samples = R.samples.loadRelaxed();
+      const unsigned Changes = R.driftChanges.loadRelaxed();
+      if (Recorded == 0) {
+        // Never changed: full visibility at VERBOSE only.
+        EJIT_DIAG_VERBOSE(
+            "[EJIT-ASAN] DRIFT period=%s fn=%s object=bound@0x%llx "
+            "offset=0x%llx src=bound%u kind=drift initial=0x%llx last=0x%llx "
+            "changes=%u samples=%u",
+            S.period, S.function,
+            (unsigned long long)R.firstArg, (unsigned long long)S.byteOffset,
+            S.argNo, (unsigned long long)S.expected,
+            (unsigned long long)R.lastSeen.loadRelaxed(), Changes, Samples);
+        if (Yield)
+          Yield(YieldCtx, YieldDelayTicks);
+        continue;
+      }
+      EJIT_DIAG_RAW(
+          "[EJIT-ASAN] DRIFT period=%s fn=%s object=bound@0x%llx "
+          "offset=0x%llx src=bound%u kind=drift initial=0x%llx last=0x%llx "
+          "changes=%u samples=%u",
+          S.period, S.function, (unsigned long long)R.firstArg,
+          (unsigned long long)S.byteOffset, S.argNo,
+          (unsigned long long)S.expected,
+          (unsigned long long)R.lastSeen.loadRelaxed(), Changes, Samples);
+      EJIT_DIAG_VERBOSE(
+          "[EJIT-ASAN] DRIFT-DETAIL fn=%s offset=0x%llx first=0x%llx "
+          "tier=%u gen=%u",
+          S.function, (unsigned long long)S.byteOffset,
+          (unsigned long long)R.firstValue, S.tier, S.gen);
+      if (Yield)
+        Yield(YieldCtx, YieldDelayTicks);
+      continue;
+    }
     if (R.recorded.loadAcquire() < 2)
       continue; // Never mismatched, or caught mid-freeze (== 1).
     unsigned Count = R.count.loadRelaxed();
@@ -459,21 +499,31 @@ void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
       checks_ ? (unsigned)((mismatchSamples_ * 1000) / checks_) : 0;
   if (GlobalRate > 1000)
     GlobalRate = 1000;
-  // Entry-instrumentation volume: per-core served checks (summed across the
-  // shared cells) and sites whose sticky record froze a mismatch.
-  uint64_t EntryChecks = 0, EntrySites = 0;
+  // Entry-instrumentation volume: per-core served checks (summed across
+  // the shared cells), sites whose sticky record froze (folded mismatches
+  // vs drift changes), and the drift observation volume.
+  uint64_t EntryChecks = 0, EntryFoldedSites = 0, EntryDriftSites = 0,
+           EntryDriftChecks = 0;
   for (const auto &Cell : gEJitAsanState.cells)
     EntryChecks += Cell.checks;
   const uint32_t Sites = gEJitAsanState.siteCounter.loadRelaxed();
-  for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si)
-    if (gEJitAsanState.sites[Si].published.loadAcquire() &&
-        gEJitAsanState.sticky[Si].recorded.loadAcquire() >= 2)
-      ++EntrySites;
+  for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si) {
+    if (!gEJitAsanState.sites[Si].published.loadAcquire())
+      continue;
+    const EJitAsanSticky &R = gEJitAsanState.sticky[Si];
+    if (gEJitAsanState.sites[Si].kind == kEJitAsanKindDrift) {
+      EntryDriftChecks += R.samples.loadRelaxed();
+      EntryDriftSites += R.recorded.loadAcquire() >= 2;
+    } else {
+      EntryFoldedSites += R.recorded.loadAcquire() >= 2;
+    }
+  }
   EJIT_DIAG_RAW(
       "[EJIT-ASAN] versions=%zu staged=%zu watches=%u/%u%s "
       "checked_active=%llu/%llu checks=%llu mismatch_samples=%llu "
       "rate=%u.%u%% recorded=%u uncovered=%llu dropped=%llu "
-      "blocked_root=%llu retired=%llu entry_checks=%llu entry_sites=%llu",
+      "blocked_root=%llu retired=%llu entry_checks=%llu "
+      "entry_folded_sites=%llu entry_drift_sites=%llu entry_drift_checks=%llu",
       live_.size(), pending_.size(), retainedWatches_, MaxWatches,
       Full ? " FULL" : "",
       (unsigned long long)checkedActiveProbes_,
@@ -481,7 +531,9 @@ void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
       (unsigned long long)mismatchSamples_, GlobalRate / 10u, GlobalRate % 10u,
       Recorded, (unsigned long long)uncovered_, (unsigned long long)dropped_,
       (unsigned long long)blockedRoot_, (unsigned long long)retired_,
-      (unsigned long long)EntryChecks, (unsigned long long)EntrySites);
+      (unsigned long long)EntryChecks, (unsigned long long)EntryFoldedSites,
+      (unsigned long long)EntryDriftSites,
+      (unsigned long long)EntryDriftChecks);
   if (Yield)
     Yield(YieldCtx, YieldDelayTicks);
 }

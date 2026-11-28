@@ -208,25 +208,17 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
     return;
   // A fold captured from another function's formals belongs to THAT
   // function's argument list; only folds owned by the specialized entry
-  // are emittable (a foreign index would read out of range). Drift records
-  // are not emitted by this path.
-  unsigned Foreign = 0, Folded = 0;
-  for (const EJitAsanEntryFold &EF : Cap->entryFolds) {
-    if (!EF.folded)
-      continue;
-    ++Folded;
+  // are emittable (a foreign index would read out of range).
+  unsigned Foreign = 0;
+  for (const EJitAsanEntryFold &EF : Cap->entryFolds)
     if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
       ++Foreign;
-  }
-  if (!Folded)
-    return;
-  if (Foreign) {
+  if (Foreign == Cap->entryFolds.size())
+    return; // Nothing emittable for this function.
+  if (Foreign)
     EJIT_DIAG_VERBOSE("[EJIT-ASAN] entry stub skipped %u fold(s) owned by "
                       "other module functions fn=%s",
                       Foreign, Ctx.fnName.c_str());
-    if (Foreign == Folded)
-      return; // Nothing emittable for this function.
-  }
   const uint32_t Slot = ejitAsanClaimSlot(Ctx.fnName);
   if (Slot == kEJitAsanNoSlot) {
     EJIT_DIAG("[EJIT-ASAN] capture DROPPED: slot table full (cap=%d) fn=%s",
@@ -238,10 +230,11 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
   SmallVector<EJitAsanEntryFold *, 8> Published;
   unsigned BudgetSkipped = 0;
   for (EJitAsanEntryFold &EF : Cap->entryFolds) {
-    if (!EF.folded || EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
+    if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
       continue; // Counted and logged above.
+    const uint8_t Kind = EF.folded ? kEJitAsanKindFolded : kEJitAsanKindDrift;
     const uint32_t Site =
-        ejitAsanPublishSite(Slot, Ctx.fnName, EF.period, kEJitAsanKindFolded,
+        ejitAsanPublishSite(Slot, Ctx.fnName, EF.period, Kind,
                             static_cast<uint8_t>(Ctx.tier), EF.argNo,
                             EF.width, EF.align, EF.byteOffset, EF.expected);
     if (Site == kEJitAsanNoSite) {
@@ -302,6 +295,19 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
       Argument *Arg = F->getArg(EF->argNo);
       Value *Addr =
           B.CreateInBoundsGEP(B.getInt8Ty(), Arg, B.getInt64(EF->byteOffset));
+      if (!EF->folded) {
+        // Drift observation: every activated call reports the field value
+        // through the hook — no comparison here; the hook protocol judges
+        // it against the last-seen baseline. Acquire when the original
+        // load was atomic.
+        LoadInst *V = B.CreateAlignedLoad(LoadTy, Addr, MaybeAlign(EF->align));
+        if (EF->atomic)
+          V->setAtomic(AtomicOrdering::Acquire);
+        B.CreateCall(Hook,
+                     {B.getInt32(EF->siteId), Arg,
+                      B.CreateZExt(V, B.getInt64Ty(), "asan.seen")});
+        continue;
+      }
       Value *V = B.CreateAlignedLoad(LoadTy, Addr, MaybeAlign(EF->align));
       Value *Ok =
           B.CreateICmpEQ(V, ConstantInt::get(LoadTy, EF->expected), "asan.ok");
