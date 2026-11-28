@@ -915,6 +915,50 @@ isBoundPeriodConstLoad(LoadInst *LI, const AssumedArgMap &BoundArguments,
 static bool offsetFitsInObject(const GlobalVariable *GV, uint64_t ByteOffset,
                                 Type *LoadTy, const DataLayout &DL);
 
+/// Metadata-free recognition of an annotated-field access: the pointer
+/// resolves to a constant element-relative field offset matching the GV's
+/// ejit_period_const_field metadata, and the access fits inside the field.
+/// Shared by the fold predicate (isPeriodConstLoad) and the final-module
+/// drift walk; the volatile/atomic and marker checks stay with the callers.
+static bool recognizesAnnotatedField(const Value *Ptr, Type *LoadTy,
+                                     const PeriodConstOffsetMap &FieldMap,
+                                     const DataLayout &DL,
+                                     const EJitFreeDimAssumptions &Assumed,
+                                     const GlobalVariable *&RootGV,
+                                     uint64_t &FieldOffset) {
+  RootGV = nullptr;
+  // v1.7 fallback for loads whose marker an earlier pass dropped. The recorded
+  // offsets are element-relative, so match on the field coordinate rather than
+  // the total offset from the global, and require the access to fit inside the
+  // field it starts at.
+  auto Off = ejitPeriodConstFieldOffset(Ptr, DL, RootGV);
+  if (!Off && usesLocalFreeDim(Ptr, Assumed)) {
+    RootGV = findRootGV(Ptr);
+    auto Witness = accumulateFullOffset(DL, Ptr, Assumed);
+    if (RootGV && Witness &&
+        offsetFitsInObject(RootGV, *Witness, LoadTy, DL)) {
+      Type *Element = RootGV->getValueType();
+      if (auto *Array = dyn_cast<ArrayType>(Element))
+        Element = Array->getElementType();
+      TypeSize Stride = DL.getTypeAllocSize(Element);
+      if (!Stride.isScalable() && Stride.getFixedValue())
+        Off = *Witness % Stride.getFixedValue();
+    }
+  }
+  if (!Off || !RootGV)
+    return false;
+  auto It = FieldMap.find(RootGV);
+  if (It == FieldMap.end() || !is_contained(It->second, *Off))
+    return false;
+  TypeSize AccessSize = DL.getTypeStoreSize(LoadTy);
+  if (AccessSize.isScalable() ||
+      !ejitAccessFitsPeriodConstField(RootGV, *Off,
+                                      AccessSize.getFixedValue(), DL))
+    return false;
+  FieldOffset = *Off;
+  return true;
+}
+
 /// Check whether a load is (or can be treated as) a period_const access.
 static bool isPeriodConstLoad(const LoadInst *LI,
                            const PeriodConstOffsetMap &periodConstFieldMap,
@@ -929,36 +973,11 @@ static bool isPeriodConstLoad(const LoadInst *LI,
   if (LI->hasMetadata(MD_EJIT_PERIOD_CONST))
     return true;
 
-  // v1.7 fallback for loads whose marker an earlier pass dropped. The recorded
-  // offsets are element-relative, so match on the field coordinate rather than
-  // the total offset from the global, and require the access to fit inside the
-  // field it starts at.
-  const GlobalVariable *RootGV = nullptr;
-  auto Off = ejitPeriodConstFieldOffset(LI->getPointerOperand(), DL, RootGV);
-  if (!Off && usesLocalFreeDim(LI->getPointerOperand(), Assumed)) {
-    RootGV = findRootGV(LI->getPointerOperand());
-    auto Witness = accumulateFullOffset(DL, LI->getPointerOperand(), Assumed);
-    if (RootGV && Witness &&
-        offsetFitsInObject(RootGV, *Witness, LI->getType(), DL)) {
-      Type *Element = RootGV->getValueType();
-      if (auto *Array = dyn_cast<ArrayType>(Element))
-        Element = Array->getElementType();
-      TypeSize Stride = DL.getTypeAllocSize(Element);
-      if (!Stride.isScalable() && Stride.getFixedValue())
-        Off = *Witness % Stride.getFixedValue();
-    }
-  }
-  if (Off && RootGV) {
-    auto It = periodConstFieldMap.find(RootGV);
-    if (It != periodConstFieldMap.end() && is_contained(It->second, *Off)) {
-      TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
-      if (!AccessSize.isScalable() &&
-          ejitAccessFitsPeriodConstField(RootGV, *Off, AccessSize.getFixedValue(),
-                                      DL))
-        return true;
-    }
-  }
-  return false;
+  const GlobalVariable *RootGV;
+  uint64_t FieldOffset;
+  return recognizesAnnotatedField(LI->getPointerOperand(), LI->getType(),
+                                  periodConstFieldMap, DL, Assumed, RootGV,
+                                  FieldOffset);
 }
 
 #ifdef EJIT_SRE_PGO_BRANCH_AUDIT
@@ -2657,6 +2676,225 @@ void captureBoundAsan(EJitAsanCapture &Capture, LoadInst &LI,
   Capture.watches.push_back(std::move(Watch));
 }
 } // namespace
+
+// Bit width of the plain scalar at ByteOffset inside an element type, or 0
+// when the annotation does not name a scalar (mid-member offset, non-scalar
+// member, vector, over-wide integer).
+static unsigned annotatedFieldWidth(Type *Ty, uint64_t ByteOffset,
+                                    const DataLayout &DL) {
+  while (auto *Array = dyn_cast<ArrayType>(Ty)) {
+    TypeSize Stride = DL.getTypeAllocSize(Array->getElementType());
+    if (Stride.isScalable() ||
+        ByteOffset >= Stride.getFixedValue() * Array->getNumElements())
+      return 0;
+    ByteOffset %= Stride.getFixedValue();
+    Ty = Array->getElementType();
+  }
+  if (auto *Struct = dyn_cast<StructType>(Ty)) {
+    if (Struct->isOpaque())
+      return 0;
+    const StructLayout *Layout = DL.getStructLayout(Struct);
+    if (ByteOffset >= Layout->getSizeInBytes())
+      return 0;
+    unsigned Idx = Layout->getElementContainingOffset(ByteOffset);
+    if (Layout->getElementOffset(Idx) != ByteOffset)
+      return 0;
+    return annotatedFieldWidth(Struct->getElementType(Idx), 0, DL);
+  }
+  if (auto *Int = dyn_cast<IntegerType>(Ty))
+    return Int->getBitWidth();
+  if (Ty->isPointerTy())
+    return DL.getPointerTypeSizeInBits(Ty);
+  if (Ty->isFloatTy())
+    return 32;
+  if (Ty->isDoubleTy())
+    return 64;
+  return 0;
+}
+
+void EJitStructFieldPass::captureDriftSites(const Module &M,
+                                            EJitAsanCapture &Capture) const {
+  assert(mapsBuilt_ && "initFromModule() must precede the drift walk");
+  const DataLayout &DL = M.getDataLayout();
+  auto Uncovered = [&](const char *Reason, const Instruction &I) {
+    ++Capture.driftUncovered;
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] drift uncovered fn=%s reason=%s",
+                      I.getFunction()->getName().str().c_str(), Reason);
+  };
+
+  // Surviving annotated loads: the ones the fold patterns left in the final
+  // module. The walk runs BEFORE stub emission because the stub's own check
+  // loads match the metadata-free bound-field fallback.
+  for (const Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (const BasicBlock &BB : F) {
+      for (const Instruction &I : BB) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        if (!LI)
+          continue;
+        const GlobalVariable *FieldGV = nullptr;
+        uint64_t FieldOff = 0;
+        const bool Marked = LI->hasMetadata(MD_EJIT_PERIOD_CONST);
+        const bool Recognized =
+            recognizesAnnotatedField(LI->getPointerOperand(), LI->getType(),
+                                     periodConstFieldMap_, DL,
+                                     freeDimAssumptions_, FieldGV, FieldOff);
+        if (!Marked && !Recognized)
+          continue;
+        if (LI->isVolatile()) {
+          Uncovered("volatile-annotated", I);
+          continue;
+        }
+        const Value *Ptr = LI->getPointerOperand();
+        const Argument *RootArg = findRootArgument(Ptr);
+        const BoundPointerState *State = nullptr;
+        if (RootArg)
+          for (const auto &S : boundStates_)
+            if (S.view.argIndex == RootArg->getArgNo()) {
+              State = &S;
+              break;
+            }
+        if (State) {
+          // Bound-anchored survivor: the specialized entry can observe the
+          // field through the CURRENT bound argument, so it becomes a drift
+          // site with the value the compile saw as its baseline.
+          auto *Ty = LI->getType();
+          unsigned Width =
+              Ty->isIntegerTy()
+                  ? Ty->getIntegerBitWidth()
+                  : Ty->isPointerTy() ? DL.getPointerTypeSizeInBits(Ty) : 0;
+          if (Width != 1 && Width != 8 && Width != 16 && Width != 32 &&
+              Width != 64) {
+            Uncovered("unsupported-load-type", I);
+            continue;
+          }
+          VerifyDomain Domain;
+          if (!Domain.collect(Ptr, freeDimAssumptions_, /*Depth=*/0,
+                              /*AllowArgs=*/true)) {
+            Uncovered("unsupported-index-domain", I);
+            continue;
+          }
+          if (Domain.modulus > 1) {
+            // A free-dim index in the address: the stub would have to
+            // recompute it per call; the full-scope watch covers the field.
+            Uncovered("residue-driven-unfolded-bound", I);
+            continue;
+          }
+          auto Offset = getBoundPointerOffset(Ptr, State->boundArguments, DL,
+                                              freeDimAssumptions_);
+          if (!Offset || *Offset >= State->view.size) {
+            Uncovered("invalid-bound-offset", I);
+            continue;
+          }
+          auto *Observed =
+              createConstantFromMemory(State->view.rawPtr + *Offset, Ty, DL);
+          if (!Observed) {
+            Uncovered("baseline-undecodable", I);
+            continue;
+          }
+          auto Bits = verifyBits(Observed);
+          if (!Bits) {
+            Uncovered("baseline-undecodable", I);
+            continue;
+          }
+          EJitAsanEntryFold &EF = Capture.entryFolds.emplace_back();
+          EF.function = F.getName().take_front(128).str();
+          EF.period =
+              State->periodName.empty() ? std::string("bound") : State->periodName;
+          EF.argNo = static_cast<uint32_t>(RootArg->getArgNo());
+          EF.byteOffset = *Offset;
+          EF.expected = *Bits;
+          EF.width = static_cast<uint8_t>(Width);
+          EF.align = static_cast<uint8_t>(LI->getAlign().value());
+          EF.folded = false;
+          EF.siteId = kEJitAsanNoSite;
+          continue;
+        }
+        // Global-anchored survivors stay stub-side uncovered (the entry can
+        // only observe bound arguments); their fields belong to the
+        // full-scope watch below. Taxonomy follows the replacement-failure
+        // log, plus the annotation-consistency smell of a marker whose
+        // field the GV's own metadata does not list.
+        if (LI->isAtomic()) {
+          Uncovered("atomic", I);
+          continue;
+        }
+        const GlobalVariable *GV = findRootGV(Ptr);
+        if (!GV) {
+          Uncovered("no-root-gv", I);
+          continue;
+        }
+        auto It = gvPeriodMap_.find(GV);
+        if (It == gvPeriodMap_.end()) {
+          Uncovered("gv-not-in-map", I);
+          continue;
+        }
+        if (!resolveBase(GV, It->second, registry_)) {
+          Uncovered("base-unresolved", I);
+          continue;
+        }
+        bool UsedAssumption = false;
+        auto Off = accumulateFullOffset(DL, Ptr, freeDimAssumptions_,
+                                        &UsedAssumption);
+        if (!Off) {
+          Uncovered("non-const-offset", I);
+          continue;
+        }
+        if (UsedAssumption && !offsetFitsInObject(GV, *Off, LI->getType(), DL)) {
+          Uncovered("witness-out-of-bounds", I);
+          continue;
+        }
+        if (!Recognized) {
+          Uncovered("offset-not-in-field-metadata", I);
+          continue;
+        }
+        Uncovered("unsupported-type", I);
+      }
+    }
+  }
+
+  // Full-scope enumeration: every annotated field of every registered
+  // object, GV metadata driven — independent of any load, fold, or version.
+  for (const auto &Kv : periodConstFieldMap_) {
+    const GlobalVariable *GV = Kv.first;
+    auto It = gvPeriodMap_.find(GV);
+    if (It == gvPeriodMap_.end())
+      continue;
+    Type *Element = GV->getValueType();
+    uint64_t Instances = 1;
+    if (auto *Array = dyn_cast<ArrayType>(Element)) {
+      Instances = Array->getNumElements();
+      Element = Array->getElementType();
+    }
+    if (It->second.isArray && It->second.arraySize != Instances) {
+      EJIT_DIAG_VERBOSE("[EJIT-ASAN] drift field enumeration skipped "
+                        "gv=%s instance-count-mismatch registered=%zu ir=%llu",
+                        GV->getName().str().c_str(), It->second.arraySize,
+                        (unsigned long long)Instances);
+      continue;
+    }
+    for (uint64_t FieldOff : Kv.second) {
+      unsigned Width = annotatedFieldWidth(Element, FieldOff, DL);
+      if (Width != 1 && Width != 8 && Width != 16 && Width != 32 &&
+          Width != 64) {
+        EJIT_DIAG_VERBOSE("[EJIT-ASAN] drift field skipped gv=%s offset=%llu "
+                          "reason=unsupported-field-width",
+                          GV->getName().str().c_str(),
+                          (unsigned long long)FieldOff);
+        continue;
+      }
+      EJitAsanAnnotatedField AF;
+      AF.object = GV->getName().str();
+      AF.period = It->second.periodName;
+      AF.offset = FieldOff;
+      AF.instanceCount = static_cast<uint32_t>(Instances);
+      AF.width = static_cast<uint8_t>(Width);
+      AF.littleEndian = DL.isLittleEndian();
+      Capture.annotatedFields.push_back(std::move(AF));
+    }
+  }
+}
 #endif
 
 PreservedAnalyses

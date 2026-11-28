@@ -858,6 +858,151 @@ TEST(EJitAsan, SkipsEntryFoldsOwnedByOtherEntries) {
   EXPECT_EQ(gEJitAsanState.siteCounter.loadRelaxed(), 0u);
 }
 
+TEST(EJitAsan, DriftWalkCapturesUnfoldedBoundLoadAsDriftSite) {
+  // An atomic period_const load through a bound_ptr argument never folds
+  // (atomics are excluded from substitution), so it survives to the final
+  // module — the unfolded group the drift walk exists to watch. The walk
+  // records a folded=false entry with the value the compile saw, and the
+  // IR is untouched.
+  resetAsanBlob();
+  auto C = std::make_unique<LLVMContext>();
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    declare void @observe(i32)
+    define i32 @probe(i8 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %p = getelementptr inbounds i8, ptr %cfg, i64 4
+      %v = load atomic i32, ptr %p acquire, align 4, !ejit.period_const !7
+      ret i32 %v
+    }
+    !0 = !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !4}
+    !4 = !{i64 4, i64 4}
+    !7 = !{}
+  )",
+                               Err, *C);
+  ASSERT_TRUE(M);
+  uint64_t Object[1] = {0xCAFEBABE00000000ULL};
+  PeriodArrayRegistry Registry;
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Object),
+                                /*size=*/8, /*argIndex=*/1, /*instance=*/1});
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  bool SawAtomic = false;
+  for (Instruction &I : instructions(M->getFunction("probe")))
+    if (auto *LI = dyn_cast<LoadInst>(&I))
+      SawAtomic |= LI->isAtomic();
+  EXPECT_TRUE(SawAtomic);
+  EXPECT_EQ(gEJitAsanState.siteCounter.loadRelaxed(), 0u);
+  EXPECT_EQ(Capture.driftUncovered, 0u);
+  ASSERT_EQ(Capture.entryFolds.size(), 1u);
+  const auto &EF = Capture.entryFolds.front();
+  EXPECT_FALSE(EF.folded);
+  EXPECT_EQ(EF.function, "probe");
+  EXPECT_EQ(EF.period, "cell");
+  EXPECT_EQ(EF.argNo, 1u);
+  EXPECT_EQ(EF.byteOffset, 4u);
+  EXPECT_EQ(EF.width, 32u);
+  // Baseline = the observed value at specialization time (LE host: the u32
+  // at bytes 4..7 of the buffer).
+  EXPECT_EQ(EF.expected, 0xCAFEBABEu);
+  EXPECT_EQ(EF.siteId, kEJitAsanNoSite);
+}
+
+TEST(EJitAsan, DriftWalkEnumeratesAnnotatedFields) {
+  // The full-scope watch set is metadata driven: every annotated field of
+  // every registered object is enumerated whether or not any load of it
+  // survived. Here the probe's only load folds, and the field still shows
+  // up for the boot-lifetime probe table.
+  resetAsanBlob();
+  uint32_t Data[2][10];
+  for (unsigned I = 0; I < 10; ++I) {
+    Data[0][I] = 7;
+    Data[1][I] = 11;
+  }
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg", Data, 2);
+  auto C = std::make_unique<LLVMContext>();
+  auto M = makeProbe(*C, /*Local=*/false, /*Mod=*/5);
+  ASSERT_TRUE(M);
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  ASSERT_EQ(Capture.annotatedFields.size(), 1u);
+  const auto &AF = Capture.annotatedFields.front();
+  EXPECT_EQ(AF.object, "cfg");
+  EXPECT_EQ(AF.period, "cell");
+  EXPECT_EQ(AF.offset, 0u);
+  EXPECT_EQ(AF.instanceCount, 2u);
+  EXPECT_EQ(AF.width, 32u);
+  EXPECT_TRUE(AF.littleEndian);
+}
+
+TEST(EJitAsan, DriftWalkClassifiesUncoveredSurvivors) {
+  // Survivors the entry cannot observe count into driftUncovered with a
+  // reason: a volatile annotated load stays out (an observation load of our
+  // own would change the access pattern the program promised), and a
+  // global-anchored load with a non-constant offset has no stub-side view.
+  resetAsanBlob();
+  auto C = std::make_unique<LLVMContext>();
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    target datalayout = "e-p:64:64-i64:64-n8:16:32:64-S128"
+    @cfg = external global [2 x [10 x i32]], !ejit.metadata !0
+    define i32 @probe(i8 %cell, i16 %j, ptr %b) !ejit.metadata !5 {
+    entry:
+      %p = getelementptr inbounds i8, ptr %b, i64 4
+      %v = load volatile i32, ptr %p, !ejit.period_const !7
+      %q = getelementptr inbounds [2 x [10 x i32]], ptr @cfg, i64 0, i64 1, i16 %j
+      %w = load i32, ptr %q, !ejit.period_const !7
+      %r = add i32 %v, %w
+      ret i32 %r
+    }
+    !0 = !{!1, !2}
+    !1 = !{!"ejit_group_indexed", !"cell", i64 2}
+    !2 = !{!"ejit_period_const_field", i64 0}
+    !5 = !{!6, !8, !9}
+    !6 = !{!"ejit_entry"}
+    !8 = !{!"ejit_dim", !"cell", i32 0}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, !10}
+    !10 = !{i64 4, i64 4}
+    !7 = !{}
+  )",
+                               Err, *C);
+  ASSERT_TRUE(M);
+  uint32_t Data[2][10] = {};
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg", Data, 2);
+  uint64_t Object[1] = {0x1122334400000000ULL};
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Object),
+                                /*size=*/8, /*argIndex=*/2, /*instance=*/1});
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  EXPECT_EQ(Capture.entryFolds.size(), 0u);
+  EXPECT_EQ(Capture.driftUncovered, 2u);
+  ASSERT_EQ(Capture.annotatedFields.size(), 1u);
+  EXPECT_EQ(Capture.annotatedFields.front().object, "cfg");
+}
+
 TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
   resetAsanBlob();
   const uint32_t Slot = ejitAsanClaimSlot("probe");

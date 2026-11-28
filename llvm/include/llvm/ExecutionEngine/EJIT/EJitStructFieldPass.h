@@ -123,6 +123,13 @@ public:
   void setAsanCapture(EJitAsanCapture *Capture) {
     asanCapture_ = Capture;
   }
+
+  /// Final-module drift walk (pipeline end, BEFORE stub emission): classify
+  /// every surviving annotated load — bound-anchored survivors become
+  /// drift entry records, others count into driftUncovered with a reason —
+  /// and enumerate every registered object's annotated fields into the
+  /// capture for the full-scope probe watch.
+  void captureDriftSites(const Module &M, EJitAsanCapture &Capture) const;
 #endif
 
 private:

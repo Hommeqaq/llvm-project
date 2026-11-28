@@ -96,6 +96,9 @@ struct EJitAsanWatch {
 // field through the CURRENT bound argument — the only place the current
 // family member is observable. siteId stays kEJitAsanNoSite until the
 // pipeline-end emitter publishes it (EJitOptimizer emitAsanEntryChecks).
+// A folded record compares the baked constant; a drift record (folded ==
+// false, from the final-module drift walk) observes against the value the
+// compile saw as its baseline.
 struct EJitAsanEntryFold {
   std::string function; // Owning function: the fold's load site lives here.
   std::string period;
@@ -105,6 +108,20 @@ struct EJitAsanEntryFold {
   uint64_t expected = 0;
   uint8_t width = 0;
   uint8_t align = 0; // Field alignment in bytes.
+  bool folded = true;
+};
+
+// One annotated field of a registered object, enumerated from GV metadata for
+// the full-scope drift watch; independent of any fold, load, or version.
+// The probe merges these into its boot-lifetime site table and computes
+// instance addresses as registryBase + instance * stride + offset.
+struct EJitAsanAnnotatedField {
+  std::string object;
+  std::string period;
+  uint64_t offset = 0;       // Field offset within one element.
+  uint32_t instanceCount = 0; // Registered instances of the element.
+  uint8_t width = 0;         // Field bit width: 1/8/16/32/64.
+  bool littleEndian = false;
 };
 
 // Compile-side only. No LLVM IR or borrowed calling arguments survive capture.
@@ -112,8 +129,11 @@ struct EJitAsanCapture {
   static constexpr unsigned MaxWatches = 128;
   std::vector<EJitAsanWatch> watches;
   std::vector<EJitAsanEntryFold> entryFolds;
+  std::vector<EJitAsanAnnotatedField> annotatedFields;
   unsigned uncovered = 0;
   unsigned dropped = 0;
+  unsigned driftUncovered = 0;
+  unsigned driftDropped = 0;
 };
 
 class EJitAsan {

@@ -208,16 +208,23 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
     return;
   // A fold captured from another function's formals belongs to THAT
   // function's argument list; only folds owned by the specialized entry
-  // are emittable (a foreign index would read out of range).
-  unsigned Foreign = 0;
-  for (const EJitAsanEntryFold &EF : Cap->entryFolds)
+  // are emittable (a foreign index would read out of range). Drift records
+  // are not emitted by this path.
+  unsigned Foreign = 0, Folded = 0;
+  for (const EJitAsanEntryFold &EF : Cap->entryFolds) {
+    if (!EF.folded)
+      continue;
+    ++Folded;
     if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
       ++Foreign;
+  }
+  if (!Folded)
+    return;
   if (Foreign) {
     EJIT_DIAG_VERBOSE("[EJIT-ASAN] entry stub skipped %u fold(s) owned by "
                       "other module functions fn=%s",
                       Foreign, Ctx.fnName.c_str());
-    if (Foreign == Cap->entryFolds.size())
+    if (Foreign == Folded)
       return; // Nothing emittable for this function.
   }
   const uint32_t Slot = ejitAsanClaimSlot(Ctx.fnName);
@@ -231,7 +238,7 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
   SmallVector<EJitAsanEntryFold *, 8> Published;
   unsigned BudgetSkipped = 0;
   for (EJitAsanEntryFold &EF : Cap->entryFolds) {
-    if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
+    if (!EF.folded || EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
       continue; // Counted and logged above.
     const uint32_t Site =
         ejitAsanPublishSite(Slot, Ctx.fnName, EF.period, kEJitAsanKindFolded,
@@ -309,6 +316,20 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
     }
     B.CreateBr(Cont);
   }
+}
+
+// Final-module drift walk: classify the annotated loads that survived the
+// fold patterns and enumerate registered objects' annotated fields into
+// the capture. Runs BEFORE emitAsanEntryChecks — the stub's own check
+// loads match the metadata-free bound-field fallback, so walking after
+// emission would re-record every site.
+static void captureAsanDrift(Module &M, const SpecializationContext &Ctx,
+                             PeriodArrayRegistry &Registry) {
+  if (!Ctx.asanCapture)
+    return;
+  EJitStructFieldPass Pass(Registry, Ctx.boundPointers);
+  Pass.initFromModule(M);
+  Pass.captureDriftSites(M, *Ctx.asanCapture);
 }
 #endif
 
@@ -609,6 +630,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
                           AuditSampledEntries);
 #endif
 #ifdef EJIT_ASAN
+    captureAsanDrift(M, ctx, registry_);
     if (ctx.asanEntryChecks)
       emitAsanEntryChecks(M, ctx);
 #endif
@@ -625,6 +647,7 @@ void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {
                         AuditSampledEntries);
 #endif
 #ifdef EJIT_ASAN
+  captureAsanDrift(M, ctx, registry_);
   if (ctx.asanEntryChecks)
     emitAsanEntryChecks(M, ctx);
 #endif
