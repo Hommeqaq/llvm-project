@@ -386,7 +386,7 @@ def doit_gc_merge(args):
         "ejit_print_dumped_module",
         "ejit_print_period_const_ranking", "ejit_print_mayconst_ranking",
         "ejit_asan_dump",
-        "ejit_enable_asan_mode", "ejit_asan_rotation_status",
+        "ejit_init_asan", "ejit_asan_rotation_status",
         # EJIT-ASAN entry-stub hooks: emitted JIT code calls these through
         # absolute symbols (same shape as the inline-cache root above — the
         # caller lives in JIT'd code, not in the runtime, so gc-merge would

@@ -167,6 +167,13 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 /// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
 /// treats this as ejit_init). PGO is off for plain ejit_init().
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
+/// Initialize with EJIT-ASAN entry instrumentation enabled (see
+/// EJIT_ASAN_CHECK.md): every worker compile of a function whose bound_ptr
+/// parameters produced period_const folds emits the entry-check stub
+/// (report-only). Uses the same config layout as ejit_init(config) and forces
+/// the instrumentation on for the boot; PGO stays off. A build without the
+/// feature returns EJIT_ERR_DISABLED without initializing.
+ejit_status_t ejit_init_asan(const ejit_config_t *config);
 void ejit_shutdown(void);
 
 // Symbol registration for bare-metal (no dlsym)
@@ -422,15 +429,6 @@ void ejit_print_mayconst_ranking(void);
 /// core or while another report is still printing. Builds with EJIT_ASAN
 /// only (EJIT_ERR_DISABLED otherwise).
 ejit_status_t ejit_asan_dump(void);
-
-/// Opt into EJIT-ASAN entry instrumentation BEFORE ejit_init: after this
-/// call, every worker compile of a function whose bound_ptr parameters
-/// produced period_const folds emits an entry stub that re-checks the folded
-/// fields through the actual argument pointer of each call (report-only;
-/// see EJIT_ASAN_CHECK.md). MUST be called before ejit_init — a call after
-/// init logs an error and returns EJIT_ERR_INVALID_PARAM, a call in a build
-/// without the feature returns EJIT_ERR_DISABLED. Irreversible for the boot.
-ejit_status_t ejit_enable_asan_mode(void);
 
 /// Print a snapshot of the EJIT-ASAN entry-check rotation through the
 /// platform log: the claimed function-slot table, and one line per core

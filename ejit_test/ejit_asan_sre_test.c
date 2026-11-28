@@ -59,16 +59,13 @@ int test_ejit_asan_start(void) {
   if (ejit_sre_current_core_id() != 6)
     return -1;
   ejit_set_log_level(EJIT_LOG_INFO);
-  // Must precede ejit_init: subsequent worker compiles emit the
-  // bound_ptr entry stubs (see EJIT_ASAN_CHECK.md).
-  ejit_status_t st = ejit_enable_asan_mode();
-  if (st != EJIT_OK)
-    return st;
-  return ejit_init_pgo(0);
+  // ASAN test mode: the plain pipeline (PGO off) with the bound_ptr entry
+  // stubs forced on (see EJIT_ASAN_CHECK.md).
+  return ejit_init_asan(0);
 }
 
 int test_ejit_asan_sample(void) {
-  if (ejit_sre_current_core_id() != 16 || ejit_init_pgo(0) != EJIT_OK)
+  if (ejit_sre_current_core_id() != 16 || ejit_init_asan(0) != EJIT_OK)
     return -1;
   for (uint32_t i = 0; i != 5; ++i)
     __atomic_store_n(&gEJitAsanCells[1].slot5[i].value, 7,

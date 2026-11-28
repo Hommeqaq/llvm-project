@@ -94,13 +94,6 @@ static_assert(kEJitMaxFuncIndex == kEJitSharedMaxFuncIndex,
 
 static EJit *gEJIT = nullptr;
 
-#ifdef EJIT_ASAN
-// ejit_enable_asan_mode() staging: read exactly once by ejitInitImpl and
-// folded into Config; calls after init are rejected with a log line (the
-// emitted stubs of already-compiled versions would be missing otherwise).
-static bool gEJitAsanEntryChecksRequested = false;
-#endif
-
 #ifdef EJIT_DIAG_ENABLE
 EJitAtomicU64 gIcacheNullFillSkips;
 constexpr uint64_t kIcacheNullFillLogEvery = 1000;
@@ -143,9 +136,12 @@ static_assert(sizeof(ejit_config_t) == (sizeof(void *) == 8 ? 24 : 16));
 static_assert(std::is_standard_layout<ejit_config_t>::value,
               "ejit_config_t must be standard-layout for a stable C ABI");
 
-// Shared init implementation for ejit_init / ejit_init_pgo. \p forcePgo forces
-// the online-PGO auto-trigger on regardless of the (unversioned) config.
-static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
+// Shared init implementation for ejit_init / ejit_init_pgo / ejit_init_asan.
+// \p forcePgo forces the online-PGO auto-trigger on regardless of the
+// (unversioned) config; \p forceAsan does the same for EJIT-ASAN entry
+// instrumentation.
+static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
+                                  bool forceAsan) {
   if (gEJIT) {
     EJIT_DIAG("already initialized, returning OK");
     return EJIT_OK;
@@ -168,7 +164,7 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
   if (forcePgo)
     cfg.enablePgo = true;
 #ifdef EJIT_ASAN
-  cfg.enableAsanEntryChecks = gEJitAsanEntryChecksRequested;
+  cfg.enableAsanEntryChecks = forceAsan;
 #endif
 
   gEJIT = new (std::nothrow) EJit(cfg);
@@ -201,11 +197,19 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo) {
 extern "C" {
 
 ejit_status_t ejit_init(const ejit_config_t *config) {
-  return ejitInitImpl(config, /*forcePgo=*/false);
+  return ejitInitImpl(config, /*forcePgo=*/false, /*forceAsan=*/false);
 }
 
 ejit_status_t ejit_init_pgo(const ejit_config_t *config) {
-  return ejitInitImpl(config, /*forcePgo=*/true);
+  return ejitInitImpl(config, /*forcePgo=*/true, /*forceAsan=*/false);
+}
+
+ejit_status_t ejit_init_asan(const ejit_config_t *config) {
+#ifdef EJIT_ASAN
+  return ejitInitImpl(config, /*forcePgo=*/false, /*forceAsan=*/true);
+#else
+  return EJIT_ERR_DISABLED;
+#endif
 }
 
 void ejit_shutdown(void) {
@@ -1225,20 +1229,6 @@ ejit_status_t ejit_asan_dump(void) {
 #endif
 }
 
-ejit_status_t ejit_enable_asan_mode(void) {
-#ifdef EJIT_ASAN
-  if (gEJIT) {
-    EJIT_DIAG("enable_asan_mode ignored: ejit_init already done");
-    return EJIT_ERR_INVALID_PARAM;
-  }
-  gEJitAsanEntryChecksRequested = true;
-  EJIT_DIAG("asan entry instrumentation requested: subsequent compiles "
-            "emit entry stubs");
-  return EJIT_OK;
-#else
-  return EJIT_ERR_DISABLED;
-#endif
-}
 
 ejit_status_t ejit_asan_rotation_status(void) {
 #ifdef EJIT_ASAN

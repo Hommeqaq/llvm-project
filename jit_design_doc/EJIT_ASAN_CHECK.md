@@ -59,14 +59,14 @@ The aarch64_be preset pins all of the above. The worker probe and the
 full-scope drift scan need no runtime opt-in; the entry stub does:
 
 ```c
-ejit_enable_asan_mode();   // BEFORE ejit_init; every later worker compile
+ejit_init_asan(0);         // instead of ejit_init; every worker compile
                            // of a function with bound folds emits the stub
 ```
 
-`ejit_enable_asan_mode()` must be called before `ejit_init`: after init it
-logs an error and returns `EJIT_ERR_INVALID_PARAM`; without the feature it
-returns `EJIT_ERR_DISABLED`. It is irreversible for the boot: emitted
-stubs stay in their versions.
+`ejit_init_asan()` takes the same config as `ejit_init` and forces the
+instrumentation on for the boot (emitted stubs stay in their versions);
+PGO stays off — the ASAN test mode runs the plain pipeline. A build
+without the feature returns `EJIT_ERR_DISABLED` without initializing.
 
 Business code needs no new Clang flag — normal spec5 annotations
 (`ejit_entry`, `ejit_dim`, `ejit_bound_ptr`, `ejit_period_const`) suffice.
@@ -283,13 +283,13 @@ the business computes with.
 Link only `ejit_test/ejit_asan_sre_test.c` with normal spec5 build flags
 (board-only demo; not enrolled in `build.sh ALL_TESTS`). The EJIT-ASAN
 runtime entry symbols are lipo GC roots (`ejit_asan_dump`,
-`ejit_enable_asan_mode`, `ejit_asan_rotation_status`,
+`ejit_init_asan`, `ejit_asan_rotation_status`,
 `__ejit_asan_gate`, `__ejit_asan_mismatch`) — verify the trimmed image
 still defines them (`nm -g board.elf | grep ejit_asan`). No new external
 symbols were added by the drift observer.
 
-1. Core 6: `test_ejit_asan_start` — enables the entry mode (before
-   `ejit_init`) and initializes.
+1. Core 6: `test_ejit_asan_start` — initializes with the entry mode
+   (`ejit_init_asan`; PGO off).
 2. Core 16: `test_ejit_asan_sample` — worker-probe demo (waits for the
    global probe's compile; full coverage of the demo folds).
 3. Core 6: `ejit_asan_dump` — stats line shows full probe coverage, zero

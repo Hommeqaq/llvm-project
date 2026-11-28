@@ -1071,10 +1071,13 @@ TEST(EJitAsan, DriftWalkClassifiesUncoveredSurvivors) {
   // load with a plain (non-free-dim) runtime index has no resolvable
   // offset; a residue-driven bound load (modulus 3 — a power-of-two
   // modulus would canonicalize the urem away — whose witness address lies
-  // outside the view, so the fold declines) gets no stub site in v1; and
-  // a marker on an i128 field the GV's own metadata does not list (too
+  // outside the view, so the fold declines) gets no stub site in v1; a
+  // marker on an i128 field the GV's own metadata does not list (too
   // wide to materialize, so nothing folds it) is the
-  // annotation-consistency smell.
+  // annotation-consistency smell; and an i64 load over a field the bound
+  // metadata declares 4 bytes wide (the fold declines on the width
+  // mismatch, the walk on the access not fitting the view) would read
+  // past the exemplar both as a baseline and in the stub.
   resetAsanBlob();
   auto C = std::make_unique<LLVMContext>();
   SMDiagnostic Err;
@@ -1086,6 +1089,8 @@ TEST(EJitAsan, DriftWalkClassifiesUncoveredSurvivors) {
     entry:
       %p = getelementptr inbounds i8, ptr %b, i64 4
       %v = load volatile i32, ptr %p, !ejit.period_const !7
+      %p8 = getelementptr inbounds i8, ptr %b, i64 4
+      %v8 = load i64, ptr %p8, !ejit.period_const !7
       %q = getelementptr inbounds [2 x [10 x i32]], ptr @cfg, i64 0, i64 1, i16 %k
       %w = load i32, ptr %q, !ejit.period_const !7
       %idx = urem i16 %j, 3
@@ -1098,10 +1103,12 @@ TEST(EJitAsan, DriftWalkClassifiesUncoveredSurvivors) {
       %w2 = load i128, ptr %q2, align 4, !ejit.period_const !7
       %x2 = add i128 %w2, 1
       %lo = trunc i128 %x2 to i32
+      %lo8 = trunc i64 %v8 to i32
       %r1 = add i32 %v, %w
       %r2 = add i32 %r1, %u
       %r3 = add i32 %r2, %lo
-      ret i32 %r3
+      %r4 = add i32 %r3, %lo8
+      ret i32 %r4
     }
     !0 = !{!1, !2}
     !1 = !{!"ejit_group_indexed", !"cell", i64 2}
@@ -1141,13 +1148,14 @@ TEST(EJitAsan, DriftWalkClassifiesUncoveredSurvivors) {
 
   ASSERT_FALSE(verifyModule(*M, &errs()));
   EXPECT_EQ(Capture.entryFolds.size(), 0u);
-  EXPECT_EQ(Capture.driftUncovered, 4u);
+  EXPECT_EQ(Capture.driftUncovered, 5u);
   ASSERT_EQ(Capture.annotatedFields.size(), 1u);
   EXPECT_EQ(Capture.annotatedFields.front().object, "cfg");
   EXPECT_NE(Out.find("reason=volatile-annotated"), std::string::npos);
   EXPECT_NE(Out.find("reason=non-const-offset"), std::string::npos);
   EXPECT_NE(Out.find("reason=residue-driven-unfolded-bound"), std::string::npos);
   EXPECT_NE(Out.find("reason=offset-not-in-field-metadata"), std::string::npos);
+  EXPECT_NE(Out.find("reason=invalid-bound-offset"), std::string::npos);
 }
 
 TEST(EJitAsan, EmitsMergedStubForFoldedAndDriftFolds) {
@@ -1230,6 +1238,28 @@ TEST(EJitAsan, EmitsMergedStubForFoldedAndDriftFolds) {
       Rot = Sw;
   ASSERT_NE(Rot, nullptr);
   EXPECT_EQ(Rot->getNumCases(), 1u);
+  // The stub's drift observation load carries the source's atomicity
+  // (Acquire); the folded compare load stays plain. Trace each hook's
+  // value argument back through its zext to the emitted load.
+  unsigned AtomicVals = 0, PlainVals = 0;
+  for (Instruction &I : instructions(M->getFunction("probe")))
+    if (auto *CI = dyn_cast<CallInst>(&I))
+      if (CI->getCalledFunction() &&
+          CI->getCalledFunction()->getName() == "__ejit_asan_mismatch") {
+        Value *V = CI->getArgOperand(2);
+        if (auto *Z = dyn_cast<ZExtInst>(V))
+          V = Z->getOperand(0);
+        auto *L = dyn_cast<LoadInst>(V);
+        ASSERT_NE(L, nullptr);
+        if (L->isAtomic()) {
+          ++AtomicVals;
+          EXPECT_EQ(L->getOrdering(), AtomicOrdering::Acquire);
+        } else {
+          ++PlainVals;
+        }
+      }
+  EXPECT_EQ(AtomicVals, 1u);
+  EXPECT_EQ(PlainVals, 1u);
 }
 
 TEST(EJitAsan, EmitsPerArgumentSubWindowsForMultipleBoundPointers) {
@@ -1479,6 +1509,30 @@ TEST(EJitAsan, FullScopeProbeWatchesAnnotatedFields) {
   Verifier.onCompiled(Req, reinterpret_cast<uintptr_t>(&codeMarker),
                       std::move(Capture));
 
+  // A recompile of the same object merges nothing new: the table is
+  // deduplicated by instance address for the boot's lifetime.
+  {
+    auto C2 = std::make_unique<LLVMContext>();
+    auto M2 = makeProbe(*C2, /*Local=*/false, /*Mod=*/5);
+    ASSERT_TRUE(M2);
+    SpecializationContext Ctx2;
+    Ctx2.fnName = "probe";
+    Ctx2.dimensions.push_back({"cell", 1});
+    EJitAsanCapture Capture2;
+    Ctx2.asanCapture = &Capture2;
+    EJitOptimizer(Registry).runPipeline(*M2, Ctx2);
+    ASSERT_FALSE(verifyModule(*M2, &errs()));
+    ASSERT_EQ(Capture2.annotatedFields.size(), 1u);
+    EJitCompileRequest Req2{};
+    Req2.funcIndex = 44;
+    Req2.generation = 2;
+    Req2.numDims = 1;
+    Req2.dims[0] = {0, 1};
+    Req2.versions[0] = 2;
+    Verifier.onCompiled(Req2, reinterpret_cast<uintptr_t>(&codeMarker),
+                        std::move(Capture2));
+  }
+
   auto Level = ejit_get_log_level();
   ejit_set_log_level(EJIT_LOG_INFO);
   auto Dump = [&] {
@@ -1556,6 +1610,7 @@ TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
   EXPECT_NE(Out.find("slot=0(probe)"), std::string::npos);
   EXPECT_NE(Out.find("sub=0"), std::string::npos);
   EXPECT_NE(Out.find("bound=2"), std::string::npos);
+  EXPECT_NE(Out.find("window="), std::string::npos);
   EXPECT_NE(Out.find("checks=2"), std::string::npos);
   // Per-slot lines are audit depth: absent at INFO.
   EXPECT_EQ(Out.find("rotation slot="), std::string::npos);
@@ -1567,4 +1622,15 @@ TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
   ejit_set_log_level(Level);
   EXPECT_NE(Verbose.find("[EJIT-ASAN] rotation slot=0(probe) bound=2 sites=0"),
             std::string::npos);
+}
+
+TEST(EJitAsan, InitAsanForcesEntryMode) {
+  // Init-family variant of ejit_init: same config, entry mode forced for
+  // the boot (PGO off). The mode lives in the EJit instance, so a plain
+  // init after shutdown starts clean; a second init is a no-op either way.
+  ASSERT_EQ(ejit_init_asan(nullptr), EJIT_OK);
+  EXPECT_EQ(ejit_init(nullptr), EJIT_OK);
+  ejit_shutdown();
+  ASSERT_EQ(ejit_init(nullptr), EJIT_OK);
+  ejit_shutdown();
 }
