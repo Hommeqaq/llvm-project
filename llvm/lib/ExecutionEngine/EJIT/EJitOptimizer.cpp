@@ -183,36 +183,32 @@ resolveBoundViews(const Module &M, const SpecializationContext &ctx) {
 }
 
 #ifdef EJIT_ASAN
-namespace {
-/// Emit the EJIT-ASAN entry stub (EJIT_ASAN_CHECK.md). Runs at the very end
-/// of runPipeline, AFTER the last StructFieldPass run AND after the audit
-/// snapshot, so no later fold pass can recognize the check loads as
-/// period_const and re-fold them into the very constants they compare
-/// against, and the audit does not count them as remaining loads. Shape:
+/// Emit the EJIT-ASAN entry stub (EJIT_ASAN_CHECK.md) at the very end of
+/// runPipeline — after the last StructFieldPass run and after the audit
+/// snapshot, so no later fold pass can re-fold the check loads into the
+/// constants they compare against. One activated call checks the folds of
+/// exactly ONE bound argument (rank K = K-th distinct bound argument,
+/// ascending):
 ///
-///   head:   %active = call i1 @__ejit_asan_gate(i32 %slot)
-///           br %active, check, cont
-///   check:  per constant-offset bound fold: re-load the field through the
-///           CURRENT bound argument and compare with the baked constant;
+///   head:   %sub = call i32 @__ejit_asan_gate(i32 %slot)
+///           switch %sub, label %cont [ i32 0, label %check0 ... ]
+///   checkK: per fold of rank K: load the field through the CURRENT bound
+///           argument and compare with the baked constant;
 ///   fail:   call @__ejit_asan_mismatch(i32 %site, ptr %arg, i64 zext(%v))
-///           and rejoin — every mismatching field is recorded and the call
-///           itself always continues (report-only).
+///           then rejoin — report-only, the call always continues.
 ///
-/// The gate serializes the per-core rotation so at most one function slot
-/// is checked per core at a time (EJitAsanState.h).
-void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
+/// An out-of-range sub (a stale stub sharing the slot with a version whose
+/// rank set shrank) falls through the switch default and checks nothing.
+static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
   EJitAsanCapture *Cap = Ctx.asanCapture;
   if (!Cap || Cap->entryFolds.empty())
     return;
   Function *F = M.getFunction(Ctx.fnName);
   if (!F || F->isDeclaration())
     return;
-  // A bound fold captured from another function of the module (a second
-  // ejit_entry's own bound formal, or a callee formal that survived
-  // internalization) belongs to THAT function's entry and its argument
-  // list — emitting it here would index this function's arguments with a
-  // foreign index (out-of-range read, wrong-parameter check, or invalid
-  // IR). Only folds owned by the specialized function are emittable.
+  // A fold captured from another function's formals belongs to THAT
+  // function's argument list; only folds owned by the specialized entry
+  // are emittable (a foreign index would read out of range).
   unsigned Foreign = 0;
   for (const EJitAsanEntryFold &EF : Cap->entryFolds)
     if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
@@ -230,9 +226,42 @@ void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
               EJIT_ASAN_MAX_SLOTS, Ctx.fnName.c_str());
     return;
   }
+  // Rank = distinct bound arguments with at least one published site,
+  // ascending; a budget-skipped fold contributes no rank.
+  SmallVector<EJitAsanEntryFold *, 8> Published;
+  unsigned BudgetSkipped = 0;
+  for (EJitAsanEntryFold &EF : Cap->entryFolds) {
+    if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
+      continue; // Counted and logged above.
+    const uint32_t Site =
+        ejitAsanPublishSite(Slot, Ctx.fnName, EF.period,
+                            static_cast<uint8_t>(Ctx.tier), EF.argNo,
+                            EF.width, EF.align, EF.byteOffset, EF.expected);
+    if (Site == kEJitAsanNoSite) {
+      ++BudgetSkipped;
+      continue;
+    }
+    EF.siteId = Site;
+    Published.push_back(&EF);
+  }
+  if (BudgetSkipped)
+    // One line per compile, mirroring the version-budget discipline — this
+    // capture's remaining folds stay worker-probe-only.
+    EJIT_DIAG("[EJIT-ASAN] capture DROPPED: site budget full (cap=%d) "
+              "fn=%s folds=%u",
+              EJIT_ASAN_MAX_SITES, Ctx.fnName.c_str(), BudgetSkipped);
+  SmallVector<uint32_t, 8> RankArgs;
+  for (const EJitAsanEntryFold *EF : Published)
+    if (!is_contained(RankArgs, EF->argNo))
+      RankArgs.push_back(EF->argNo);
+  sort(RankArgs);
+  // Before emission: the version goes live only after the compile, so the
+  // next arming on any core serves every bound argument it checks.
+  ejitAsanSetSlotBound(Slot, RankArgs.size());
+
   LLVMContext &C = M.getContext();
   auto *GateTy =
-      FunctionType::get(Type::getInt1Ty(C), {Type::getInt32Ty(C)}, false);
+      FunctionType::get(Type::getInt32Ty(C), {Type::getInt32Ty(C)}, false);
   auto *HookTy = FunctionType::get(
       Type::getVoidTy(C),
       {Type::getInt32Ty(C), PointerType::get(C, 0), Type::getInt64Ty(C)},
@@ -247,54 +276,40 @@ void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
   while (isa<PHINode>(It))
     ++It;
   BasicBlock *Cont = Head->splitBasicBlock(It, "asan.cont");
-  BasicBlock *Check = BasicBlock::Create(C, "asan.check", F, Cont);
   Head->getTerminator()->eraseFromParent();
   IRBuilder<> B(Head);
-  CallInst *Active = B.CreateCall(Gate, {B.getInt32(Slot)}, "asan.active");
-  B.CreateCondBr(Active, Check, Cont);
+  CallInst *Sub = B.CreateCall(Gate, {B.getInt32(Slot)}, "asan.sub");
+  SwitchInst *Rotate =
+      B.CreateSwitch(Sub, Cont, static_cast<unsigned>(RankArgs.size()));
 
-  BasicBlock *Next = Check;
-  unsigned BudgetSkipped = 0;
-  for (EJitAsanEntryFold &EF : Cap->entryFolds) {
-    if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
-      continue; // Counted and logged above.
-    const uint32_t Site =
-        ejitAsanPublishSite(Slot, Ctx.fnName, EF.period,
-                            static_cast<uint8_t>(Ctx.tier), EF.argNo,
-                            EF.width, EF.align, EF.byteOffset, EF.expected);
-    if (Site == kEJitAsanNoSite) {
-      ++BudgetSkipped;
-      continue;
+  for (unsigned Rank = 0; Rank < RankArgs.size(); ++Rank) {
+    BasicBlock *Check =
+        BasicBlock::Create(C, ("asan.check" + Twine(Rank)).str(), F, Cont);
+    Rotate->addCase(B.getInt32(Rank), Check);
+    B.SetInsertPoint(Check);
+    for (EJitAsanEntryFold *EF : Published) {
+      if (EF->argNo != RankArgs[Rank])
+        continue;
+      Type *LoadTy = EF->width == 1 ? Type::getInt1Ty(C)
+                                    : Type::getIntNTy(C, EF->width);
+      Argument *Arg = F->getArg(EF->argNo);
+      Value *Addr =
+          B.CreateInBoundsGEP(B.getInt8Ty(), Arg, B.getInt64(EF->byteOffset));
+      Value *V = B.CreateAlignedLoad(LoadTy, Addr, MaybeAlign(EF->align));
+      Value *Ok =
+          B.CreateICmpEQ(V, ConstantInt::get(LoadTy, EF->expected), "asan.ok");
+      BasicBlock *Fail = BasicBlock::Create(C, "asan.fail", F, Cont);
+      BasicBlock *GoOn = BasicBlock::Create(C, "asan.next", F, Cont);
+      B.CreateCondBr(Ok, GoOn, Fail);
+      B.SetInsertPoint(Fail);
+      B.CreateCall(Hook, {B.getInt32(EF->siteId), Arg,
+                          B.CreateZExt(V, B.getInt64Ty(), "asan.bad")});
+      B.CreateBr(GoOn);
+      B.SetInsertPoint(GoOn);
     }
-    EF.siteId = Site;
-    B.SetInsertPoint(Next);
-    Type *LoadTy = EF.width == 1 ? Type::getInt1Ty(C)
-                                  : Type::getIntNTy(C, EF.width);
-    Argument *Arg = F->getArg(EF.argNo);
-    Value *Addr =
-        B.CreateInBoundsGEP(B.getInt8Ty(), Arg, B.getInt64(EF.byteOffset));
-    Value *V = B.CreateAlignedLoad(LoadTy, Addr, MaybeAlign(EF.align));
-    Value *Ok =
-        B.CreateICmpEQ(V, ConstantInt::get(LoadTy, EF.expected), "asan.ok");
-    BasicBlock *Fail = BasicBlock::Create(C, "asan.fail", F, Cont);
-    BasicBlock *GoOn = BasicBlock::Create(C, "asan.next", F, Cont);
-    B.CreateCondBr(Ok, GoOn, Fail);
-    B.SetInsertPoint(Fail);
-    B.CreateCall(Hook, {B.getInt32(Site), Arg,
-                        B.CreateZExt(V, B.getInt64Ty(), "asan.bad")});
-    B.CreateBr(GoOn);
-    Next = GoOn;
+    B.CreateBr(Cont);
   }
-  if (BudgetSkipped)
-    // One line per compile, mirroring the version-budget discipline — this
-    // capture's remaining folds stay worker-probe-only.
-    EJIT_DIAG("[EJIT-ASAN] capture DROPPED: site budget full (cap=%d) "
-              "fn=%s folds=%u",
-              EJIT_ASAN_MAX_SITES, Ctx.fnName.c_str(), BudgetSkipped);
-  B.SetInsertPoint(Next);
-  B.CreateBr(Cont);
 }
-} // namespace
 #endif
 
 void EJitOptimizer::runPipeline(Module &M, const SpecializationContext &ctx) {

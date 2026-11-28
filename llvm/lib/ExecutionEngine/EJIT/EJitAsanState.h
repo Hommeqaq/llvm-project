@@ -27,10 +27,11 @@
 #include <cstdint>
 #include <type_traits>
 
-// Rotation window: how many calls of the active function are checked before
-// the core rotates to the next slot. Target-scoped definition from the
-// EJIT_ASAN_ROTATION_WINDOW CMake cache variable; the #ifndef default keeps
-// standalone consumers (host unit tests) independent of the board config.
+// Rotation window: calls per bound-argument sub-window before the gate
+// advances (a slot's window spans bound x window calls). Target-scoped
+// definition from the EJIT_ASAN_ROTATION_WINDOW CMake cache variable; the
+// #ifndef default keeps standalone consumers (host unit tests) independent
+// of the board config.
 #ifndef EJIT_ASAN_ROTATION_WINDOW
 #define EJIT_ASAN_ROTATION_WINDOW 128
 #endif
@@ -69,9 +70,12 @@ constexpr uint32_t kEJitAsanNoSlot = 0xFFFFFFFFu;
 // only from the read-only rotation-status diagnostic.
 struct alignas(64) EJitAsanCell {
   uint32_t slot;      // Slot this core is currently checking.
-  uint32_t countdown; // Calls left in this window; 0 = advance on next gate.
+  uint32_t countdown; // Matching calls left in the window; 0 = advance on
+                      // the next gate.
   uint32_t cycles;    // Completed full rotations (slot wrap-arounds).
   uint32_t checks;    // Entry checks served by this core; saturates ~4G.
+  uint32_t bound;     // Sub-windows of the armed window; snapshotted at
+                      // arming, a later registration waits for the next.
 };
 
 // A function slot in the rotation. Claimed and written only by the emitting
@@ -79,6 +83,8 @@ struct alignas(64) EJitAsanCell {
 struct EJitAsanSlot {
   char name[128];
   EJitAtomicU32 activeSites; // Sites currently published into this slot.
+  EJitAtomicU32 boundCount;  // Monotonic max of sub-windows the slot's
+                            // stubs check; 0 = none registered yet.
 };
 
 // One emitted entry-check site: one (specialization version, bound fold)
@@ -153,6 +159,10 @@ inline void ejitAsanCopyName(char *Dst, size_t Cap, StringRef Src) {
 // slots and the caller must skip instrumenting this version.
 uint32_t ejitAsanClaimSlot(StringRef FunctionName);
 
+// Monotonic running max of the slot's sub-window count; the gate snapshots
+// it when arming a window.
+void ejitAsanSetSlotBound(uint32_t Slot, uint32_t Bound);
+
 // Publish one emitted site and return its id. Fields must be fully known;
 // the id is what the emitted stub embeds. Returns kEJitAsanNoSite when the
 // site budget is exhausted (the caller logs and skips the fold).
@@ -166,7 +176,9 @@ uint32_t ejitAsanPublishSite(uint32_t Slot, StringRef Function,
 
 // Entry-stub hooks, implemented in EJitAsan.cpp. EJit::init registers their
 // addresses with the compile driver (like the value-profiling hooks) so the
-// emitted stubs resolve them through the absolute-symbol path.
+// emitted stubs resolve them through the absolute-symbol path. The gate
+// returns the bound-argument sub-window index to check (0..bound-1) or -1
+// when this core is not holding the window for the caller's slot.
 extern "C" int32_t __ejit_asan_gate(uint32_t Slot);
 extern "C" void __ejit_asan_mismatch(uint32_t SiteId, const void *Arg,
                                      uint64_t ValueSeen);

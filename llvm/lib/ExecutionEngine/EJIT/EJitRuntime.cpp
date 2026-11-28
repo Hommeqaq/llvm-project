@@ -1249,17 +1249,31 @@ ejit_status_t ejit_asan_rotation_status(void) {
   EJIT_DIAG_RAW("[EJIT-ASAN] rotation slots=%u/%d sites=%u",
                 UsedSlots, EJIT_ASAN_MAX_SLOTS,
                 gEJitAsanState.siteCounter.loadRelaxed());
+  // Per-slot lines are audit depth: VERBOSE only.
+  for (uint32_t I = 0; I < UsedSlots && I < EJIT_ASAN_MAX_SLOTS; ++I) {
+    const EJitAsanSlot &S = gEJitAsanState.slots[I];
+    EJIT_DIAG_VERBOSE("[EJIT-ASAN] rotation slot=%u(%s) bound=%u sites=%u",
+                      I, S.name, S.boundCount.loadRelaxed(),
+                      S.activeSites.loadRelaxed());
+  }
   for (uint32_t I = 0; I < EJIT_ASAN_MAX_CORES; ++I) {
     const EJitAsanCell &C = gEJitAsanState.cells[I];
     if (C.checks == 0 && C.cycles == 0)
       continue;
     const char *Name = C.slot < UsedSlots ? gEJitAsanState.slots[C.slot].name
                                           : "";
+    // Sub the NEXT activated call will check: (bound*W - countdown)/W; a
+    // fully drained window reports the last sub-window served.
+    const uint32_t W = EJIT_ASAN_ROTATION_WINDOW;
+    const uint32_t Bound = C.bound ? C.bound : 1;
+    const uint32_t Total = Bound * W;
+    uint32_t Sub = (Total - C.countdown) / W;
+    if (Sub >= Bound)
+      Sub = Bound - 1;
     EJIT_DIAG_RAW(
-        "[EJIT-ASAN] rotation core=%u slot=%u(%s) window=%u/%d cycles=%u "
-        "checks=%u",
-        I, C.slot, Name, C.countdown, EJIT_ASAN_ROTATION_WINDOW, C.cycles,
-        C.checks);
+        "[EJIT-ASAN] rotation core=%u slot=%u(%s) sub=%u bound=%u "
+        "window=%u/%u cycles=%u checks=%u",
+        I, C.slot, Name, Sub, Bound, C.countdown, Total, C.cycles, C.checks);
   }
   return EJIT_OK;
 #else

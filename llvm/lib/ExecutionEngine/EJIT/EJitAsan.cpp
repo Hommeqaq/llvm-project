@@ -84,6 +84,16 @@ uint32_t ejitAsanClaimSlot(StringRef FunctionName) {
   return kEJitAsanNoSlot;
 }
 
+void ejitAsanSetSlotBound(uint32_t Slot, uint32_t Bound) {
+  if (Slot >= EJIT_ASAN_MAX_SLOTS || Bound == 0)
+    return;
+  EJitAsanSlot &S = gEJitAsanState.slots[Slot];
+  uint32_t Cur = S.boundCount.loadRelaxed();
+  while (Bound > Cur && !S.boundCount.compareExchange(Cur, Bound))
+    if (Cur >= Bound)
+      break; // Lost the race to a writer that already raised the maximum.
+}
+
 uint32_t ejitAsanPublishSite(uint32_t Slot, StringRef Function,
                              StringRef Period, uint8_t Tier, uint8_t ArgNo,
                              uint8_t Width, uint8_t FieldAlign,
@@ -119,22 +129,23 @@ uint32_t ejitAsanPublishSite(uint32_t Slot, StringRef Function,
 // hooks); report-only — a mismatch is recorded, the call always continues.
 //===----------------------------------------------------------------------===//
 
-/// Rotation gate, one call per instrumented function entry. Reads only this
-/// core's private cell (plain loads/stores, single writer) and the shared
-/// slot count: at most one function slot is active per core at any time.
-/// Returns 1 when the caller's slot holds the active window this call.
+/// Rotation gate, one call per instrumented function entry. At most one
+/// function slot is active per core at a time, and each activated call
+/// checks exactly one bound argument of that function. Returns the
+/// sub-window index to check (0..bound-1) or -1 when this core is not
+/// holding the window for the caller's slot.
 extern "C" int32_t __ejit_asan_gate(uint32_t Slot) {
   const uint32_t Core = EJitCoreId::current();
   if (Core >= EJIT_ASAN_MAX_CORES)
-    return 0; // Safely degraded: this core never checks.
+    return -1; // Safely degraded: this core never checks.
   EJitAsanCell &C = gEJitAsanState.cells[Core];
   const uint32_t Live = gEJitAsanState.slotsUsed.loadRelaxed();
   if (Live == 0)
-    return 0;
+    return -1;
   if (C.countdown == 0) {
     if (C.checks == 0 && C.cycles == 0 && C.slot == 0) {
       // Fresh core: arm slot 0's first window instead of skipping it.
-      C.countdown = EJIT_ASAN_ROTATION_WINDOW;
+      C.slot = 0;
     } else {
       uint32_t Next = C.slot + 1;
       if (Next >= Live) {
@@ -142,15 +153,28 @@ extern "C" int32_t __ejit_asan_gate(uint32_t Slot) {
         ++C.cycles;
       }
       C.slot = Next;
+    }
+    // Arm with the slot's current sub-window count, snapshotted for the
+    // whole window; a later registration waits for the next arming.
+    uint32_t Bound = gEJitAsanState.slots[C.slot].boundCount.loadRelaxed();
+    C.bound = Bound ? Bound : 1;
+    C.countdown = C.bound * EJIT_ASAN_ROTATION_WINDOW;
+    if (C.countdown == 0) { // bound x window overflowed: degrade
+      C.bound = 1;
       C.countdown = EJIT_ASAN_ROTATION_WINDOW;
     }
   }
   if (C.slot != Slot)
-    return 0;
+    return -1;
+  // Sub-window of this call: from the countdown BEFORE this call consumes
+  // its slot (calls 1..W are sub 0, W+1..2W are sub 1).
+  const int32_t Sub =
+      static_cast<int32_t>((C.bound * EJIT_ASAN_ROTATION_WINDOW - C.countdown) /
+                           EJIT_ASAN_ROTATION_WINDOW);
   --C.countdown;
   if (C.checks != 0xFFFFFFFFu)
     ++C.checks;
-  return 1;
+  return Sub;
 }
 
 /// Mismatch hook, called from the stub's cold block with the site id, the

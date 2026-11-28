@@ -428,26 +428,55 @@ TEST(EJitAsan, GateRotatesPerCoreWindow) {
   const uint32_t SlotB = ejitAsanClaimSlot("fn_b");
   ASSERT_EQ(SlotA, 0u);
   ASSERT_EQ(SlotB, 1u);
+  ejitAsanSetSlotBound(SlotA, 2);
 
   EJitCoreId::setCurrentForTest(0);
-  // Fresh core arms slot 0's window instead of skipping it.
-  for (unsigned I = 0; I < EJIT_ASAN_ROTATION_WINDOW; ++I)
+  // Fresh core arms slot 0: each activated call checks ONE bound argument,
+  // so the window spans bound x W calls.
+  const unsigned W = EJIT_ASAN_ROTATION_WINDOW;
+  for (unsigned I = 0; I < W; ++I)
+    EXPECT_EQ(__ejit_asan_gate(SlotA), 0);
+  for (unsigned I = 0; I < W; ++I)
     EXPECT_EQ(__ejit_asan_gate(SlotA), 1);
   // Window exhausted: the next call advances to slot 1, so slot A is dormant
-  // and slot B is served.
-  EXPECT_EQ(__ejit_asan_gate(SlotA), 0);
-  EXPECT_EQ(__ejit_asan_gate(SlotB), 1);
-  EXPECT_EQ(gEJitAsanState.cells[0].checks,
-            EJIT_ASAN_ROTATION_WINDOW + 1u);
+  // and slot B (no registered stubs: one sub-window) is served.
+  EXPECT_EQ(__ejit_asan_gate(SlotA), -1);
+  EXPECT_EQ(__ejit_asan_gate(SlotB), 0);
+  EXPECT_EQ(gEJitAsanState.cells[0].checks, 2 * W + 1u);
 
   // Rotation state is per core: core 1 is unaffected by core 0's rotation.
   EJitCoreId::setCurrentForTest(1);
-  EXPECT_EQ(__ejit_asan_gate(SlotA), 1);
-  EXPECT_EQ(__ejit_asan_gate(SlotB), 0);
+  EXPECT_EQ(__ejit_asan_gate(SlotA), 0);
+  EXPECT_EQ(__ejit_asan_gate(SlotB), -1);
 
   // Cores beyond the cell capacity are safely degraded: never active.
   EJitCoreId::setCurrentForTest(EJIT_ASAN_MAX_CORES);
-  EXPECT_EQ(__ejit_asan_gate(SlotA), 0);
+  EXPECT_EQ(__ejit_asan_gate(SlotA), -1);
+  EJitCoreId::resetForTest();
+}
+
+TEST(EJitAsan, GateBoundsSubWindowsByArmedSnapshot) {
+  resetAsanBlob();
+  const uint32_t Slot = ejitAsanClaimSlot("fn");
+  EJitCoreId::setCurrentForTest(0);
+  const unsigned W = EJIT_ASAN_ROTATION_WINDOW;
+  // No registered stubs: degrade to a single sub-window.
+  EXPECT_EQ(__ejit_asan_gate(Slot), 0);
+  // A registration mid-window does not re-arm: the snapshot keeps serving
+  // sub 0 for the rest of the window.
+  ejitAsanSetSlotBound(Slot, 2);
+  for (unsigned I = 1; I < W; ++I)
+    EXPECT_EQ(__ejit_asan_gate(Slot), 0);
+  // The new count applies from the next arming: W calls of sub 0, then W
+  // calls of sub 1.
+  for (unsigned I = 0; I < W; ++I)
+    EXPECT_EQ(__ejit_asan_gate(Slot), 0);
+  for (unsigned I = 0; I < W; ++I)
+    EXPECT_EQ(__ejit_asan_gate(Slot), 1);
+  // Monotonic maximum: a smaller count never shrinks the window.
+  ejitAsanSetSlotBound(Slot, 1);
+  EXPECT_EQ(__ejit_asan_gate(Slot), 0);
+  EXPECT_EQ(gEJitAsanState.cells[0].bound, 2u);
   EJitCoreId::resetForTest();
 }
 
@@ -541,6 +570,7 @@ TEST(EJitAsan, EmitsEntryStubForConstantOffsetBoundFold) {
     EXPECT_EQ(S.width, 32u);
     EXPECT_EQ(S.slot, 0u);
     EXPECT_EQ(gEJitAsanState.slots[0].activeSites.loadRelaxed(), 1u);
+    EXPECT_EQ(gEJitAsanState.slots[0].boundCount.loadRelaxed(), 1u);
     bool SawCheck = false;
     for (Instruction &I : instructions(M->getFunction("probe")))
       if (auto *Cmp = dyn_cast<ICmpInst>(&I))
@@ -621,6 +651,8 @@ TEST(EJitAsan, UnrolledLoopBoundFoldsGetEntryStubs) {
   EXPECT_EQ(Offsets, (std::set<uint64_t>{0, 1, 2, 3}));
   EXPECT_EQ(Expecteds, (std::set<uint64_t>{7, 9, 11, 13}));
   EXPECT_EQ(gEJitAsanState.slots[0].activeSites.loadRelaxed(), 4u);
+  // All four folds share one bound argument: one sub-window.
+  EXPECT_EQ(gEJitAsanState.slots[0].boundCount.loadRelaxed(), 1u);
 }
 
 TEST(EJitAsan, EntryStubEndToEndRecordsDivergentBuffer) {
@@ -694,7 +726,7 @@ TEST(EJitAsan, DumpReportsEntryRowsAndStats) {
                                              kBoundFieldOffset, kBoundExpected);
   ASSERT_NE(Site, kEJitAsanNoSite);
   EJitCoreId::setCurrentForTest(0);
-  EXPECT_EQ(__ejit_asan_gate(Slot), 1); // Serve one check on this core.
+  EXPECT_EQ(__ejit_asan_gate(Slot), 0); // Serve one check on this core.
   EJitCoreId::resetForTest();
   uint32_t Buffer = 0xdeadbeefu;
   __ejit_asan_mismatch(Site, &Buffer, 0xdeadbeefu);
@@ -785,8 +817,10 @@ TEST(EJitAsan, SkipsEntryFoldsOwnedByOtherEntries) {
 TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
   resetAsanBlob();
   const uint32_t Slot = ejitAsanClaimSlot("probe");
+  ejitAsanSetSlotBound(Slot, 2);
   EJitCoreId::setCurrentForTest(0);
-  EXPECT_EQ(__ejit_asan_gate(Slot), 1);
+  EXPECT_EQ(__ejit_asan_gate(Slot), 0);
+  EXPECT_EQ(__ejit_asan_gate(Slot), 0);
   EJitCoreId::resetForTest();
 
   auto Level = ejit_get_log_level();
@@ -799,5 +833,17 @@ TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
   EXPECT_NE(Out.find("[EJIT-ASAN] rotation slots=1/"), std::string::npos);
   EXPECT_NE(Out.find("rotation core=0"), std::string::npos);
   EXPECT_NE(Out.find("slot=0(probe)"), std::string::npos);
-  EXPECT_NE(Out.find("checks=1"), std::string::npos);
+  EXPECT_NE(Out.find("sub=0"), std::string::npos);
+  EXPECT_NE(Out.find("bound=2"), std::string::npos);
+  EXPECT_NE(Out.find("checks=2"), std::string::npos);
+  // Per-slot lines are audit depth: absent at INFO.
+  EXPECT_EQ(Out.find("rotation slot="), std::string::npos);
+
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
+  testing::internal::CaptureStdout();
+  EXPECT_EQ(ejit_asan_rotation_status(), EJIT_OK);
+  const std::string Verbose = testing::internal::GetCapturedStdout();
+  ejit_set_log_level(Level);
+  EXPECT_NE(Verbose.find("[EJIT-ASAN] rotation slot=0(probe) bound=2 sites=0"),
+            std::string::npos);
 }
