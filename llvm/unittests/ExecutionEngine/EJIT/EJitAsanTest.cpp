@@ -931,30 +931,35 @@ TEST(EJitAsan, DriftWalkRecognizesAtomicReadsWithoutMarker) {
     entry:
       %p = getelementptr inbounds i8, ptr %cfg, i64 4
       %v = load atomic i32, ptr %p acquire, align 4
-      ret i32 %v
+      %q = getelementptr inbounds i8, ptr %cfg, i64 8
+      %u = load i32, ptr %q, align 4
+      %r = add i32 %v, %u
+      ret i32 %r
     }
     !0 = !{!1, !2, !3}
     !1 = !{!"ejit_entry"}
     !2 = !{!"ejit_dim", !"cell", i32 0}
-    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !4}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 16, !4}
     !4 = !{i64 4, i64 4}
     !7 = !{}
   )",
                                Err, *C);
   ASSERT_TRUE(M);
-  uint64_t Object[1] = {0xCAFEBABE00000000ULL};
+  uint64_t Object[2] = {0xCAFEBABE00000000ULL, 0x5566778855667788ULL};
   PeriodArrayRegistry Registry;
   SpecializationContext Ctx;
   Ctx.fnName = "probe";
   Ctx.dimensions.push_back({"cell", 1});
   Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Object),
-                                /*size=*/8, /*argIndex=*/1, /*instance=*/1});
+                                /*size=*/16, /*argIndex=*/1, /*instance=*/1});
   EJitAsanCapture Capture;
   Ctx.asanCapture = &Capture;
 
   EJitOptimizer(Registry).runPipeline(*M, Ctx);
   ASSERT_FALSE(verifyModule(*M, &errs()));
   EXPECT_EQ(Capture.driftUncovered, 0u);
+  // Only the annotated atomic read at +4 records a site: the plain load at
+  // +8 sits in no listed field and stays invisible.
   ASSERT_EQ(Capture.entryFolds.size(), 1u);
   const auto &EF = Capture.entryFolds.front();
   EXPECT_FALSE(EF.folded);
@@ -962,7 +967,6 @@ TEST(EJitAsan, DriftWalkRecognizesAtomicReadsWithoutMarker) {
   EXPECT_EQ(EF.argNo, 1u);
   EXPECT_EQ(EF.byteOffset, 4u);
   EXPECT_EQ(EF.expected, 0xCAFEBABEu);
-  // An un-annotated offset through the bound argument stays invisible.
   EXPECT_EQ(gEJitAsanState.siteCounter.loadRelaxed(), 0u);
 }
 

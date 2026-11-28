@@ -54,6 +54,8 @@ static_assert(EJIT_ASAN_MAX_CORES >= 1 && EJIT_ASAN_MAX_CORES <= 256,
 #define EJIT_ASAN_MAX_SITES 512
 #endif
 static_assert(EJIT_ASAN_ROTATION_WINDOW >= 1, "rotation window must be >= 1");
+static_assert(EJIT_ASAN_ROTATION_WINDOW <= 0x10000000,
+              "bound x rotation window must fit the uint32 countdown");
 static_assert(EJIT_ASAN_MAX_SLOTS >= 1, "slot capacity must be >= 1");
 static_assert(EJIT_ASAN_MAX_SITES >= 1, "site budget must be >= 1");
 

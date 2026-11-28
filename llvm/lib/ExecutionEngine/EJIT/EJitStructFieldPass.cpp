@@ -2749,11 +2749,9 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
               State = &S;
               break;
             }
-        // Clang cannot attach the marker to an atomic load (atomics bypass
-        // the load decoration), so an annotated field read with atomic
-        // semantics reaches the final module unmarked. Recognize it through
-        // the bound metadata's field ranges — the same authority the
-        // substitution fallback trusts.
+        // Atomic reads of annotated fields reach the final module unmarked
+        // (atomics bypass the load decoration): recognize them through the
+        // bound metadata's field ranges, as the substitution fallback does.
         bool BoundAnnotated = false;
         if (!Marked && !Recognized && !LI->isVolatile() && State) {
           auto Off = getBoundPointerOffset(Ptr, State->boundArguments, DL,
@@ -2774,9 +2772,8 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
           continue;
         }
         if (State) {
-          // Bound-anchored survivor: the specialized entry can observe the
-          // field through the CURRENT bound argument, so it becomes a drift
-          // site with the value the compile saw as its baseline.
+          // Bound-anchored survivor: a drift site with the compile-time
+          // value as its baseline.
           auto *Ty = LI->getType();
           unsigned Width =
               Ty->isIntegerTy()
@@ -2801,7 +2798,9 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
           }
           auto Offset = getBoundPointerOffset(Ptr, State->boundArguments, DL,
                                               freeDimAssumptions_);
-          if (!Offset || *Offset >= State->view.size) {
+          TypeSize AccessSize = DL.getTypeStoreSize(Ty);
+          if (!Offset || AccessSize.isScalable() ||
+              *Offset + AccessSize.getFixedValue() > State->view.size) {
             Uncovered("invalid-bound-offset", I);
             continue;
           }
@@ -2830,11 +2829,9 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
           EF.siteId = kEJitAsanNoSite;
           continue;
         }
-        // Global-anchored survivors stay stub-side uncovered (the entry can
-        // only observe bound arguments); their fields belong to the
-        // full-scope watch below. Taxonomy follows the replacement-failure
-        // log, plus the annotation-consistency smell of a marker whose
-        // field the GV's own metadata does not list.
+        // Global-anchored survivors: only bound arguments are observable at
+        // an entry; their fields belong to the full-scope watch below.
+        // Replacement-failure taxonomy, plus offset-not-in-field-metadata.
         if (LI->isAtomic()) {
           Uncovered("atomic", I);
           continue;

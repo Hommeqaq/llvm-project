@@ -177,7 +177,7 @@ into one boot-lifetime table, deduplicated by instance address — it is
 independent of versions on purpose: retiring a version and resetting
 these counters would destroy exactly the long-run evidence the tier
 exists to collect. Each scan slice runs a second cursor over the table
-within the same step budget: folded-marked sites (an address some
+with its own step budget: folded-marked sites (an address some
 version's folded watch already covered — back-marked at merge, sticky
 through retirement, a documented blind spot) are skipped; the rest are
 sampled with value transfers recorded. At the default 32 steps per ~5 s
@@ -260,12 +260,14 @@ offset (widths 1/8/16/32/64) are observed by the stub; every annotated
 field of every registered object is sampled by the full-scope scan.
 Not covered: volatile annotated loads; residue-driven unfolded bound
 addresses (v1); annotated fields wider than 64 bits or non-scalar;
-registered objects whose base cannot be resolved at walk time; and the
-retired-folded blind spot (a full-scope site marked folded stays skipped
-after its version retires). Clang's frontend excludes unions, bitfields
-and volatile fields from the annotation, and nested struct members ARE
-enumerated (element-relative offsets) and resolved (recursive layout
-descent).
+registered objects whose base cannot be resolved at walk time;
+bound-anchored annotated loads owned by a non-entry function (a callee
+formal — no stub observes them and no worker watch exists; they surface
+only as VERBOSE drift lines); and the retired-folded blind spot (a
+full-scope site marked folded stays skipped after its version retires).
+Clang's frontend excludes unions, bitfields and volatile fields from the
+annotation, and nested struct members ARE enumerated (element-relative
+offsets) and resolved (recursive layout descent).
 
 The product contract for bound pointers is unchanged (heap memory,
 lifetime spanning the version, updates coherent across cores) plus the
@@ -310,8 +312,9 @@ symbols were added by the drift observer.
    `kind=drift` row (`object=bound@<FamilyB> offset=0x4 initial=0x0
    last=0x3 changes=1` — every earlier bound-sample call already counted
    its samples), one `src=metadata` row
-   (`object=gEJitAsanCells@... offset=0x8 instance=0/2 initial=0x7
-   last=0x17 changes=1`), and the stats reflecting
+   (`object=gEJitAsanCells@... offset=0x8 instance=0/2 initial=0x0
+   last=0x17 changes=1` — cell 0 is zero at merge time), and the stats
+   reflecting
    `entry_drift_sites=1 entry_drift_checks>0 fullscope_changed=1`.
 9. Any core: `ejit_asan_rotation_status` — header with `drift_sites=1`,
    per-core `sub=/bound=/window=` lines at INFO; per-slot lines at

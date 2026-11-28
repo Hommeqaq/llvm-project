@@ -183,22 +183,14 @@ resolveBoundViews(const Module &M, const SpecializationContext &ctx) {
 }
 
 #ifdef EJIT_ASAN
-/// Emit the EJIT-ASAN entry stub (EJIT_ASAN_CHECK.md) at the very end of
-/// runPipeline — after the last StructFieldPass run and after the audit
-/// snapshot, so no later fold pass can re-fold the check loads into the
-/// constants they compare against. One activated call checks the folds of
-/// exactly ONE bound argument (rank K = K-th distinct bound argument,
-/// ascending):
-///
-///   head:   %sub = call i32 @__ejit_asan_gate(i32 %slot)
-///           switch %sub, label %cont [ i32 0, label %check0 ... ]
-///   checkK: per fold of rank K: load the field through the CURRENT bound
-///           argument and compare with the baked constant;
-///   fail:   call @__ejit_asan_mismatch(i32 %site, ptr %arg, i64 zext(%v))
-///           then rejoin — report-only, the call always continues.
-///
-/// An out-of-range sub (a stale stub sharing the slot with a version whose
-/// rank set shrank) falls through the switch default and checks nothing.
+/// Emit the EJIT-ASAN entry stub (see EJIT_ASAN_CHECK.md for the shape) at
+/// the very end of runPipeline, after the last StructFieldPass run and the
+/// audit snapshot, so no later pass can re-fold the check loads. One
+/// activated call checks exactly ONE bound argument (rank K = K-th distinct
+/// bound argument, ascending): folded fields compare their baked constant,
+/// drift fields report the observed value through the hook; everything
+/// rejoins — report-only. An out-of-range sub falls through the switch
+/// default and checks nothing.
 static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
   EJitAsanCapture *Cap = Ctx.asanCapture;
   if (!Cap || Cap->entryFolds.empty())
@@ -207,8 +199,7 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
   if (!F || F->isDeclaration())
     return;
   // A fold captured from another function's formals belongs to THAT
-  // function's argument list; only folds owned by the specialized entry
-  // are emittable (a foreign index would read out of range).
+  // function's argument list; only the entry's own folds are emittable.
   unsigned Foreign = 0;
   for (const EJitAsanEntryFold &EF : Cap->entryFolds)
     if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
@@ -326,14 +317,20 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
 
 // Final-module drift walk: classify the annotated loads that survived the
 // fold patterns and enumerate registered objects' annotated fields into
-// the capture. Runs BEFORE emitAsanEntryChecks — the stub's own check
-// loads match the metadata-free bound-field fallback, so walking after
-// emission would re-record every site.
+// the capture. Runs BEFORE emitAsanEntryChecks (the stub's own check
+// loads match the metadata-free bound-field fallback).
 static void captureAsanDrift(Module &M, const SpecializationContext &Ctx,
                              PeriodArrayRegistry &Registry) {
   if (!Ctx.asanCapture)
     return;
-  EJitStructFieldPass Pass(Registry, Ctx.boundPointers);
+  // Same construction as the substitution pass: without the root function
+  // the bound-argument propagation falls back to unique-binder inference,
+  // which is ambiguous in multi-entry modules and loses every bound state.
+  SmallVector<EJitLocalWitnessPeriod, 4> LocalPeriods;
+  for (const auto &Dim : Ctx.dimensions)
+    LocalPeriods.push_back({Dim.periodName, Dim.cellIdx});
+  EJitStructFieldPass Pass(Registry, Ctx.boundPointers, Ctx.fnName,
+                           LocalPeriods);
   Pass.initFromModule(M);
   Pass.captureDriftSites(M, *Ctx.asanCapture);
 }

@@ -170,7 +170,6 @@ struct EJitAsanCapture {
   unsigned uncovered = 0;
   unsigned dropped = 0;
   unsigned driftUncovered = 0;
-  unsigned driftDropped = 0;
 };
 
 class EJitAsan {

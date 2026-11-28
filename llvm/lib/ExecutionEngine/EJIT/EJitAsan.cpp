@@ -247,9 +247,7 @@ bool EJitAsan::sameRequest(const EJitCompileRequest &A,
 }
 
 void EJitAsan::mergeAnnotatedFields(const EJitAsanCapture &Capture) {
-  // Boot-lifetime table: every compile re-enumerates the registered
-  // objects' annotated fields; deduplicate by instance address so the
-  // table grows only when new fields register.
+  // Boot-lifetime table, address-deduped across compiles.
   unsigned Dropped = 0;
   for (const auto &AF : Capture.annotatedFields) {
     if (!AF.base || !AF.stride || !AF.instanceCount)
@@ -280,10 +278,8 @@ void EJitAsan::mergeAnnotatedFields(const EJitAsanCapture &Capture) {
       fullSites_.push_back(std::move(FS));
     }
   }
-  // A folded watch covers these addresses for this capture's version
-  // lifetime: mark the full-scope sites folded so the drift scan skips
-  // them (their correctness is the version watch's business). Sticky —
-  // a retired version does not re-arm the site.
+  // A folded watch owns these addresses for its version lifetime; sticky
+  // through retirement (documented blind spot).
   for (const auto &W : Capture.watches)
     for (uintptr_t A : W.addresses) {
       auto It = fullIndex_.find(A);
@@ -309,7 +305,6 @@ void EJitAsan::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
   // Full-scope tier: merged regardless of the version lifecycle.
   mergeAnnotatedFields(Capture);
   driftUncovered_ += Capture.driftUncovered;
-  driftDropped_ += Capture.driftDropped;
   if (Capture.watches.empty() && Capture.entryFolds.empty() &&
       !Capture.uncovered && !Capture.dropped)
     return;
@@ -495,13 +490,12 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
       const unsigned Samples = R.samples.loadRelaxed();
       const unsigned Changes = R.driftChanges.loadRelaxed();
       if (Recorded == 0) {
-        // Never changed: full visibility at VERBOSE only.
+        // Never changed: VERBOSE only; no diverging member to name.
         EJIT_DIAG_VERBOSE(
-            "[EJIT-ASAN] DRIFT period=%s fn=%s object=bound@0x%llx "
+            "[EJIT-ASAN] DRIFT period=%s fn=%s "
             "offset=0x%llx src=bound%u kind=drift initial=0x%llx last=0x%llx "
             "changes=%u samples=%u",
-            S.period, S.function,
-            (unsigned long long)R.firstArg, (unsigned long long)S.byteOffset,
+            S.period, S.function, (unsigned long long)S.byteOffset,
             S.argNo, (unsigned long long)S.expected,
             (unsigned long long)R.lastSeen.loadRelaxed(), Changes, Samples);
         if (Yield)
@@ -728,10 +722,9 @@ void EJitAsan::scanSlice(const EJitSharedTaskPool &Pool,
     advance();
   }
 
-  // Full-scope drift watch, second cursor in the same slice budget:
-  // boot-lifetime field instances, no version lifecycle — a retirement
-  // resetting these counters would destroy exactly the long-run evidence
-  // they exist to collect.
+  // Full-scope drift watch, second cursor with its own step budget:
+  // boot-lifetime, no version lifecycle (resetting on retirement would
+  // destroy the long-run evidence).
   for (unsigned N = 0; N < StepBudget && !fullSites_.empty(); ++N) {
     Worked = true;
     if (Yield && EJIT_ASAN_YIELD_EVERY &&
