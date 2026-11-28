@@ -982,6 +982,8 @@ set(EJIT_ASAN_MAX_CORES "64" CACHE STRING
   "ASAN entry check: per-core rotation cell capacity (>= 1, <= 256)")
 set(EJIT_ASAN_MAX_SITES "512" CACHE STRING
   "ASAN entry check: emitted-site budget, monotonic per boot (>= 1)")
+set(EJIT_ASAN_MAX_FULLSITES "4096" CACHE STRING
+  "ASAN full-scope drift watch: registered field-instance budget, merged per boot, dedup by address (>= 1)")
 if(EJIT_ASAN)
   if(NOT EJIT_DIAG_ENABLE)
     message(FATAL_ERROR
@@ -996,6 +998,7 @@ if(EJIT_ASAN)
   ejit_require_numeric(EJIT_ASAN_MAX_SLOTS)
   ejit_require_numeric(EJIT_ASAN_MAX_CORES)
   ejit_require_numeric(EJIT_ASAN_MAX_SITES)
+  ejit_require_numeric(EJIT_ASAN_MAX_FULLSITES)
   if(EJIT_ASAN_IDLE_TICKS LESS 1 OR
      EJIT_ASAN_STEP_BUDGET LESS 1 OR
      EJIT_ASAN_YIELD_EVERY LESS 0 OR
@@ -1005,10 +1008,11 @@ if(EJIT_ASAN)
      EJIT_ASAN_MAX_SLOTS LESS 1 OR
      EJIT_ASAN_MAX_CORES LESS 1 OR
      EJIT_ASAN_MAX_CORES GREATER 256 OR
-     EJIT_ASAN_MAX_SITES LESS 1)
+     EJIT_ASAN_MAX_SITES LESS 1 OR
+     EJIT_ASAN_MAX_FULLSITES LESS 1)
     message(FATAL_ERROR
       "EJIT_ASAN_IDLE_TICKS/STEP_BUDGET/MAX_WATCHES/MAX_VERSIONS/"
-      "ROTATION_WINDOW/MAX_SLOTS/MAX_SITES must be >= 1, "
+      "ROTATION_WINDOW/MAX_SLOTS/MAX_SITES/MAX_FULLSITES must be >= 1, "
       "EJIT_ASAN_YIELD_EVERY >= 0, and EJIT_ASAN_MAX_CORES in [1, 256]")
   endif()
   add_definitions(-DEJIT_ASAN)

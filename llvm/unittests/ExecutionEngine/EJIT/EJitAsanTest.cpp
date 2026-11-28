@@ -1192,6 +1192,91 @@ TEST(EJitAsan, DriftStubEndToEndRecordsDivergentBuffer) {
   EJitCoreId::resetForTest();
 }
 
+TEST(EJitAsan, FullScopeProbeWatchesAnnotatedFields) {
+  // The full-scope tier watches every registered instance of every
+  // annotated field for the boot's lifetime, independent of versions: the
+  // capture's folded watch covers the cell-1 instance (back-marked folded,
+  // skipped by the drift scan), the cell-0 instance is sampled here and a
+  // value transfer reports a DRIFT row.
+  resetAsanBlob();
+  uint32_t Data[2][10];
+  for (unsigned I = 0; I < 10; ++I) {
+    Data[0][I] = 7;
+    Data[1][I] = 11;
+  }
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "cfg", Data, 2);
+  auto C = std::make_unique<LLVMContext>();
+  auto M = makeProbe(*C, /*Local=*/false, /*Mod=*/5);
+  ASSERT_TRUE(M);
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  ASSERT_EQ(Capture.annotatedFields.size(), 1u);
+  ASSERT_EQ(Capture.annotatedFields.front().base,
+            reinterpret_cast<uintptr_t>(Data));
+
+  EJitCompileRequest Req{};
+  Req.funcIndex = 44;
+  Req.generation = 1;
+  Req.numDims = 1;
+  Req.dims[0] = {0, 1};
+  Req.versions[0] = 1;
+  EJitSharedTaskPool Pool;
+  EJitAsan Verifier;
+  Verifier.onCompiled(Req, reinterpret_cast<uintptr_t>(&codeMarker),
+                      std::move(Capture));
+
+  auto Level = ejit_get_log_level();
+  ejit_set_log_level(EJIT_LOG_INFO);
+  auto Dump = [&] {
+    testing::internal::CaptureStdout();
+    EXPECT_TRUE(Verifier.dumpNow(Pool));
+    return testing::internal::GetCapturedStdout();
+  };
+  // A slice runs the full step budget over the site table, so the one
+  // un-folded site is sampled StepBudget/2 times per dump (the folded
+  // sibling consumes the other half of the steps).
+  const std::string Samples1 = "fullscope_samples=" +
+                               std::to_string(EJIT_ASAN_STEP_BUDGET / 2);
+  const std::string Samples2 =
+      "fullscope_samples=" + std::to_string(EJIT_ASAN_STEP_BUDGET);
+  const std::string RowCounts =
+      "changes=1 samples=" + std::to_string(EJIT_ASAN_STEP_BUDGET);
+  // Baseline scan: both instances merged, the folded one skipped, nothing
+  // changed yet.
+  auto First = Dump();
+  EXPECT_EQ(First.find("src=metadata"), std::string::npos);
+  EXPECT_NE(First.find("fullscope_sites=2/4096"), std::string::npos);
+  EXPECT_NE(First.find("fullscope_folded=1"), std::string::npos);
+  EXPECT_NE(First.find("fullscope_changed=0"), std::string::npos);
+  EXPECT_NE(First.find(Samples1), std::string::npos);
+  EXPECT_NE(First.find("drift_uncovered=0"), std::string::npos);
+  // A value transfer on the un-folded instance reports a DRIFT row with
+  // the registered-object identity; the folded instance never does.
+  __atomic_store_n(&Data[0][0], 9u, __ATOMIC_RELEASE);
+  auto Drifted = Dump();
+  EXPECT_NE(Drifted.find("instance=0/2 src=metadata"), std::string::npos);
+  EXPECT_NE(Drifted.find("kind=drift"), std::string::npos);
+  EXPECT_NE(Drifted.find("initial=0x7 last=0x9"), std::string::npos);
+  EXPECT_NE(Drifted.find(RowCounts), std::string::npos);
+  EXPECT_NE(Drifted.find("fullscope_changed=1"), std::string::npos);
+  EXPECT_NE(Drifted.find(Samples2), std::string::npos);
+  EXPECT_EQ(Drifted.find("instance=1/2"), std::string::npos);
+
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
+  testing::internal::CaptureStdout();
+  EXPECT_TRUE(Verifier.dumpNow(Pool));
+  const std::string Verbose = testing::internal::GetCapturedStdout();
+  ejit_set_log_level(Level);
+  EXPECT_NE(Verbose.find("DRIFT-DETAIL"), std::string::npos);
+  EXPECT_NE(Verbose.find("first=0x9"), std::string::npos);
+}
+
 TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
   resetAsanBlob();
   const uint32_t Slot = ejitAsanClaimSlot("probe");

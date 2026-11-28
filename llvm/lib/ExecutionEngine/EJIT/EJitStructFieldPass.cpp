@@ -2875,6 +2875,17 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
                         (unsigned long long)Instances);
       continue;
     }
+    void *Base = resolveBase(GV, It->second, registry_);
+    if (!Base) {
+      EJIT_DIAG_VERBOSE("[EJIT-ASAN] drift field enumeration skipped "
+                        "gv=%s reason=base-unresolved",
+                        GV->getName().str().c_str());
+      continue;
+    }
+    TypeSize StrideSz = DL.getTypeAllocSize(Element);
+    if (StrideSz.isScalable() || !StrideSz.getFixedValue())
+      continue;
+    const uint64_t Stride = StrideSz.getFixedValue();
     for (uint64_t FieldOff : Kv.second) {
       unsigned Width = annotatedFieldWidth(Element, FieldOff, DL);
       if (Width != 1 && Width != 8 && Width != 16 && Width != 32 &&
@@ -2892,6 +2903,8 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
       AF.instanceCount = static_cast<uint32_t>(Instances);
       AF.width = static_cast<uint8_t>(Width);
       AF.littleEndian = DL.isLittleEndian();
+      AF.base = reinterpret_cast<uintptr_t>(Base);
+      AF.stride = Stride;
       Capture.annotatedFields.push_back(std::move(AF));
     }
   }

@@ -246,6 +246,58 @@ bool EJitAsan::sameRequest(const EJitCompileRequest &A,
   return true;
 }
 
+void EJitAsan::mergeAnnotatedFields(const EJitAsanCapture &Capture) {
+  // Boot-lifetime table: every compile re-enumerates the registered
+  // objects' annotated fields; deduplicate by instance address so the
+  // table grows only when new fields register.
+  unsigned Dropped = 0;
+  for (const auto &AF : Capture.annotatedFields) {
+    if (!AF.base || !AF.stride || !AF.instanceCount)
+      continue;
+    for (uint32_t Inst = 0; Inst < AF.instanceCount; ++Inst) {
+      const uintptr_t Address =
+          AF.base + Inst * AF.stride + AF.offset;
+      if (fullIndex_.count(Address))
+        continue;
+      if (fullSites_.size() >= MaxFullSites) {
+        ++Dropped;
+        continue;
+      }
+      EJitAsanFullSite FS;
+      FS.object = AF.object;
+      FS.period = AF.period;
+      FS.base = AF.base;
+      FS.address = Address;
+      FS.instance = Inst;
+      FS.instanceCount = AF.instanceCount;
+      FS.offset = AF.offset;
+      FS.width = AF.width;
+      FS.littleEndian = AF.littleEndian;
+      FS.initial = FS.lastSeen =
+          readWatch(Address, FS.width, FS.littleEndian);
+      fullIndex_.try_emplace(Address,
+                             static_cast<uint32_t>(fullSites_.size()));
+      fullSites_.push_back(std::move(FS));
+    }
+  }
+  // A folded watch covers these addresses for this capture's version
+  // lifetime: mark the full-scope sites folded so the drift scan skips
+  // them (their correctness is the version watch's business). Sticky —
+  // a retired version does not re-arm the site.
+  for (const auto &W : Capture.watches)
+    for (uintptr_t A : W.addresses) {
+      auto It = fullIndex_.find(A);
+      if (It != fullIndex_.end())
+        fullSites_[It->second].folded = true;
+    }
+  if (Dropped) {
+    driftDropped_ += Dropped;
+    EJIT_DIAG("[EJIT-ASAN] capture DROPPED: full-scope site budget full "
+              "(cap=%u dropped=%u)",
+              MaxFullSites, Dropped);
+  }
+}
+
 void EJitAsan::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
                                    EJitAsanCapture Capture) {
   // Backfill the version generation on the emitted entry sites now that the
@@ -254,6 +306,10 @@ void EJitAsan::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
   for (const auto &EF : Capture.entryFolds)
     if (EF.siteId != kEJitAsanNoSite)
       gEJitAsanState.sites[EF.siteId].gen = Req.generation;
+  // Full-scope tier: merged regardless of the version lifecycle.
+  mergeAnnotatedFields(Capture);
+  driftUncovered_ += Capture.driftUncovered;
+  driftDropped_ += Capture.driftDropped;
   if (Capture.watches.empty() && Capture.entryFolds.empty() &&
       !Capture.uncovered && !Capture.dropped)
     return;
@@ -485,6 +541,44 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
     if (Yield)
       Yield(YieldCtx, YieldDelayTicks);
   }
+
+  // Full-scope drift rows: registered annotated fields the worker samples
+  // directly (src=metadata), one row per field instance. Same two-tier
+  // discipline as the stub rows; folded sites are skipped — the version
+  // watch rows report their addresses.
+  for (size_t Fi = 0; Fi < fullSites_.size(); ++Fi) {
+    const EJitAsanFullSite &FS = fullSites_[Fi];
+    if (FS.folded)
+      continue;
+    if (FS.changes) {
+      EJIT_DIAG_RAW(
+          "[EJIT-ASAN] DRIFT period=%s object=%s@0x%llx offset=0x%llx "
+          "instance=%u/%u src=metadata kind=drift initial=0x%llx "
+          "last=0x%llx changes=%u samples=%u",
+          FS.period.c_str(), FS.object.c_str(),
+          (unsigned long long)FS.base, (unsigned long long)FS.offset,
+          FS.instance, FS.instanceCount, (unsigned long long)FS.initial,
+          (unsigned long long)FS.lastSeen, FS.changes, FS.samples);
+      EJIT_DIAG_VERBOSE(
+          "[EJIT-ASAN] DRIFT-DETAIL object=%s@0x%llx offset=0x%llx "
+          "instance=%u/%u first=0x%llx",
+          FS.object.c_str(), (unsigned long long)FS.base,
+          (unsigned long long)FS.offset, FS.instance, FS.instanceCount,
+          (unsigned long long)FS.firstChanged);
+    } else {
+      // Never changed: full visibility at VERBOSE only.
+      EJIT_DIAG_VERBOSE(
+          "[EJIT-ASAN] DRIFT period=%s object=%s@0x%llx offset=0x%llx "
+          "instance=%u/%u src=metadata kind=drift initial=0x%llx "
+          "last=0x%llx changes=%u samples=%u",
+          FS.period.c_str(), FS.object.c_str(),
+          (unsigned long long)FS.base, (unsigned long long)FS.offset,
+          FS.instance, FS.instanceCount, (unsigned long long)FS.initial,
+          (unsigned long long)FS.lastSeen, FS.changes, FS.samples);
+    }
+    if (Yield)
+      Yield(YieldCtx, YieldDelayTicks);
+  }
 }
 
 void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
@@ -518,12 +612,26 @@ void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
       EntryFoldedSites += R.recorded.loadAcquire() >= 2;
     }
   }
+  // Full-scope tier aggregates: boot-lifetime sites, folded ones (skipped
+  // by the scan), sites with recorded drift, and total observations.
+  uint64_t FullscopeFolded = 0, FullscopeChanged = 0, FullscopeSamples = 0;
+  for (const auto &FS : fullSites_) {
+    if (FS.folded) {
+      ++FullscopeFolded;
+      continue;
+    }
+    FullscopeSamples += FS.samples;
+    FullscopeChanged += FS.changes != 0;
+  }
+  const bool FullSites = fullSites_.size() >= MaxFullSites;
   EJIT_DIAG_RAW(
       "[EJIT-ASAN] versions=%zu staged=%zu watches=%u/%u%s "
       "checked_active=%llu/%llu checks=%llu mismatch_samples=%llu "
       "rate=%u.%u%% recorded=%u uncovered=%llu dropped=%llu "
       "blocked_root=%llu retired=%llu entry_checks=%llu "
-      "entry_folded_sites=%llu entry_drift_sites=%llu entry_drift_checks=%llu",
+      "entry_folded_sites=%llu entry_drift_sites=%llu entry_drift_checks=%llu "
+      "fullscope_sites=%zu/%u%s fullscope_folded=%llu fullscope_changed=%llu "
+      "fullscope_samples=%llu drift_uncovered=%llu drift_dropped=%llu",
       live_.size(), pending_.size(), retainedWatches_, MaxWatches,
       Full ? " FULL" : "",
       (unsigned long long)checkedActiveProbes_,
@@ -533,7 +641,10 @@ void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
       (unsigned long long)blockedRoot_, (unsigned long long)retired_,
       (unsigned long long)EntryChecks, (unsigned long long)EntryFoldedSites,
       (unsigned long long)EntryDriftSites,
-      (unsigned long long)EntryDriftChecks);
+      (unsigned long long)EntryDriftChecks, fullSites_.size(), MaxFullSites,
+      FullSites ? " FULL" : "", (unsigned long long)FullscopeFolded,
+      (unsigned long long)FullscopeChanged, (unsigned long long)FullscopeSamples,
+      (unsigned long long)driftUncovered_, (unsigned long long)driftDropped_);
   if (Yield)
     Yield(YieldCtx, YieldDelayTicks);
 }
@@ -615,6 +726,34 @@ void EJitAsan::scanSlice(const EJitSharedTaskPool &Pool,
         V.watch = 0;
     }
     advance();
+  }
+
+  // Full-scope drift watch, second cursor in the same slice budget:
+  // boot-lifetime field instances, no version lifecycle — a retirement
+  // resetting these counters would destroy exactly the long-run evidence
+  // they exist to collect.
+  for (unsigned N = 0; N < StepBudget && !fullSites_.empty(); ++N) {
+    Worked = true;
+    if (Yield && EJIT_ASAN_YIELD_EVERY &&
+        N % EJIT_ASAN_YIELD_EVERY == 0 && N != 0)
+      Yield(YieldCtx, YieldDelayTicks);
+    // Fresh reference each step: a yield lets the worker consume compiles
+    // whose merges append to (and may reallocate) fullSites_.
+    EJitAsanFullSite &FS = fullSites_[fullCursor_];
+    if (++fullCursor_ == fullSites_.size())
+      fullCursor_ = 0;
+    if (FS.folded)
+      continue; // The version watch owns this address.
+    const uint64_t V = readWatch(FS.address, FS.width, FS.littleEndian);
+    if (FS.samples != 0xFFFFFFFFu)
+      ++FS.samples;
+    if (V != FS.lastSeen) {
+      if (FS.changes == 0)
+        FS.firstChanged = V;
+      if (FS.changes != 0xFFFFFFFFu)
+        ++FS.changes;
+      FS.lastSeen = V;
+    }
   }
   // Work/rest rhythm: a finished slice always ends with one fixed rest. A
   // light slice's probe work is microseconds per step (far under the work

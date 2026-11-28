@@ -10,6 +10,7 @@
 #define LLVM_LIB_EXECUTIONENGINE_EJIT_EJITASAN_H
 
 #include "EJitAsanState.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/EJIT/EJitTaskPoolTypes.h"
 #include <string>
@@ -45,6 +46,13 @@ namespace llvm::ejit {
 #endif
 #ifndef EJIT_ASAN_MAX_VERSIONS
 #define EJIT_ASAN_MAX_VERSIONS 1024
+#endif
+// Full-scope drift watch: total (registered field instance) sites, merged
+// across every compile of the boot, deduplicated by address. Overrun drops
+// the newest capture's remaining sites with a log and counts into
+// drift_dropped.
+#ifndef EJIT_ASAN_MAX_FULLSITES
+#define EJIT_ASAN_MAX_FULLSITES 4096
 #endif
 
 class EJitSharedTaskPool;
@@ -123,6 +131,34 @@ struct EJitAsanAnnotatedField {
   uint32_t instanceCount = 0; // Registered instances of the element.
   uint8_t width = 0;         // Field bit width: 1/8/16/32/64.
   bool littleEndian = false;
+  uintptr_t base = 0; // Registered object/array base (0 = unresolvable).
+  uint64_t stride = 0; // Per-instance stride.
+};
+
+// One registered field instance in the boot-lifetime full-scope drift
+// watch: independent of any version. The worker's scan loop samples it and
+// records value transfers as annotation-truthfulness evidence. Plain
+// fields: only the worker core (probe and dump run there) ever touches
+// them.
+struct EJitAsanFullSite {
+  std::string object;
+  std::string period;
+  uintptr_t base = 0;    // Registered object/array base (row identity).
+  uintptr_t address = 0; // base + instance * stride + offset.
+  uint32_t instance = 0;
+  uint32_t instanceCount = 0;
+  uint64_t offset = 0;
+  uint8_t width = 0;
+  bool littleEndian = false;
+  // A folded watch covers this address: its correctness is the version
+  // watch's business, so the full-scope scan skips it. Sticky — a retired
+  // version does not re-arm the site (documented blind spot).
+  bool folded = false;
+  uint64_t initial = 0; // Value observed when the site merged in.
+  uint64_t lastSeen = 0;
+  uint64_t firstChanged = 0;
+  uint32_t changes = 0; // Value transfers, saturating ~4G.
+  uint32_t samples = 0;
 };
 
 // Compile-side only. No LLVM IR or borrowed calling arguments survive capture.
@@ -176,6 +212,7 @@ private:
   };
   static bool sameRequest(const EJitCompileRequest &A,
                           const EJitCompileRequest &B);
+  void mergeAnnotatedFields(const EJitAsanCapture &Capture);
   void dropCurrent();
   void advance();
   void scanSlice(const EJitSharedTaskPool &Pool, VerifyYieldFn Yield,
@@ -195,6 +232,14 @@ private:
   static constexpr unsigned YieldDelayTicks = 20;
   std::vector<Version> pending_, live_;
   size_t cursor_ = 0;
+  // Full-scope drift watch: boot-lifetime field instances, address-deduped
+  // across compiles, with their own scan cursor in the same slice budget.
+  static constexpr unsigned MaxFullSites = EJIT_ASAN_MAX_FULLSITES;
+  std::vector<EJitAsanFullSite> fullSites_;
+  DenseMap<uintptr_t, uint32_t> fullIndex_;
+  size_t fullCursor_ = 0;
+  uint64_t driftUncovered_ = 0;
+  uint64_t driftDropped_ = 0;
   unsigned retainedWatches_ = 0;
   unsigned idleTicks_ = 0;
   // Direct-dump in-progress flag (see dumpNow): plain bool, not atomic —
