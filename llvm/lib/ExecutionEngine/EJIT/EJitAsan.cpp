@@ -313,9 +313,9 @@ void EJitAsan::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
     // Budget failures must be discoverable at compile time, not only in a
     // later dump: one line per dropped capture (rare anomaly, not scanning).
     EJIT_DIAG("[EJIT-ASAN] capture DROPPED: version budget full "
-              "(tracked=%zu cap=%u) fn=%u watches=%u uncovered=%u",
-              pending_.size() + live_.size(), MaxVersions,
-              stripReqTier(Req.funcIndex),
+              "(tracked=%llu cap=%u) fn=%u watches=%u uncovered=%u",
+              (unsigned long long)(pending_.size() + live_.size()),
+              MaxVersions, stripReqTier(Req.funcIndex),
               static_cast<unsigned>(Capture.watches.size()), Capture.uncovered);
     return;
   }
@@ -329,9 +329,9 @@ void EJitAsan::onCompiled(const EJitCompileRequest &Req, uintptr_t Fn,
     // Either the per-capture fold cap (EJitAsanCapture::MaxWatches)
     // or the global watch budget trimmed this capture.
     EJIT_DIAG("[EJIT-ASAN] capture TRIMMED: dropped=%u (global watch "
-              "budget trim=%u, retained=%u+%zu cap=%u) fn=%u",
+              "budget trim=%u, retained=%u+%llu cap=%u) fn=%u",
               Capture.dropped, Trimmed, retainedWatches_,
-              Capture.watches.size(), MaxWatches,
+              (unsigned long long)Capture.watches.size(), MaxWatches,
               stripReqTier(Req.funcIndex));
   }
   retainedWatches_ += Capture.watches.size();
@@ -432,7 +432,7 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
               "[EJIT-ASAN] MISMATCH tier=%u gen=%u "
               "dims=%u:%u@%u,%u:%u@%u,%u:%u@%u,%u:%u@%u "
               "period=%s fn=%s object=%s@0x%llx offset=0x%llx src=arg%u "
-              "residue=%u/%zu kind=%s expected=0x%llx first=0x%llx "
+              "residue=%u/%llu kind=%s expected=0x%llx first=0x%llx "
               "count=%u/%u rate=%u.%u%%",
               decodeReqTier(Q.funcIndex), Q.generation,
               Q.dims[0].dimType, Q.dims[0].instanceId, Q.versions[0],
@@ -440,7 +440,8 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
               Q.dims[2].dimType, Q.dims[2].instanceId, Q.versions[2],
               Q.dims[3].dimType, Q.dims[3].instanceId, Q.versions[3],
               W.period.c_str(), W.function.c_str(), W.object.c_str(), Base,
-              Offset, W.freeArg, R, W.addresses.size(), Kind,
+              Offset, W.freeArg, R, (unsigned long long)W.addresses.size(),
+              Kind,
               (unsigned long long)(Rec.changedRoot ? W.expectedRoot
                                                    : W.expected),
               (unsigned long long)Rec.value,
@@ -450,7 +451,7 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
               "[EJIT-ASAN] MISMATCH tier=%u gen=%u "
               "dims=%u:%u@%u,%u:%u@%u,%u:%u@%u,%u:%u@%u "
               "period=%s fn=%s object=%s@0x%llx offset=0x%llx src=const "
-              "residue=%u/%zu kind=%s expected=0x%llx first=0x%llx "
+              "residue=%u/%llu kind=%s expected=0x%llx first=0x%llx "
               "count=%u/%u rate=%u.%u%%",
               decodeReqTier(Q.funcIndex), Q.generation,
               Q.dims[0].dimType, Q.dims[0].instanceId, Q.versions[0],
@@ -458,7 +459,7 @@ void EJitAsan::printRecordedRows(VerifyYieldFn Yield,
               Q.dims[2].dimType, Q.dims[2].instanceId, Q.versions[2],
               Q.dims[3].dimType, Q.dims[3].instanceId, Q.versions[3],
               W.period.c_str(), W.function.c_str(), W.object.c_str(), Base,
-              Offset, R, W.addresses.size(), Kind,
+              Offset, R, (unsigned long long)W.addresses.size(), Kind,
               (unsigned long long)(Rec.changedRoot ? W.expectedRoot
                                                    : W.expected),
               (unsigned long long)Rec.value,
@@ -619,14 +620,15 @@ void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
   }
   const bool FullSites = fullSites_.size() >= MaxFullSites;
   EJIT_DIAG_RAW(
-      "[EJIT-ASAN] versions=%zu staged=%zu watches=%u/%u%s "
+      "[EJIT-ASAN] versions=%llu staged=%llu watches=%u/%u%s "
       "checked_active=%llu/%llu checks=%llu mismatch_samples=%llu "
       "rate=%u.%u%% recorded=%u uncovered=%llu dropped=%llu "
       "blocked_root=%llu retired=%llu entry_checks=%llu "
       "entry_folded_sites=%llu entry_drift_sites=%llu entry_drift_checks=%llu "
-      "fullscope_sites=%zu/%u%s fullscope_folded=%llu fullscope_changed=%llu "
+      "fullscope_sites=%llu/%u%s fullscope_folded=%llu fullscope_changed=%llu "
       "fullscope_samples=%llu drift_uncovered=%llu drift_dropped=%llu",
-      live_.size(), pending_.size(), retainedWatches_, MaxWatches,
+      (unsigned long long)live_.size(), (unsigned long long)pending_.size(),
+      retainedWatches_, MaxWatches,
       Full ? " FULL" : "",
       (unsigned long long)checkedActiveProbes_,
       (unsigned long long)activeProbes_, (unsigned long long)checks_,
@@ -635,7 +637,8 @@ void EJitAsan::dump(VerifyYieldFn Yield, void *YieldCtx) const {
       (unsigned long long)blockedRoot_, (unsigned long long)retired_,
       (unsigned long long)EntryChecks, (unsigned long long)EntryFoldedSites,
       (unsigned long long)EntryDriftSites,
-      (unsigned long long)EntryDriftChecks, fullSites_.size(), MaxFullSites,
+      (unsigned long long)EntryDriftChecks,
+      (unsigned long long)fullSites_.size(), MaxFullSites,
       FullSites ? " FULL" : "", (unsigned long long)FullscopeFolded,
       (unsigned long long)FullscopeChanged, (unsigned long long)FullscopeSamples,
       (unsigned long long)driftUncovered_, (unsigned long long)driftDropped_);

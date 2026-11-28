@@ -2885,8 +2885,10 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
     }
     if (It->second.isArray && It->second.arraySize != Instances) {
       EJIT_DIAG_VERBOSE("[EJIT-ASAN] drift field enumeration skipped "
-                        "gv=%s instance-count-mismatch registered=%zu ir=%llu",
-                        GV->getName().str().c_str(), It->second.arraySize,
+                        "gv=%s instance-count-mismatch registered=%llu "
+                        "ir=%llu",
+                        GV->getName().str().c_str(),
+                        (unsigned long long)It->second.arraySize,
                         (unsigned long long)Instances);
       continue;
     }
