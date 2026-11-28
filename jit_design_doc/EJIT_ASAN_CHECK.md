@@ -1,30 +1,40 @@
-# EJIT-ASAN: live substitution checking
+# EJIT-ASAN: live substitution and annotation checking
 
 EJIT-ASAN checks, at runtime, that the constants the JIT baked into
-specialized code still hold. It is a read-only diagnostic: nothing gates on
-it and no specialized code is diverted on a mismatch — a mismatch is
-recorded and reported, the call always continues with its baked values.
+specialized code still hold — and that the fields whose values it was
+told to trust really are trustworthy. It is a read-only diagnostic:
+nothing gates on it and no specialized code is diverted — evidence is
+recorded and reported, the call always continues with its baked values
+(folded checks) or its real values (drift observations).
 
-It has two complementary halves:
+It has three complementary parts:
 
-- **The worker probe** re-reads, on the shared worker's own idle rounds, the
-  shared-RAM locations whose values the fold actually baked, comparing them
-  against the constants in the JIT code. It watches the compile-time
-  snapshot of every fold — including the exemplar pointee of a bound_ptr
-  fold — but it can only ever see the addresses captured at compile time.
-- **The entry stub** (the bound_ptr half) answers the question the probe
-  structurally cannot: whether the pointer a call passes *now* still honors
-  the bound_ptr promise. A `bound_ptr` parameter is a promise that certain
-  period_const members are CONSISTENT across every pointer the product may
-  pass for the specialization's lifetime — different pointers, same folded
-  fields, no recompile on pointer change. Only the entry of the specialized
-  function can see the current pointer, so the stub loads the folded
-  fields through the ACTUAL argument and compares them with the baked
-  constants on a rotating sample of calls. The first divergence freezes
-  both the seen value and the argument pointer — the family member that
-  broke the invariant — and the row names it directly.
+- **The worker probe** re-reads, on the shared worker's idle rounds, the
+  shared-RAM locations whose values the fold actually baked, comparing
+  them against the constants in the JIT code. It watches the
+  compile-time snapshot of every fold — including the exemplar pointee
+  of a bound_ptr fold — but it can only ever see the addresses captured
+  at compile time.
+- **The entry stub** answers the question the probe structurally cannot:
+  whether the pointer a call passes *now* still honors the bound_ptr
+  promise. A `bound_ptr` parameter is a promise that certain
+  period_const members are CONSISTENT across every pointer the product
+  may pass for the specialization's lifetime — different pointers, same
+  folded fields, no recompile on pointer change. Only the entry of the
+  specialized function can see the current pointer, so the stub loads
+  the folded fields through the ACTUAL argument and compares them with
+  the baked constants on a rotating sample of calls.
+- **The drift observer** (the gen-2 extension) watches the unfolded
+  half: annotated fields that SURVIVED the specialization — their
+  annotation claims "constant within the window", yet nothing ever
+  verified the claim. The same merged entry stub observes the ones
+  reached through a bound_ptr argument; the worker's full-scope scan
+  samples every annotated field of every registered object,
+  compile-independent and version-independent. A value that moves is
+  not a fault — it is evidence the annotation does not hold.
 
-Both halves report through the same dump; rows carry their source (`kind=`).
+All parts report through the same dump; rows carry their source
+(`kind=`, `src=`).
 
 ## Configure and enable
 
@@ -35,17 +45,18 @@ Both halves report through the same dump; rows carry their source (`kind=`).
 | CMake knob | default | meaning |
 |---|---|---|
 | `EJIT_ASAN_IDLE_TICKS` | 5000 | worker-probe: one probe slice every Nth worker idle round (~5 s at 1 tick ~ 1 ms) |
-| `EJIT_ASAN_STEP_BUDGET` | 32 | worker-probe: max probe/retirement steps per slice |
+| `EJIT_ASAN_STEP_BUDGET` | 32 | worker-probe: max probe/full-scope steps per slice |
 | `EJIT_ASAN_YIELD_EVERY` | 8 | worker-probe: in-slice yield cadence |
 | `EJIT_ASAN_MAX_WATCHES` | 81920 | worker-probe: global watch budget; overrun trims the NEWEST capture |
 | `EJIT_ASAN_MAX_VERSIONS` | 1024 | worker-probe: simultaneous tracked-version budget |
-| `EJIT_ASAN_ROTATION_WINDOW` | 128 | entry stub: calls per function window before rotating |
+| `EJIT_ASAN_ROTATION_WINDOW` | 128 | entry stub: calls per bound-argument sub-window before the gate advances |
 | `EJIT_ASAN_MAX_SLOTS` | 64 | entry stub: rotation function-slot table capacity |
 | `EJIT_ASAN_MAX_CORES` | 64 | entry stub: per-core rotation cell capacity (in [1, 256]; cores above it never check) |
-| `EJIT_ASAN_MAX_SITES` | 512 | entry stub: emitted-site budget; monotonic per boot, overrun drops the NEWEST capture with a log |
+| `EJIT_ASAN_MAX_SITES` | 512 | entry stub: emitted-site budget (folded + drift share it); monotonic per boot, overrun drops the NEWEST capture with a log |
+| `EJIT_ASAN_MAX_FULLSITES` | 4096 | full-scope drift watch: registered field-instance budget, merged per boot, dedup by address; overrun drops the capture's remaining sites with a log |
 
-The aarch64_be preset pins all of the above. The worker probe needs no
-runtime opt-in; the entry stub does:
+The aarch64_be preset pins all of the above. The worker probe and the
+full-scope drift scan need no runtime opt-in; the entry stub does:
 
 ```c
 ejit_enable_asan_mode();   // BEFORE ejit_init; every later worker compile
@@ -62,173 +73,248 @@ Business code needs no new Clang flag — normal spec5 annotations
 
 ## Worker probe
 
-Pacing and mechanics are unchanged from the original feature: one bounded
-probe slice every `EJIT_ASAN_IDLE_TICKS` idle rounds; a mismatching probe
-only bumps the location's sticky record (the first mismatch freezes the
-seen value; later mismatches only grow saturating counters); normal
-scanning never prints. Every fold the capture could not watch counts into
-`uncovered`; dropped or trimmed captures log at compile time
-(`capture DROPPED` / `capture TRIMMED`, plus `capture DROPPED: site
-budget full` for the entry-stub budget).
+Unchanged from gen-1: one bounded probe slice every
+`EJIT_ASAN_IDLE_TICKS` idle rounds; a mismatching probe only bumps the
+location's sticky record (the first mismatch freezes the seen value;
+later mismatches only grow saturating counters); normal scanning never
+prints. Every fold the capture could not watch counts into `uncovered`;
+dropped or trimmed captures log at compile time (`capture DROPPED` /
+`capture TRIMMED`, plus `capture DROPPED: site budget full` /
+`full-scope site budget full` for the two site budgets).
 
-One capture bug is fixed in this version: the domain walk previously
-dropped its AllowArgs flag while walking GEP chains, so every bound fold
-at a nonzero offset was reported `uncovered: unsupported-index-domain`
-instead of being watched. Only bare offset-0 bound loads ever captured;
-all constant-offset bound folds now capture.
+The gen-1 capture bug is fixed here: the domain walk now propagates
+`AllowArgs` through GEP chains, so constant-offset bound folds capture
+(was: every nonzero-offset bound fold landed `uncovered:
+unsupported-index-domain`).
 
-## Entry stub
+## Entry stub and drift observer
 
-**Emission.** At worker compile, a bound fold whose byte offset is fully
-constant (`modulus == 1`) is recorded in the compile's capture regardless
-of the mode. When the mode is enabled, the very END of the optimization
-pipeline — after the last StructFieldPass run and after the audit
-snapshot, so no later fold pass can recognize the check loads as
-period_const and re-fold them into the constants they compare against —
-emits at the specialized function's entry:
+**Emission.** At worker compile, bound folds with a fully constant offset
+(`modulus == 1`) are recorded — folded ones from the substitution, drift
+ones from the final-module walk below. When the mode is enabled, the very
+END of the optimization pipeline — after the last StructFieldPass run
+and after the audit snapshot — emits at the specialized function's entry
+one merged stub:
 
 ```text
-head:   %active = call i1 @__ejit_asan_gate(i32 %slot)
-        br %active, check, cont
-check:  per folded field: load <field> through the CURRENT bound argument;
-        compare with the baked constant
-fail:   call @__ejit_asan_mismatch(i32 %site, ptr %arg, i64 %value)
-        br cont                        -- report-only: the call continues
+head:   %sub = call i32 @__ejit_asan_gate(i32 %slot)
+        switch %sub, label %cont [ i32 0, label %check0 ... ]
+checkK: the K-th bound argument (ascending rank):
+        folded fields: load through the CURRENT bound argument, compare
+                       with the baked constant; mismatch -> hook -> rejoin
+        drift fields:  load (Acquire when the source load was atomic),
+                       report the value through the hook, rejoin
 cont:   <original body>
 ```
 
 The stub resolves `__ejit_asan_gate`/`__ejit_asan_mismatch` through the
 same absolute-symbol path as the value-profiling hooks (registered by
-`ejit_init`; same-image/same-VA cross-core precondition). Residue-driven
-bound folds (`modulus > 1` — a free-dim index in the address) get NO
-entry stub in v1: the stub would have to recompute the index per call;
-those folds keep their full worker-probe coverage instead. Functions with
-no bound folds emit nothing; the dormant cost of an instrumented entry is
-one gate call.
+`ejit_init`; same-image/same-VA cross-core precondition).
 
-**Rotation.** One shared rotation state (`gEJitAsanState`, inter-core
-shared memory; an independent blob — the taskpool state and its ABI are
-untouched): a function-slot table claimed by the emitting worker (a slot
-is never freed; a dead slot — no published sites — may only be renamed
-once the table is full), and one cell per core. At most ONE function slot
-is active per core at a time: `EJIT_ASAN_ROTATION_WINDOW` consecutive
-calls of the active function are checked, then the next gate call
-advances to the next slot. Each core rotates independently (a cold core
-stalls only its own rotation). By product decision v1 has NO dead-slot
-skip and NO tick backstop: if a slot with no live versions (or a
-function nobody calls) is reached, that core's rotation rests on it
-until some instrumented call arrives; `ejit_asan_rotation_status()` makes
-the stall visible. The gate reads only its own core's cell — plain loads
-and stores, no atomics on the hot path — and cores beyond
-`EJIT_ASAN_MAX_CORES` are safely degraded (never check).
+**Sub-rotation.** One gate call per instrumented entry; each activated
+call checks exactly ONE bound argument of the active function (product
+rule: a function may mark several bound_ptrs, but no call pays for more
+than one). The gate returns the sub-window index or -1; the window spans
+`bound x EJIT_ASAN_ROTATION_WINDOW` matching calls, where `bound` is the
+slot's registered sub-window count (the distinct bound arguments its
+stubs ever instrumented — a monotonic max written by the emitter). The
+armed window SNAPSHOTS the count: a version registering more arguments
+affects the next arming on any core; a stale stub whose rank set shrank
+falls through the switch default and checks nothing. At most one
+function slot is active per core; each core rotates independently; v1
+has no dead-slot skip and no tick backstop (a resting rotation is
+visible via `ejit_asan_rotation_status()`); cores beyond
+`EJIT_ASAN_MAX_CORES` are safely degraded.
 
-**Records.** The mismatch hook freezes, on the FIRST divergence per site,
-the seen value and the actual argument pointer (a CAS elects the single
-freezing writer; losers only grow a saturating count). Entry rows carry
-no rate: counting every executed check would put an atomic in the hot
-stub; the per-core `checks` counter covers the volume and is reported in
-the stats. Sites are monotonic per boot (version retirement does not
-reclaim them); when the site budget is full the newest capture is dropped
-with a discoverable log and its folds keep the worker-probe coverage.
+**The drift walk.** At both final-code exits, before stub emission (the
+stub's own check loads match the metadata-free bound-field fallback and
+must not be re-recorded), a fresh pass instance walks the final module:
+
+- A **bound-anchored surviving load** with a constant offset inside a
+  listed bound field becomes a drift site: the stub observes the field
+  through the current argument on every activated call, and the value
+  the compile saw is published as its baseline. Clang cannot attach
+  `!ejit.period_const` to an atomic load — an annotated field read with
+  atomic semantics (`__atomic_load_n` in source) therefore reaches the
+  final module unmarked; the walk recognizes it through the bound
+  metadata's field ranges, the same authority the substitution fallback
+  trusts. Residue-driven survivors (`modulus > 1`) get no site in v1.
+- **Global-anchored survivors** cannot be observed at an entry (only
+  bound arguments are visible there); they count into `drift_uncovered`
+  with a reason — the replacement-failure taxonomy (`no-root-gv`,
+  `gv-not-in-map`, `base-unresolved`, `non-const-offset`,
+  `witness-out-of-bounds`, `unsupported-type`, `atomic`) plus
+  `offset-not-in-field-metadata`, the annotation-consistency smell of a
+  marker on a field the GV's own metadata does not list. Volatile
+  annotated loads stay out entirely (an observation load of our own
+  would change the access pattern the program promised).
+- **Full-scope enumeration**: every registered object's annotated fields
+  (GV metadata, including nested struct members and expanded array
+  slots; unions and bitfields are excluded at the frontend) are
+  enumerated per walk — element-relative offset, DL-derived width
+  (1/8/16/32/64-bit scalars only), registered instance count
+  cross-checked against the IR array length — with the registered base
+  resolved so instance addresses are `registryBase + instance * stride
+  + offset`.
+
+**Hook dispatch.** The mismatch hook keeps its historical name and
+signature; the site's kind dispatches the protocol:
+
+- A **folded** site records a MISMATCH: the first divergence freezes the
+  seen value and the argument pointer (the family member that broke the
+  promise); later mismatches only grow a saturating count.
+- A **drift** site records an OBSERVATION: every activated call counts a
+  sample; a value that differs from the last-seen baseline transfers
+  `lastSeen` (a bounded 4-round CAS — under extreme multi-core flutter
+  the retry gives up and under-counts rather than spins, a documented
+  approximation) and counts one change; the first changed value and the
+  diverging call's pointer freeze through the same CAS-elected single
+  writer. An A→B→A flip entirely between two observations is physically
+  invisible at any sampling rate.
+
+**The full-scope scan.** The worker merges every compile's enumeration
+into one boot-lifetime table, deduplicated by instance address — it is
+independent of versions on purpose: retiring a version and resetting
+these counters would destroy exactly the long-run evidence the tier
+exists to collect. Each scan slice runs a second cursor over the table
+within the same step budget: folded-marked sites (an address some
+version's folded watch already covered — back-marked at merge, sticky
+through retirement, a documented blind spot) are skipped; the rest are
+sampled with value transfers recorded. At the default 32 steps per ~5 s
+slice a full 4096-site round takes ~11 minutes — the cadence scales
+inversely with the annotated-field count.
 
 ## Output model
 
 `ejit_asan_dump()` prints the report NOW, synchronously in the caller's
-context (owner/worker core only): one probe slice, one row per recorded
+context (owner/worker core only): one scan slice, one row per recorded
 location, then the stats line, each paced with fixed 20-tick yields; a
 second call while printing returns `EJIT_ERR_NOT_ACTIVE`.
 
-Worker-probe row (unchanged semantics; `kind` is `value`, `pointer-root`,
-or `bound`):
+**MISMATCH rows** (folded checks — faults; all fields at INFO):
 
 ```text
-[EJIT-ASAN] MISMATCH tier=0 gen=1 dims=... period=asan_cell
-  fn=ejit_asan_probe object=gEJitAsanCells@0x82f40000 offset=0x14 src=arg1
-  residue=4/5 kind=value expected=0x7 first=0x11 count=7/7 rate=100.0%
-```
+[EJIT-ASAN] MISMATCH tier=0 gen=1 dims=... period=asan_cell fn=ejit_asan_probe
+  object=gEJitAsanCells@0x82f40000 offset=0x14 src=arg1 residue=4/5 kind=value
+  expected=0x7 first=0x11 count=7/7 rate=100.0%          <- worker probe
 
-Entry row (new; `kind=entry`; `object=bound@<arg>` names the diverging
-family member; `src=boundN` names the bound-pointer argument; no
-residue/rate by design):
-
-```text
 [EJIT-ASAN] MISMATCH tier=0 gen=3 period=asan_cell fn=ejit_asan_bound_probe
   object=bound@0x82f50020 offset=0x0 src=bound1 kind=entry
-  expected=0x7 first=0x9 count=N
+  expected=0x7 first=0x9 count=12                        <- entry stub
 ```
+
+**DRIFT rows** (evidence, not faults). A changed site prints its core
+row at INFO plus a forensic detail line at VERBOSE; a never-changed
+site prints at VERBOSE only (the stats line carries the aggregate):
+
+```text
+[EJIT-ASAN] DRIFT period=asan_cell fn=ejit_asan_bound_probe
+  object=bound@0x82f50020 offset=0x4 src=bound1 kind=drift initial=0x0
+  last=0x3 changes=1 samples=512                       <- entry stub
+[EJIT-ASAN] DRIFT-DETAIL fn=ejit_asan_bound_probe offset=0x4 first=0x3
+  tier=0 gen=3
+
+[EJIT-ASAN] DRIFT period=asan_cell object=gEJitAsanCells@0x82f40000
+  offset=0x8 instance=0/2 src=metadata kind=drift initial=0x7 last=0x17
+  changes=1 samples=40                                   <- full-scope scan
+[EJIT-ASAN] DRIFT-DETAIL object=gEJitAsanCells@0x82f40000 offset=0x8
+  instance=0/2 first=0x17
+```
+
+`object=bound@<arg>` on a stub row names the family member that moved
+(or diverged); `instance=i/n` on a full-scope row pins the registered
+array instance. Offsets map to source members offline via DWARF on a
+`-g` image (`llvm-dwarfdump --name=<symbol> board.elf`).
 
 Stats line: `versions`, `staged`, `watches=<n>/<cap>` (FULL marker),
 `checked_active`, `checks`, `mismatch_samples`, `rate`, `recorded`,
-`uncovered`, `dropped`, `blocked_root`, `retired`, plus `entry_checks`
-(per-core served checks, summed) and `entry_sites` (sites with a frozen
-record). `checks=0` is not a pass.
+`uncovered`, `dropped`, `blocked_root`, `retired`, `entry_checks`
+(rotation volume served by the per-core cells), `entry_folded_sites`,
+`entry_drift_sites` (sites with a frozen record, by kind),
+`entry_drift_checks` (drift observations), `fullscope_sites=<n>/<cap>`
+(FULL marker), `fullscope_folded`, `fullscope_changed`,
+`fullscope_samples`, `drift_uncovered`, `drift_dropped`.
+`checks=0` is not a pass.
 
-`ejit_asan_rotation_status()`: read-only, any core, any time. Prints the
-claimed-slot count and site count, then one line per core that ever served
-a check — slot (with function name), window progress, completed
-rotations, checks served:
+`ejit_asan_rotation_status()`: read-only, any core, any time. The header
+and per-core lines (INFO) answer "whose window is it and which argument
+is next"; the per-slot lines are audit depth and print at VERBOSE only:
 
 ```text
-[EJIT-ASAN] rotation slots=2/64 sites=5
-[EJIT-ASAN] rotation core=16 slot=1(ejit_asan_bound_probe) window=37/128 cycles=12 checks=1543
+[EJIT-ASAN] rotation slots=2/64 sites=5 drift_sites=1
+[EJIT-ASAN] rotation slot=1(ejit_asan_bound_probe) bound=1 sites=2    <- VERBOSE
+[EJIT-ASAN] rotation core=16 slot=1(ejit_asan_bound_probe) sub=0 bound=1
+  window=37/128 cycles=12 checks=1543
 ```
-
-### Mapping offsets to source members
-
-Unchanged: embedded bitcode carries IR-level layouts only, so resolve
-`object=...@0x... offset=0x14` offline via DWARF on a `-g` image
-(`llvm-dwarfdump --name=<symbol> board.elf`). This stays offline tooling.
 
 ## Coverage and contract
 
-Worker-probe coverage: scalar integer/pointer folds with a registered
+Folded-check coverage: scalar integer/pointer folds with a registered
 source, constant offsets, one fully enumerable unsigned remainder
-(residues <= 16), pointer roots double-checked, bound exemplars probed at
-their frozen snapshot address.
+(residues <= 16), pointer roots double-checked, bound exemplars probed
+at their frozen snapshot address; bound folds with a constant offset
+additionally checked at the entry against the current argument.
 
-Entry-stub coverage: bound folds with a fully constant offset inside the
-pointee (width 1/8/16/32/64). The typed IR load makes endianness the
-codegen's job — no manual byte-order handling. Not covered by the stub
-(v1): residue-driven bound addresses, non-bound folds, and anything whose
-pointee is not live shared memory.
+Drift coverage: bound-anchored unfolded annotated loads with a constant
+offset (widths 1/8/16/32/64) are observed by the stub; every annotated
+field of every registered object is sampled by the full-scope scan.
+Not covered: volatile annotated loads; residue-driven unfolded bound
+addresses (v1); annotated fields wider than 64 bits or non-scalar;
+registered objects whose base cannot be resolved at walk time; and the
+retired-folded blind spot (a full-scope site marked folded stays skipped
+after its version retires). Clang's frontend excludes unions, bitfields
+and volatile fields from the annotation, and nested struct members ARE
+enumerated (element-relative offsets) and resolved (recursive layout
+descent).
 
 The product contract for bound pointers is unchanged (heap memory,
 lifetime spanning the version, updates coherent across cores) plus the
-family rule the stub enforces empirically: all pointers passed during a
-version's lifetime must agree on the folded members. Report-only means a
-family break is OBSERVED, not corrected — the call still uses the baked
-constant, so a persistent `kind=entry` row is a live wrong-answer bug in
-the business results until the product restores consistency (or
-recompiles).
+family rule the stub enforces empirically. Report-only means a family
+break is OBSERVED, not corrected — a persistent `kind=entry` row is a
+live wrong-answer bug in the business results until the product
+restores consistency (or recompiles); a `kind=drift` row is the
+annotation-truthfulness signal, and the observed value itself is what
+the business computes with.
 
 ## Board smoke
 
 Link only `ejit_test/ejit_asan_sre_test.c` with normal spec5 build flags
-(board-only demo; not enrolled in `build.sh ALL_TESTS`). The new EJIT-ASAN
+(board-only demo; not enrolled in `build.sh ALL_TESTS`). The EJIT-ASAN
 runtime entry symbols are lipo GC roots (`ejit_asan_dump`,
 `ejit_enable_asan_mode`, `ejit_asan_rotation_status`,
 `__ejit_asan_gate`, `__ejit_asan_mismatch`) — verify the trimmed image
-still defines them (`nm -g board.elf | grep ejit_asan`).
+still defines them (`nm -g board.elf | grep ejit_asan`). No new external
+symbols were added by the drift observer.
 
 1. Core 6: `test_ejit_asan_start` — enables the entry mode (before
    `ejit_init`) and initializes.
 2. Core 16: `test_ejit_asan_sample` — worker-probe demo (waits for the
    global probe's compile; full coverage of the demo folds).
 3. Core 6: `ejit_asan_dump` — stats line shows full probe coverage, zero
-   recorded rows, `entry_checks=0`.
-4. Core 16: `test_ejit_asan_bound_sample` — compiles the bound probe from
-   the family exemplar (FamilyA, scale=7).
+   recorded rows, `entry_checks=0`, and the full-scope table seeded
+   (`fullscope_sites=30/4096`, `fullscope_folded=15`: the probe's folded
+   watch covers cell 1's 15 annotated field slots; cell 0's 15 are
+   scanned).
+4. Core 16: `test_ejit_asan_bound_sample` — compiles the bound probe
+   from the family exemplar (FamilyA, scale=7, probeBias=0).
 5. Core 16: `test_ejit_asan_bound_inject` — 512 calls with the divergent
    member FamilyB. Every call returns the BAKED computation (7·input+1),
-   which is the wrong-answer symptom itself. Only the bound probe is
-   instrumented in this demo, so its slot is the only one: the rotation
-   serves it a check on the very first call after any re-arm, regardless
-   of window state.
-6. Core 6: `ejit_asan_dump` again — exactly one `kind=entry` row for
-   `ejit_asan_bound_probe`: `object=bound@<address of FamilyB>`,
-   `expected=0x7 first=0x9`, count > 0; `entry_checks>0` and
-   `entry_sites=1` in the stats. The worker-probe watch for the FamilyA
-   exemplar records nothing (FamilyA never changed).
-7. Any core: `ejit_asan_rotation_status` — per-core window/cycles/checks.
+   the wrong-answer symptom itself.
+6. Core 16: `test_ejit_asan_drift_inject` — moves FamilyB's probeBias
+   (read with atomic semantics, never folded) to 3 and calls 512 times:
+   every call now returns the REAL value (7i+1+3).
+7. Core 16: `test_ejit_asan_drift_fullscope_inject` — changes cell 0's
+   `slot5[2].value` (covered by no folded watch) to 23.
+8. Core 6: `ejit_asan_dump` (after ~10 s, two scan slices) — exactly one
+   `kind=entry` row (FamilyB, `expected=0x7 first=0x9`), one stub
+   `kind=drift` row (`object=bound@<FamilyB> offset=0x4 initial=0x0
+   last=0x3 changes=1` — every earlier bound-sample call already counted
+   its samples), one `src=metadata` row
+   (`object=gEJitAsanCells@... offset=0x8 instance=0/2 initial=0x7
+   last=0x17 changes=1`), and the stats reflecting
+   `entry_drift_sites=1 entry_drift_checks>0 fullscope_changed=1`.
+9. Any core: `ejit_asan_rotation_status` — header with `drift_sites=1`,
+   per-core `sub=/bound=/window=` lines at INFO; per-slot lines at
+   VERBOSE.
 
 Reboot before repeating; the injection commands are diagnostic-only.

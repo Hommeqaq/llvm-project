@@ -2733,20 +2733,14 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
         auto *LI = dyn_cast<LoadInst>(&I);
         if (!LI)
           continue;
+        const Value *Ptr = LI->getPointerOperand();
+        const bool Marked = LI->hasMetadata(MD_EJIT_PERIOD_CONST);
         const GlobalVariable *FieldGV = nullptr;
         uint64_t FieldOff = 0;
-        const bool Marked = LI->hasMetadata(MD_EJIT_PERIOD_CONST);
         const bool Recognized =
-            recognizesAnnotatedField(LI->getPointerOperand(), LI->getType(),
+            recognizesAnnotatedField(Ptr, LI->getType(),
                                      periodConstFieldMap_, DL,
                                      freeDimAssumptions_, FieldGV, FieldOff);
-        if (!Marked && !Recognized)
-          continue;
-        if (LI->isVolatile()) {
-          Uncovered("volatile-annotated", I);
-          continue;
-        }
-        const Value *Ptr = LI->getPointerOperand();
         const Argument *RootArg = findRootArgument(Ptr);
         const BoundPointerState *State = nullptr;
         if (RootArg)
@@ -2755,6 +2749,30 @@ void EJitStructFieldPass::captureDriftSites(const Module &M,
               State = &S;
               break;
             }
+        // Clang cannot attach the marker to an atomic load (atomics bypass
+        // the load decoration), so an annotated field read with atomic
+        // semantics reaches the final module unmarked. Recognize it through
+        // the bound metadata's field ranges — the same authority the
+        // substitution fallback trusts.
+        bool BoundAnnotated = false;
+        if (!Marked && !Recognized && !LI->isVolatile() && State) {
+          auto Off = getBoundPointerOffset(Ptr, State->boundArguments, DL,
+                                           freeDimAssumptions_);
+          TypeSize AccessSize = DL.getTypeStoreSize(LI->getType());
+          if (Off && !AccessSize.isScalable())
+            for (const auto &[Begin, Size] : State->periodConstFields)
+              if (*Off >= Begin && *Off - Begin <= Size &&
+                  AccessSize.getFixedValue() <= Size - (*Off - Begin)) {
+                BoundAnnotated = true;
+                break;
+              }
+        }
+        if (!Marked && !Recognized && !BoundAnnotated)
+          continue;
+        if (LI->isVolatile()) {
+          Uncovered("volatile-annotated", I);
+          continue;
+        }
         if (State) {
           // Bound-anchored survivor: the specialized entry can observe the
           // field through the CURRENT bound argument, so it becomes a drift

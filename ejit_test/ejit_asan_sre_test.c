@@ -30,23 +30,29 @@ uint32_t ejit_asan_probe(EJIT_DIM(asan_cell) uint8_t cell,
 // period_const members are promised consistent across every pointer the
 // product may pass. FamilyA is the compile-time exemplar (scale=7); FamilyB
 // carries the same layout but a divergent scale (9) — the family-consistency
-// break the entry stub exists to catch at the call site.
+// break the entry stub exists to catch at the call site. probeBias is read
+// with atomic semantics (__atomic_load_n): substitution never folds atomics
+// and the marker never rides atomic loads, so it survives to the final
+// module as an unfolded annotated field — exactly the group the stub's
+// drift half observes on every activated call.
 struct AsanBoundCfg {
   EJIT_PERIOD_CONST uint32_t scale; // +0: family-consistent, folded
-  uint32_t runtimeBias;             // +4: per-member, never folded
+  EJIT_PERIOD_CONST uint32_t probeBias; // +4: atomic read → drift site
+  uint32_t runtimeBias;                  // +8: per-member, never annotated
 };
 
 __attribute__((section(".mc_shared"), aligned(64)))
-struct AsanBoundCfg gAsanFamilyA = {7u, 100u};
+struct AsanBoundCfg gAsanFamilyA = {7u, 0u, 100u};
 __attribute__((section(".mc_shared"), aligned(64)))
-struct AsanBoundCfg gAsanFamilyB = {9u, 100u};
+struct AsanBoundCfg gAsanFamilyB = {9u, 0u, 100u};
 
 EJIT_ENTRY __attribute__((noinline))
 uint32_t ejit_asan_bound_probe(EJIT_DIM(asan_cell) uint8_t cell,
                                EJIT_BOUND_PTR(asan_cell)
                                    const struct AsanBoundCfg *cfg,
                                uint32_t input) {
-  return cfg->scale * input + cell;
+  return cfg->scale * input + cell +
+         __atomic_load_n(&cfg->probeBias, __ATOMIC_ACQUIRE);
 }
 
 int test_ejit_asan_start(void) {
@@ -151,5 +157,36 @@ int test_ejit_asan_bound_inject(void) {
   for (uint32_t i = 1; i <= 512; ++i)
     if (ejit_asan_bound_probe(1, &gAsanFamilyB, i) != 7u * i + 1u)
       return -2;
+  return 0;
+}
+
+// The drift half of the entry stub: probeBias never folds, so the stub
+// observes it through the CURRENT bound argument on every activated call.
+// Move FamilyB's copy away from the compile-time baseline (0): every call
+// now returns the REAL value (7i+1+3) and the dump reports a kind=drift
+// row whose object=bound@<FamilyB> names the member that moved.
+int test_ejit_asan_drift_inject(void) {
+  if (ejit_sre_current_core_id() != 16 ||
+      !ejit_is_active("asan_cell", 1))
+    return -1;
+  __atomic_store_n(&gAsanFamilyB.probeBias, 3u, __ATOMIC_RELEASE);
+  for (uint32_t i = 1; i <= 512; ++i)
+    if (ejit_asan_bound_probe(1, &gAsanFamilyB, i) != 7u * i + 1u + 3u)
+      return -2;
+  return 0;
+}
+
+// The full-scope half: cell 0's annotated fields are covered by no folded
+// watch (the probe specializes cell 1), so the worker's full-scope scan
+// samples them directly from the registered object. Change one and let a
+// scan slice run (~5 s) before the dump: the row is src=metadata with
+// instance=0/2 — the annotation-truthfulness evidence the folded probes
+// structurally cannot produce.
+int test_ejit_asan_drift_fullscope_inject(void) {
+  if (ejit_sre_current_core_id() != 16 ||
+      !ejit_is_active("asan_cell", 1))
+    return -1;
+  __atomic_store_n(&gEJitAsanCells[0].slot5[2].value, 23,
+                   __ATOMIC_RELEASE);
   return 0;
 }

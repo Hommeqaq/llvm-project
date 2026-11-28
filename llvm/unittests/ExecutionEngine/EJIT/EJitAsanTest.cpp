@@ -917,6 +917,55 @@ TEST(EJitAsan, DriftWalkCapturesUnfoldedBoundLoadAsDriftSite) {
   EXPECT_EQ(EF.siteId, kEJitAsanNoSite);
 }
 
+TEST(EJitAsan, DriftWalkRecognizesAtomicReadsWithoutMarker) {
+  // The shape real Clang emits for an atomic read of an annotated bound
+  // field: an atomic load with NO marker (atomics bypass the load
+  // decoration). The walk recognizes it through the bound metadata's field
+  // ranges and records the drift site.
+  resetAsanBlob();
+  auto C = std::make_unique<LLVMContext>();
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    declare void @observe(i32)
+    define i32 @probe(i8 %cell, ptr %cfg) !ejit.metadata !0 {
+    entry:
+      %p = getelementptr inbounds i8, ptr %cfg, i64 4
+      %v = load atomic i32, ptr %p acquire, align 4
+      ret i32 %v
+    }
+    !0 = !{!1, !2, !3}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !4}
+    !4 = !{i64 4, i64 4}
+    !7 = !{}
+  )",
+                               Err, *C);
+  ASSERT_TRUE(M);
+  uint64_t Object[1] = {0xCAFEBABE00000000ULL};
+  PeriodArrayRegistry Registry;
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Object),
+                                /*size=*/8, /*argIndex=*/1, /*instance=*/1});
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  EXPECT_EQ(Capture.driftUncovered, 0u);
+  ASSERT_EQ(Capture.entryFolds.size(), 1u);
+  const auto &EF = Capture.entryFolds.front();
+  EXPECT_FALSE(EF.folded);
+  EXPECT_TRUE(EF.atomic);
+  EXPECT_EQ(EF.argNo, 1u);
+  EXPECT_EQ(EF.byteOffset, 4u);
+  EXPECT_EQ(EF.expected, 0xCAFEBABEu);
+  // An un-annotated offset through the bound argument stays invisible.
+  EXPECT_EQ(gEJitAsanState.siteCounter.loadRelaxed(), 0u);
+}
+
 TEST(EJitAsan, DriftWalkEnumeratesAnnotatedFields) {
   // The full-scope watch set is metadata driven: every annotated field of
   // every registered object is enumerated whether or not any load of it
