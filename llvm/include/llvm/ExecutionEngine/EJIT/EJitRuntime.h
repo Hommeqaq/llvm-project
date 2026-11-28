@@ -167,12 +167,11 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 /// with LLVMProfileData + LLVMInstrumentation (a build without PGO support
 /// treats this as ejit_init). PGO is off for plain ejit_init().
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
-/// Initialize with EJIT-ASAN entry instrumentation enabled (see
-/// EJIT_ASAN_CHECK.md): every worker compile of a function whose bound_ptr
-/// parameters produced period_const folds emits the entry-check stub
-/// (report-only). Uses the same config layout as ejit_init(config) and forces
-/// the instrumentation on for the boot; PGO stays off. A build without the
-/// feature returns EJIT_ERR_DISABLED without initializing.
+/// Initialize with EJIT-ASAN in use (see EJIT_ASAN_CHECK.md): the worker
+/// probe, the full-scope drift scan, and the bound_ptr entry stubs activate
+/// together for the boot (report-only). Uses the same config layout as
+/// ejit_init(config) and forces the feature on; PGO stays off. A build
+/// without the feature returns EJIT_ERR_DISABLED without initializing.
 ejit_status_t ejit_init_asan(const ejit_config_t *config);
 void ejit_shutdown(void);
 

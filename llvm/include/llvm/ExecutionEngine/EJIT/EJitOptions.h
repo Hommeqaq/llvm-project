@@ -46,11 +46,12 @@ struct Config {
   bool enableProfileAudit = false;
 #endif
 #if defined(EJIT_ASAN)
-  /// EJIT-ASAN entry instrumentation opt-in (EJIT_ASAN_CHECK.md). Set by
-  /// ejit_init_asan(): every subsequent worker compile of a function with
-  /// bound_ptr folds then emits the entry-check stub. The mode is read at
+  /// EJIT-ASAN use gate (EJIT_ASAN_CHECK.md). The build knob compiles the
+  /// feature in; ejit_init_asan() turns it on for the boot — the worker
+  /// probe, the full-scope drift scan, and the entry stubs together. Plain
+  /// ejit_init() leaves it compiled-in but inert. The mode is read at
   /// compile time only; emitted stubs stay for the boot.
-  bool enableAsanEntryChecks = false;
+  bool enableAsan = false;
 #endif
 };
 

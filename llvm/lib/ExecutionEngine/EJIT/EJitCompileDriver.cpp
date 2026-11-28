@@ -200,7 +200,12 @@ EJitCompileDriver::EJitCompileDriver(const Config &config,
   sharedPool_.setPublishCallback(&taskpoolPublishThunk, this);
   sharedPool_.setPeriodConstRankingCallback(&sharedPeriodConstRankingThunk, this);
 #ifdef EJIT_ASAN
-  sharedPool_.setAsanCallbacks(
+  // Use gate: the build knob compiles the feature in; only ejit_init_asan
+  // registers the ASAN compile/scan callbacks (worker probe slices, the
+  // full-scope scan, and the synchronous dump ride this registration).
+  // Without them the pool compiles through the plain thunk and stays inert.
+  if (config_.enableAsan)
+    sharedPool_.setAsanCallbacks(
       [](void *Ctx, const EJitCompileRequest &Req, void **Fn) {
         auto *Driver = static_cast<EJitCompileDriver *>(Ctx);
         *Fn = Driver->compileNow(Req, /*CollectAsan=*/true);
@@ -320,7 +325,8 @@ bool EJitCompileDriver::sharedOwnerElected(void *ctx) {
   if (!Driver->ensureJitEngine())
     return false;
 #ifdef EJIT_ASAN
-  Driver->asan_ = std::make_unique<EJitAsan>();
+  if (Driver->config_.enableAsan)
+    Driver->asan_ = std::make_unique<EJitAsan>();
 #endif
   return true;
 }
@@ -487,7 +493,7 @@ void *EJitCompileDriver::compileCold(uint64_t cacheKey, uint32_t tier,
   if (CollectAsan && request && asan_) {
     ctx.asanCapture = &VerifyCapture;
   }
-  ctx.asanEntryChecks = config_.enableAsanEntryChecks;
+  ctx.asanEntryChecks = config_.enableAsan;
 #endif
   if (request && request->boundCount) {
     for (uint32_t I = 0; I < request->boundCount; ++I) {

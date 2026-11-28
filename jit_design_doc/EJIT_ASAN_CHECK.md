@@ -55,18 +55,22 @@ All parts report through the same dump; rows carry their source
 | `EJIT_ASAN_MAX_SITES` | 512 | entry stub: emitted-site budget (folded + drift share it); monotonic per boot, overrun drops the NEWEST capture with a log |
 | `EJIT_ASAN_MAX_FULLSITES` | 4096 | full-scope drift watch: registered field-instance budget, merged per boot, dedup by address; overrun drops the capture's remaining sites with a log |
 
-The aarch64_be preset pins all of the above. The worker probe and the
-full-scope drift scan need no runtime opt-in; the entry stub does:
+The aarch64_be preset pins all of the above. The build knob compiles the
+feature in; USE is a single runtime opt-in — all three parts (worker
+probe, full-scope drift scan, entry stubs) activate together:
 
 ```c
-ejit_init_asan(0);         // instead of ejit_init; every worker compile
-                           // of a function with bound folds emits the stub
+ejit_init_asan(0);         // instead of ejit_init: probe + full-scope
+                           // scan + entry stubs, all for the boot
 ```
 
 `ejit_init_asan()` takes the same config as `ejit_init` and forces the
-instrumentation on for the boot (emitted stubs stay in their versions);
-PGO stays off — the ASAN test mode runs the plain pipeline. A build
-without the feature returns `EJIT_ERR_DISABLED` without initializing.
+feature on for the boot (emitted stubs stay in their versions); PGO stays
+off — the ASAN test mode runs the plain pipeline. Under plain
+`ejit_init()` the feature stays compiled-in but inert: no probe slices,
+no scan, no stubs, and `ejit_asan_dump()` returns `EJIT_ERR_NOT_ACTIVE`.
+A build without the feature returns `EJIT_ERR_DISABLED` without
+initializing.
 
 Business code needs no new Clang flag — normal spec5 annotations
 (`ejit_entry`, `ejit_dim`, `ejit_bound_ptr`, `ejit_period_const`) suffice.

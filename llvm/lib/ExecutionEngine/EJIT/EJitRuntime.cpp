@@ -164,7 +164,7 @@ static ejit_status_t ejitInitImpl(const ejit_config_t *config, bool forcePgo,
   if (forcePgo)
     cfg.enablePgo = true;
 #ifdef EJIT_ASAN
-  cfg.enableAsanEntryChecks = forceAsan;
+  cfg.enableAsan = forceAsan;
 #endif
 
   gEJIT = new (std::nothrow) EJit(cfg);
