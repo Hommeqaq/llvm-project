@@ -1004,56 +1004,150 @@ TEST(EJitAsan, DriftWalkEnumeratesAnnotatedFields) {
   EXPECT_TRUE(AF.littleEndian);
 }
 
+TEST(EJitAsan, DriftWalkDerivesNestedStructFieldWidths) {
+  // Nested struct members: the frontend expands inner arrays so the
+  // metadata carries absolute element-relative offsets; the width
+  // derivation must descend array levels (stride modulo) and struct
+  // members (exact member start) to the innermost scalar. A mid-member
+  // offset resolves to no scalar and is skipped with a reason.
+  resetAsanBlob();
+  struct Inner { uint32_t value; };
+  struct Outer { Inner in[3]; uint32_t pad; };
+  Outer Data[2] = {};
+  PeriodArrayRegistry Registry;
+  Registry.registerArray("cell", "nested", Data, 2);
+  LLVMContext C;
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    target datalayout = "e-p:64:64-i64:64-n8:16:32:64-S128"
+    %struct.Inner = type { i32 }
+    %struct.Outer = type { [3 x %struct.Inner], i32 }
+    @nested = external global [2 x %struct.Outer], !ejit.metadata !0
+    define i32 @probe(i8 %cell) !ejit.metadata !5 {
+    entry:
+      ret i32 0
+    }
+    !0 = !{!1, !2, !3, !4, !8}
+    !1 = !{!"ejit_group_indexed", !"cell", i64 2}
+    !2 = !{!"ejit_period_const_field", i64 0}
+    !3 = !{!"ejit_period_const_field", i64 4}
+    !4 = !{!"ejit_period_const_field", i64 8}
+    !8 = !{!"ejit_period_const_field", i64 6}
+    !5 = !{!6, !7}
+    !6 = !{!"ejit_entry"}
+    !7 = !{!"ejit_dim", !"cell", i32 0}
+  )",
+                               Err, C);
+  ASSERT_TRUE(M);
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  // Offsets 0/4/8 are in[k].value scalars (32-bit); offset 6 lands mid
+  // member and is skipped.
+  ASSERT_EQ(Capture.annotatedFields.size(), 3u);
+  const std::set<uint64_t> Offsets{0, 4, 8};
+  std::set<uint64_t> Seen;
+  for (const auto &AF : Capture.annotatedFields) {
+    EXPECT_EQ(AF.object, "nested");
+    EXPECT_EQ(AF.period, "cell");
+    EXPECT_EQ(AF.instanceCount, 2u);
+    EXPECT_EQ(AF.width, 32u);
+    EXPECT_EQ(AF.base, reinterpret_cast<uintptr_t>(Data));
+    EXPECT_EQ(AF.stride, 16u);
+    Seen.insert(AF.offset);
+  }
+  EXPECT_EQ(Seen, Offsets);
+}
+
 TEST(EJitAsan, DriftWalkClassifiesUncoveredSurvivors) {
   // Survivors the entry cannot observe count into driftUncovered with a
   // reason: a volatile annotated load stays out (an observation load of our
-  // own would change the access pattern the program promised), and a
-  // global-anchored load with a non-constant offset has no stub-side view.
+  // own would change the access pattern the program promised); a global
+  // load with a plain (non-free-dim) runtime index has no resolvable
+  // offset; a residue-driven bound load (modulus 3 — a power-of-two
+  // modulus would canonicalize the urem away — whose witness address lies
+  // outside the view, so the fold declines) gets no stub site in v1; and
+  // a marker on an i128 field the GV's own metadata does not list (too
+  // wide to materialize, so nothing folds it) is the
+  // annotation-consistency smell.
   resetAsanBlob();
   auto C = std::make_unique<LLVMContext>();
   SMDiagnostic Err;
   auto M = parseAssemblyString(R"(
     target datalayout = "e-p:64:64-i64:64-n8:16:32:64-S128"
     @cfg = external global [2 x [10 x i32]], !ejit.metadata !0
-    define i32 @probe(i8 %cell, i16 %j, ptr %b) !ejit.metadata !5 {
+    @cfg2 = external global [2 x [10 x i32]], !ejit.metadata !11
+    define i32 @probe(i8 %cell, i16 %j, i16 %k, ptr %b) !ejit.metadata !5 {
     entry:
       %p = getelementptr inbounds i8, ptr %b, i64 4
       %v = load volatile i32, ptr %p, !ejit.period_const !7
-      %q = getelementptr inbounds [2 x [10 x i32]], ptr @cfg, i64 0, i64 1, i16 %j
+      %q = getelementptr inbounds [2 x [10 x i32]], ptr @cfg, i64 0, i64 1, i16 %k
       %w = load i32, ptr %q, !ejit.period_const !7
-      %r = add i32 %v, %w
-      ret i32 %r
+      %idx = urem i16 %j, 3
+      %idxz = zext i16 %idx to i64
+      %mul = mul i64 %idxz, 4
+      %s = getelementptr inbounds i8, ptr %b, i64 %mul
+      %s2 = getelementptr inbounds i8, ptr %s, i64 8
+      %u = load i32, ptr %s2, !ejit.period_const !7
+      %q2 = getelementptr inbounds [2 x [10 x i32]], ptr @cfg2, i64 0, i64 0, i64 0
+      %w2 = load i128, ptr %q2, align 4, !ejit.period_const !7
+      %x2 = add i128 %w2, 1
+      %lo = trunc i128 %x2 to i32
+      %r1 = add i32 %v, %w
+      %r2 = add i32 %r1, %u
+      %r3 = add i32 %r2, %lo
+      ret i32 %r3
     }
     !0 = !{!1, !2}
     !1 = !{!"ejit_group_indexed", !"cell", i64 2}
     !2 = !{!"ejit_period_const_field", i64 0}
-    !5 = !{!6, !8, !9}
+    !11 = !{!12}
+    !12 = !{!"ejit_group_indexed", !"cell", i64 2}
+    !5 = !{!6, !8, !9, !13}
     !6 = !{!"ejit_entry"}
     !8 = !{!"ejit_dim", !"cell", i32 0}
-    !9 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, !10}
+    !9 = !{!"ejit_bound_ptr", !"cell", i32 3, i64 8, !10}
     !10 = !{i64 4, i64 4}
+    !13 = !{!"ejit_free_dim", !"", i32 1}
     !7 = !{}
   )",
                                Err, *C);
   ASSERT_TRUE(M);
   uint32_t Data[2][10] = {};
+  uint32_t Data2[2][10] = {};
   PeriodArrayRegistry Registry;
   Registry.registerArray("cell", "cfg", Data, 2);
+  Registry.registerArray("cell", "cfg2", Data2, 2);
   uint64_t Object[1] = {0x1122334400000000ULL};
   SpecializationContext Ctx;
   Ctx.fnName = "probe";
   Ctx.dimensions.push_back({"cell", 1});
   Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Object),
-                                /*size=*/8, /*argIndex=*/2, /*instance=*/1});
+                                /*size=*/8, /*argIndex=*/3, /*instance=*/1});
   EJitAsanCapture Capture;
   Ctx.asanCapture = &Capture;
 
+  auto Level = ejit_get_log_level();
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
+  testing::internal::CaptureStdout();
   EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  const std::string Out = testing::internal::GetCapturedStdout();
+  ejit_set_log_level(Level);
+
   ASSERT_FALSE(verifyModule(*M, &errs()));
   EXPECT_EQ(Capture.entryFolds.size(), 0u);
-  EXPECT_EQ(Capture.driftUncovered, 2u);
+  EXPECT_EQ(Capture.driftUncovered, 4u);
   ASSERT_EQ(Capture.annotatedFields.size(), 1u);
   EXPECT_EQ(Capture.annotatedFields.front().object, "cfg");
+  EXPECT_NE(Out.find("reason=volatile-annotated"), std::string::npos);
+  EXPECT_NE(Out.find("reason=non-const-offset"), std::string::npos);
+  EXPECT_NE(Out.find("reason=residue-driven-unfolded-bound"), std::string::npos);
+  EXPECT_NE(Out.find("reason=offset-not-in-field-metadata"), std::string::npos);
 }
 
 TEST(EJitAsan, EmitsMergedStubForFoldedAndDriftFolds) {
@@ -1138,6 +1232,100 @@ TEST(EJitAsan, EmitsMergedStubForFoldedAndDriftFolds) {
   EXPECT_EQ(Rot->getNumCases(), 1u);
 }
 
+TEST(EJitAsan, EmitsPerArgumentSubWindowsForMultipleBoundPointers) {
+  // The sub-rotation's product rule at the IR level: a function with TWO
+  // bound_ptr arguments gets one gate and one switch with two cases, and
+  // case K's check chain references ONLY the K-th bound argument (rank =
+  // ascending argument index) — sub 0 never touches the second pointer.
+  resetAsanBlob();
+  auto C = std::make_unique<LLVMContext>();
+  SMDiagnostic Err;
+  auto M = parseAssemblyString(R"(
+    declare void @observe(i32)
+    define i32 @probe(i8 %cell, ptr %a, ptr %b) !ejit.metadata !0 {
+    entry:
+      %pa = getelementptr inbounds i8, ptr %a, i64 0
+      %va = load i32, ptr %pa, !ejit.period_const !7
+      %pb = getelementptr inbounds i8, ptr %b, i64 4
+      %vb = load i32, ptr %pb, !ejit.period_const !7
+      %r = add i32 %va, %vb
+      ret i32 %r
+    }
+    !0 = !{!1, !2, !3, !4}
+    !1 = !{!"ejit_entry"}
+    !2 = !{!"ejit_dim", !"cell", i32 0}
+    !3 = !{!"ejit_bound_ptr", !"cell", i32 1, i64 8, !5}
+    !4 = !{!"ejit_bound_ptr", !"cell", i32 2, i64 8, !6}
+    !5 = !{i64 0, i64 4}
+    !6 = !{i64 4, i64 4}
+    !7 = !{}
+  )",
+                               Err, *C);
+  ASSERT_TRUE(M);
+  uint32_t Bufs[2][2] = {{0xAABBCCDDu, 0}, {0, 0xEEFF0011u}};
+  PeriodArrayRegistry Registry;
+  SpecializationContext Ctx;
+  Ctx.fnName = "probe";
+  Ctx.dimensions.push_back({"cell", 1});
+  Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Bufs[0]),
+                                /*size=*/8, /*argIndex=*/1, /*instance=*/1});
+  Ctx.boundPointers.push_back({reinterpret_cast<const uint8_t *>(Bufs[1]),
+                                /*size=*/8, /*argIndex=*/2, /*instance=*/1});
+  Ctx.asanEntryChecks = true;
+  EJitAsanCapture Capture;
+  Ctx.asanCapture = &Capture;
+
+  EJitOptimizer(Registry).runPipeline(*M, Ctx);
+  ASSERT_FALSE(verifyModule(*M, &errs()));
+  ASSERT_EQ(Capture.entryFolds.size(), 2u);
+  EXPECT_EQ(countCallsTo(*M, "__ejit_asan_gate"), 1u);
+  EXPECT_EQ(countCallsTo(*M, "__ejit_asan_mismatch"), 2u);
+  // Two distinct bound arguments published: two sub-windows.
+  EXPECT_EQ(gEJitAsanState.slots[0].boundCount.loadRelaxed(), 2u);
+
+  SwitchInst *Rot = nullptr;
+  for (Instruction &I : instructions(M->getFunction("probe")))
+    if (auto *Sw = dyn_cast<SwitchInst>(&I))
+      Rot = Sw;
+  ASSERT_NE(Rot, nullptr);
+  ASSERT_EQ(Rot->getNumCases(), 2u);
+  Function *F = M->getFunction("probe");
+  // Walk each case's check chain (everything reachable before the switch
+  // default): every argument it touches must be exactly the K-th bound
+  // argument, and exactly one hook call lives in the chain.
+  BasicBlock *Cont = Rot->getDefaultDest();
+  for (unsigned Rank = 0; Rank < 2; ++Rank) {
+    auto Case = Rot->findCaseValue(
+        ConstantInt::get(Type::getInt32Ty(M->getContext()), Rank));
+    ASSERT_NE(Case, Rot->case_default());
+    std::set<const Argument *> Touched;
+    std::set<BasicBlock *> Seen;
+    SmallVector<BasicBlock *, 8> Work{Case->getCaseSuccessor()};
+    unsigned Hooks = 0;
+    while (!Work.empty()) {
+      BasicBlock *Cur = Work.pop_back_val();
+      if (!Seen.insert(Cur).second || Cur == Cont)
+        continue;
+      for (Instruction &I : *Cur) {
+        if (auto *Call = dyn_cast<CallInst>(&I))
+          if (Call->getCalledFunction() &&
+              Call->getCalledFunction()->getName() == "__ejit_asan_mismatch")
+            ++Hooks;
+        for (Value *Op : I.operands())
+          if (auto *A = dyn_cast<Argument>(Op->stripPointerCasts()))
+            if (A->getParent() == F)
+              Touched.insert(A);
+      }
+      Instruction *T = Cur->getTerminator();
+      for (unsigned S = 0; S < T->getNumSuccessors(); ++S)
+        Work.push_back(T->getSuccessor(S));
+    }
+    EXPECT_EQ(Hooks, 1u);
+    ASSERT_EQ(Touched.size(), 1u);
+    EXPECT_EQ((*Touched.begin())->getArgNo(), Rank == 0 ? 1u : 2u);
+  }
+}
+
 TEST(EJitAsan, DriftStubEndToEndRecordsDivergentBuffer) {
   // The drift half of the stub, end to end: the observation call reports
   // the field value seen through the CURRENT bound argument on every
@@ -1198,6 +1386,24 @@ TEST(EJitAsan, DriftStubEndToEndRecordsDivergentBuffer) {
   auto *Probe =
       jitTargetAddressToFunction<int32_t (*)(uint8_t, void *)>(Sym.getValue());
 
+  EJitSharedTaskPool Pool;
+  EJitAsan Verifier;
+  auto Level = ejit_get_log_level();
+  auto DumpAt = [&](ejit_log_level_t Lvl) {
+    ejit_set_log_level(Lvl);
+    testing::internal::CaptureStdout();
+    EXPECT_TRUE(Verifier.dumpNow(Pool));
+    std::string S = testing::internal::GetCapturedStdout();
+    ejit_set_log_level(Level);
+    return S;
+  };
+  // Before any activation the drift site is never-changed: its row prints
+  // at VERBOSE only, with the seeded baseline and no diverging member.
+  EXPECT_EQ(DumpAt(EJIT_LOG_INFO).find("kind=drift"), std::string::npos);
+  const std::string Pristine = DumpAt(EJIT_LOG_VERBOSE);
+  EXPECT_NE(Pristine.find("kind=drift"), std::string::npos);
+  EXPECT_NE(Pristine.find("changes=0 samples=0"), std::string::npos);
+
   // Divergent member observed on the first activated call.
   EXPECT_EQ(Probe(1, Bad), 0x55aa55aa);
   const EJitAsanSticky &R = gEJitAsanState.sticky[Site];
@@ -1216,14 +1422,7 @@ TEST(EJitAsan, DriftStubEndToEndRecordsDivergentBuffer) {
   EXPECT_EQ(R.driftChanges.loadRelaxed(), 2u);
   EXPECT_EQ(R.lastSeen.loadRelaxed(), 0x11223344u);
 
-  EJitSharedTaskPool Pool;
-  EJitAsan Verifier;
-  auto Level = ejit_get_log_level();
-  ejit_set_log_level(EJIT_LOG_INFO);
-  testing::internal::CaptureStdout();
-  EXPECT_TRUE(Verifier.dumpNow(Pool));
-  const std::string Out = testing::internal::GetCapturedStdout();
-  ejit_set_log_level(Level);
+  const std::string Out = DumpAt(EJIT_LOG_INFO);
   EXPECT_NE(Out.find("kind=drift"), std::string::npos);
   EXPECT_NE(Out.find("object=bound@0x"), std::string::npos);
   EXPECT_NE(Out.find("initial=0x11223344 last=0x11223344"), std::string::npos);
@@ -1234,11 +1433,7 @@ TEST(EJitAsan, DriftStubEndToEndRecordsDivergentBuffer) {
   // The forensic detail line is VERBOSE-only.
   EXPECT_EQ(Out.find("DRIFT-DETAIL"), std::string::npos);
 
-  ejit_set_log_level(EJIT_LOG_VERBOSE);
-  testing::internal::CaptureStdout();
-  EXPECT_TRUE(Verifier.dumpNow(Pool));
-  const std::string Verbose = testing::internal::GetCapturedStdout();
-  ejit_set_log_level(Level);
+  const std::string Verbose = DumpAt(EJIT_LOG_VERBOSE);
   EXPECT_NE(Verbose.find("DRIFT-DETAIL"), std::string::npos);
   EXPECT_NE(Verbose.find("first=0x55aa55aa"), std::string::npos);
 
@@ -1293,13 +1488,12 @@ TEST(EJitAsan, FullScopeProbeWatchesAnnotatedFields) {
   };
   // A slice runs the full step budget over the site table, so the one
   // un-folded site is sampled StepBudget/2 times per dump (the folded
-  // sibling consumes the other half of the steps).
-  const std::string Samples1 = "fullscope_samples=" +
-                               std::to_string(EJIT_ASAN_STEP_BUDGET / 2);
-  const std::string Samples2 =
-      "fullscope_samples=" + std::to_string(EJIT_ASAN_STEP_BUDGET);
-  const std::string RowCounts =
-      "changes=1 samples=" + std::to_string(EJIT_ASAN_STEP_BUDGET);
+  // sibling consumes the other half of the steps); the counts below scale
+  // with the number of dumps run so far.
+  const unsigned PerDump = EJIT_ASAN_STEP_BUDGET / 2;
+  auto SamplesAfter = [&](unsigned Dumps) {
+    return "fullscope_samples=" + std::to_string(PerDump * Dumps);
+  };
   // Baseline scan: both instances merged, the folded one skipped, nothing
   // changed yet.
   auto First = Dump();
@@ -1307,8 +1501,17 @@ TEST(EJitAsan, FullScopeProbeWatchesAnnotatedFields) {
   EXPECT_NE(First.find("fullscope_sites=2/4096"), std::string::npos);
   EXPECT_NE(First.find("fullscope_folded=1"), std::string::npos);
   EXPECT_NE(First.find("fullscope_changed=0"), std::string::npos);
-  EXPECT_NE(First.find(Samples1), std::string::npos);
+  EXPECT_NE(First.find(SamplesAfter(1)), std::string::npos);
   EXPECT_NE(First.find("drift_uncovered=0"), std::string::npos);
+  // Never-changed site: the full row prints at VERBOSE only.
+  ejit_set_log_level(EJIT_LOG_VERBOSE);
+  testing::internal::CaptureStdout();
+  EXPECT_TRUE(Verifier.dumpNow(Pool));
+  const std::string V0 = testing::internal::GetCapturedStdout();
+  ejit_set_log_level(Level);
+  EXPECT_NE(V0.find("instance=0/2 src=metadata"), std::string::npos);
+  EXPECT_NE(V0.find("changes=0 samples=" + std::to_string(2 * PerDump)),
+            std::string::npos);
   // A value transfer on the un-folded instance reports a DRIFT row with
   // the registered-object identity; the folded instance never does.
   __atomic_store_n(&Data[0][0], 9u, __ATOMIC_RELEASE);
@@ -1316,9 +1519,10 @@ TEST(EJitAsan, FullScopeProbeWatchesAnnotatedFields) {
   EXPECT_NE(Drifted.find("instance=0/2 src=metadata"), std::string::npos);
   EXPECT_NE(Drifted.find("kind=drift"), std::string::npos);
   EXPECT_NE(Drifted.find("initial=0x7 last=0x9"), std::string::npos);
-  EXPECT_NE(Drifted.find(RowCounts), std::string::npos);
+  EXPECT_NE(Drifted.find("changes=1 samples=" + std::to_string(3 * PerDump)),
+            std::string::npos);
   EXPECT_NE(Drifted.find("fullscope_changed=1"), std::string::npos);
-  EXPECT_NE(Drifted.find(Samples2), std::string::npos);
+  EXPECT_NE(Drifted.find(SamplesAfter(3)), std::string::npos);
   EXPECT_EQ(Drifted.find("instance=1/2"), std::string::npos);
 
   ejit_set_log_level(EJIT_LOG_VERBOSE);

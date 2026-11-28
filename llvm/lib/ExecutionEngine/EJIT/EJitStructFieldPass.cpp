@@ -2697,9 +2697,16 @@ static unsigned annotatedFieldWidth(Type *Ty, uint64_t ByteOffset,
     if (ByteOffset >= Layout->getSizeInBytes())
       return 0;
     unsigned Idx = Layout->getElementContainingOffset(ByteOffset);
+    Type *Member = Struct->getElementType(Idx);
+    // Descend with the within-member offset: an annotated field inside an
+    // array or nested-struct member still names a scalar; a mid-scalar
+    // offset (bitfield, packed) does not.
+    if (isa<ArrayType>(Member) || isa<StructType>(Member))
+      return annotatedFieldWidth(
+          Member, ByteOffset - Layout->getElementOffset(Idx), DL);
     if (Layout->getElementOffset(Idx) != ByteOffset)
       return 0;
-    return annotatedFieldWidth(Struct->getElementType(Idx), 0, DL);
+    return annotatedFieldWidth(Member, 0, DL);
   }
   if (auto *Int = dyn_cast<IntegerType>(Ty))
     return Int->getBitWidth();
