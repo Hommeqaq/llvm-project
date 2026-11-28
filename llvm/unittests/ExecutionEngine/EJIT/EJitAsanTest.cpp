@@ -1625,12 +1625,17 @@ TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
 }
 
 TEST(EJitAsan, InitAsanForcesEntryMode) {
-  // Init-family variant of ejit_init: same config, entry mode forced for
-  // the boot (PGO off). The mode lives in the EJit instance, so a plain
-  // init after shutdown starts clean; a second init is a no-op either way.
+  // The use gate, observable through the public surface: this variant's
+  // runtime registers the pool's ASAN callbacks, so the synchronous dump is
+  // served on the owner core. Plain ejit_init leaves the feature compiled-in
+  // but inert, and an already-initialized runtime ignores a later
+  // ejit_init_asan (the mode is fixed at the first init).
   ASSERT_EQ(ejit_init_asan(nullptr), EJIT_OK);
-  EXPECT_EQ(ejit_init(nullptr), EJIT_OK);
+  EXPECT_EQ(ejit_asan_dump(), EJIT_OK);
   ejit_shutdown();
   ASSERT_EQ(ejit_init(nullptr), EJIT_OK);
+  EXPECT_EQ(ejit_asan_dump(), EJIT_ERR_NOT_ACTIVE);
+  EXPECT_EQ(ejit_init_asan(nullptr), EJIT_OK);
+  EXPECT_EQ(ejit_asan_dump(), EJIT_ERR_NOT_ACTIVE);
   ejit_shutdown();
 }

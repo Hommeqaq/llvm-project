@@ -66,7 +66,10 @@ ejit_init_asan(0);         // instead of ejit_init: probe + full-scope
 
 `ejit_init_asan()` takes the same config as `ejit_init` and forces the
 feature on for the boot (emitted stubs stay in their versions); PGO stays
-off — the ASAN test mode runs the plain pipeline. Under plain
+off — the ASAN test mode runs the plain pipeline. The shared-pool parts
+(worker probe, full-scope scan) need the Async compile mode; with
+`EJIT_COMPILE_OFF` nothing activates. A call on an already-initialized
+runtime is a silent no-op that enables nothing. Under plain
 `ejit_init()` the feature stays compiled-in but inert: no probe slices,
 no scan, no stubs, and `ejit_asan_dump()` returns `EJIT_ERR_NOT_ACTIVE`.
 A build without the feature returns `EJIT_ERR_DISABLED` without

@@ -1229,7 +1229,6 @@ ejit_status_t ejit_asan_dump(void) {
 #endif
 }
 
-
 ejit_status_t ejit_asan_rotation_status(void) {
 #ifdef EJIT_ASAN
   // Read-only snapshot of the shared rotation state, callable from any core

@@ -169,9 +169,12 @@ ejit_status_t ejit_init(const ejit_config_t *config);
 ejit_status_t ejit_init_pgo(const ejit_config_t *config);
 /// Initialize with EJIT-ASAN in use (see EJIT_ASAN_CHECK.md): the worker
 /// probe, the full-scope drift scan, and the bound_ptr entry stubs activate
-/// together for the boot (report-only). Uses the same config layout as
-/// ejit_init(config) and forces the feature on; PGO stays off. A build
-/// without the feature returns EJIT_ERR_DISABLED without initializing.
+/// together for the boot (report-only; the shared-pool parts need the Async
+/// compile mode). Uses the same config layout as ejit_init(config) and forces
+/// the feature on; PGO stays off. A call on an already-initialized runtime
+/// is a silent no-op that enables nothing (the mode is fixed at the first
+/// init). A build without the feature returns EJIT_ERR_DISABLED without
+/// initializing.
 ejit_status_t ejit_init_asan(const ejit_config_t *config);
 void ejit_shutdown(void);
 
