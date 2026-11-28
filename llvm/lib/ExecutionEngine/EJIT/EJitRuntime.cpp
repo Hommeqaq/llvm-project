@@ -1246,9 +1246,14 @@ ejit_status_t ejit_asan_rotation_status(void) {
   // at any time (the blob is static storage; no owner or init gate). Cores
   // that never served a check stay silent to keep the serial ring small.
   const uint32_t UsedSlots = gEJitAsanState.slotsUsed.loadAcquire();
-  EJIT_DIAG_RAW("[EJIT-ASAN] rotation slots=%u/%d sites=%u",
-                UsedSlots, EJIT_ASAN_MAX_SLOTS,
-                gEJitAsanState.siteCounter.loadRelaxed());
+  const uint32_t Sites = gEJitAsanState.siteCounter.loadRelaxed();
+  uint32_t DriftSites = 0;
+  for (uint32_t Si = 0; Si < Sites && Si < EJIT_ASAN_MAX_SITES; ++Si)
+    if (gEJitAsanState.sites[Si].published.loadAcquire() &&
+        gEJitAsanState.sites[Si].kind == kEJitAsanKindDrift)
+      ++DriftSites;
+  EJIT_DIAG_RAW("[EJIT-ASAN] rotation slots=%u/%d sites=%u drift_sites=%u",
+                UsedSlots, EJIT_ASAN_MAX_SLOTS, Sites, DriftSites);
   // Per-slot lines are audit depth: VERBOSE only.
   for (uint32_t I = 0; I < UsedSlots && I < EJIT_ASAN_MAX_SLOTS; ++I) {
     const EJitAsanSlot &S = gEJitAsanState.slots[I];

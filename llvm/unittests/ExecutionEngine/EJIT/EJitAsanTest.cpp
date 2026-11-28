@@ -484,9 +484,10 @@ TEST(EJitAsan, MismatchHookFreezesFirstRecord) {
   resetAsanBlob();
   const uint32_t Slot = ejitAsanClaimSlot("probe");
   const uint32_t Site = ejitAsanPublishSite(Slot, "probe", "cell",
-                                             /*tier=*/0, /*argNo=*/1,
-                                             /*width=*/32, /*align=*/4,
-                                             kBoundFieldOffset, kBoundExpected);
+                                            kEJitAsanKindFolded,
+                                            /*tier=*/0, /*argNo=*/1,
+                                            /*width=*/32, /*align=*/4,
+                                            kBoundFieldOffset, kBoundExpected);
   ASSERT_NE(Site, kEJitAsanNoSite);
 
   uint32_t Buffer = 0x55667788u;
@@ -505,6 +506,48 @@ TEST(EJitAsan, MismatchHookFreezesFirstRecord) {
   // An unpublishable site id is ignored (stale stub in a recycled slot).
   __ejit_asan_mismatch(Site + 1, &Buffer, 1u);
   EXPECT_EQ(gEJitAsanState.sticky[Site + 1].recorded.loadRelaxed(), 0u);
+}
+
+TEST(EJitAsan, MismatchHookDriftProtocolObservesAndFreezes) {
+  resetAsanBlob();
+  const uint32_t Slot = ejitAsanClaimSlot("probe");
+  const uint32_t Site = ejitAsanPublishSite(Slot, "probe", "cell",
+                                            kEJitAsanKindDrift,
+                                            /*tier=*/0, /*argNo=*/1,
+                                            /*width=*/32, /*align=*/4,
+                                            kBoundFieldOffset, kBoundExpected);
+  ASSERT_NE(Site, kEJitAsanNoSite);
+  const EJitAsanSticky &R = gEJitAsanState.sticky[Site];
+  uint32_t Buffer = 0;
+
+  // A same-value observation counts a sample only; the publish-seeded
+  // baseline prevents a pseudo-change on the first observation.
+  __ejit_asan_mismatch(Site, &Buffer, kBoundExpected);
+  EXPECT_EQ(R.samples.loadRelaxed(), 1u);
+  EXPECT_EQ(R.driftChanges.loadRelaxed(), 0u);
+  EXPECT_EQ(R.lastSeen.loadRelaxed(), kBoundExpected);
+  EXPECT_EQ(R.recorded.loadRelaxed(), 0u);
+
+  // A changed value transfers lastSeen, counts one change, and freezes
+  // the first change with the diverging call's pointer.
+  __ejit_asan_mismatch(Site, &Buffer, 0x12345678u);
+  EXPECT_EQ(R.samples.loadRelaxed(), 2u);
+  EXPECT_EQ(R.driftChanges.loadRelaxed(), 1u);
+  EXPECT_EQ(R.lastSeen.loadRelaxed(), 0x12345678u);
+  EXPECT_EQ(R.recorded.loadRelaxed(), 2u);
+  EXPECT_EQ(R.firstValue, 0x12345678u);
+  EXPECT_EQ(R.firstArg, reinterpret_cast<uint64_t>(&Buffer));
+
+  // Later changes keep counting; the frozen record stays.
+  __ejit_asan_mismatch(Site, &Buffer, 0x9u);
+  EXPECT_EQ(R.driftChanges.loadRelaxed(), 2u);
+  EXPECT_EQ(R.lastSeen.loadRelaxed(), 0x9u);
+  EXPECT_EQ(R.firstValue, 0x12345678u);
+
+  // Re-observing the current value samples without counting a change.
+  __ejit_asan_mismatch(Site, &Buffer, 0x9u);
+  EXPECT_EQ(R.samples.loadRelaxed(), 4u);
+  EXPECT_EQ(R.driftChanges.loadRelaxed(), 2u);
 }
 
 TEST(EJitAsan, EmitsEntryStubForConstantOffsetBoundFold) {
@@ -721,9 +764,10 @@ TEST(EJitAsan, DumpReportsEntryRowsAndStats) {
   resetAsanBlob();
   const uint32_t Slot = ejitAsanClaimSlot("probe");
   const uint32_t Site = ejitAsanPublishSite(Slot, "probe", "cell",
-                                             /*tier=*/0, /*argNo=*/1,
-                                             /*width=*/32, /*align=*/4,
-                                             kBoundFieldOffset, kBoundExpected);
+                                            kEJitAsanKindFolded,
+                                            /*tier=*/0, /*argNo=*/1,
+                                            /*width=*/32, /*align=*/4,
+                                            kBoundFieldOffset, kBoundExpected);
   ASSERT_NE(Site, kEJitAsanNoSite);
   EJitCoreId::setCurrentForTest(0);
   EXPECT_EQ(__ejit_asan_gate(Slot), 0); // Serve one check on this core.
@@ -831,6 +875,7 @@ TEST(EJitAsan, RotationStatusPrintsPerCoreState) {
   ejit_set_log_level(Level);
 
   EXPECT_NE(Out.find("[EJIT-ASAN] rotation slots=1/"), std::string::npos);
+  EXPECT_NE(Out.find("drift_sites=0"), std::string::npos);
   EXPECT_NE(Out.find("rotation core=0"), std::string::npos);
   EXPECT_NE(Out.find("slot=0(probe)"), std::string::npos);
   EXPECT_NE(Out.find("sub=0"), std::string::npos);

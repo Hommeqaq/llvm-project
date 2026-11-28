@@ -62,6 +62,9 @@ namespace ejit {
 
 constexpr uint32_t kEJitAsanNoSite = 0xFFFFFFFFu;
 constexpr uint32_t kEJitAsanNoSlot = 0xFFFFFFFFu;
+// Site protocol, dispatched by the hook on the site's kind.
+constexpr uint8_t kEJitAsanKindFolded = 0;
+constexpr uint8_t kEJitAsanKindDrift = 1;
 
 // One rotation cell per core. Single writer on the hot path: only the core
 // that owns the cell ever writes it (the gate), so every field is a plain
@@ -87,7 +90,7 @@ struct EJitAsanSlot {
                             // stubs check; 0 = none registered yet.
 };
 
-// One emitted entry-check site: one (specialization version, bound fold)
+// One emitted entry-check site: one (specialization version, field check)
 // pair. Written by the worker at emit time and published with storeRelease;
 // the mismatch hook on any core consumes it with loadAcquire.
 struct EJitAsanSite {
@@ -96,25 +99,31 @@ struct EJitAsanSite {
   EJitAtomicU32 published; // 0 = free, 1 = fully written and live.
   uint32_t gen;            // Version generation, backfilled by the driver.
   uint32_t slot;
-  uint8_t tier;            // CompileTier as a plain byte.
-  uint8_t argNo;           // Bound-pointer argument index.
-  uint8_t width;           // Field bit width: 1/8/16/32/64.
-  uint8_t fieldAlign;      // Field alignment in bytes.
-  uint64_t byteOffset;     // Constant offset within the pointee.
-  uint64_t expected;       // The constant baked at specialization time.
+  uint8_t kind;      // kEJitAsanKindFolded: compare the baked constant;
+                     // kEJitAsanKindDrift: observe against the baseline.
+  uint8_t tier;      // CompileTier as a plain byte.
+  uint8_t argNo;     // Bound-pointer argument index.
+  uint8_t width;     // Field bit width: 1/8/16/32/64.
+  uint8_t fieldAlign; // Field alignment in bytes.
+  uint64_t byteOffset; // Constant offset within the pointee.
+  uint64_t expected;  // Folded: the baked constant. Drift: the observed
+                      // compile-time baseline.
 };
 
-// Sticky first-mismatch record for one site, the entry-side twin of the
-// probe-side rows: the first mismatch freezes the seen value and the actual
-// argument pointer (the family member that diverged); later mismatches only
-// grow the saturating count. No samples counter on this path — counting
-// every executed check would put an atomic in the hot stub; the per-core
-// cell's `checks` covers the volume.
+// Sticky record for one site. For a folded site this is the first-mismatch
+// record (kind=entry rows); a drift site reuses the same freeze protocol
+// for the first CHANGED value while lastSeen tracks the most recent
+// observation. No samples counter on the folded path — counting every
+// executed check would put an atomic in the hot stub; the per-core cell's
+// `checks` covers the volume.
 struct EJitAsanSticky {
-  EJitAtomicU32 recorded; // 0 = never mismatched, 1 = first value frozen.
-  EJitAtomicU32 count;    // Mismatch occurrences, saturating at 0xFFFF.
+  EJitAtomicU32 recorded;     // 0 = never recorded, 1 = first value frozen.
+  EJitAtomicU32 count;        // Folded mismatches, saturating at 0xFFFF.
+  EJitAtomicU32 driftChanges; // Drift value transfers, saturating ~4G.
+  EJitAtomicU32 samples;      // Drift observations, saturating ~4G.
   uint64_t firstValue;
   uint64_t firstArg;
+  EJitAtomicU64 lastSeen;     // Drift baseline, seeded at publish.
 };
 
 struct EJitAsanState {
@@ -164,11 +173,12 @@ uint32_t ejitAsanClaimSlot(StringRef FunctionName);
 void ejitAsanSetSlotBound(uint32_t Slot, uint32_t Bound);
 
 // Publish one emitted site and return its id. Fields must be fully known;
-// the id is what the emitted stub embeds. Returns kEJitAsanNoSite when the
-// site budget is exhausted (the caller logs and skips the fold).
+// the id is what the emitted stub embeds. Kind selects the hook protocol
+// and seeds the drift baseline from Expected. Returns kEJitAsanNoSite when
+// the site budget is exhausted (the caller logs and skips the fold).
 uint32_t ejitAsanPublishSite(uint32_t Slot, StringRef Function,
-                             StringRef Period, uint8_t Tier, uint8_t ArgNo,
-                             uint8_t Width, uint8_t FieldAlign,
+                             StringRef Period, uint8_t Kind, uint8_t Tier,
+                             uint8_t ArgNo, uint8_t Width, uint8_t FieldAlign,
                              uint64_t ByteOffset, uint64_t Expected);
 
 } // namespace ejit

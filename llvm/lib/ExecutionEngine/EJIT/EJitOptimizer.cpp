@@ -234,7 +234,7 @@ static void emitAsanEntryChecks(Module &M, const SpecializationContext &Ctx) {
     if (EF.function != Ctx.fnName || EF.argNo >= F->arg_size())
       continue; // Counted and logged above.
     const uint32_t Site =
-        ejitAsanPublishSite(Slot, Ctx.fnName, EF.period,
+        ejitAsanPublishSite(Slot, Ctx.fnName, EF.period, kEJitAsanKindFolded,
                             static_cast<uint8_t>(Ctx.tier), EF.argNo,
                             EF.width, EF.align, EF.byteOffset, EF.expected);
     if (Site == kEJitAsanNoSite) {

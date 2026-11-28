@@ -95,8 +95,8 @@ void ejitAsanSetSlotBound(uint32_t Slot, uint32_t Bound) {
 }
 
 uint32_t ejitAsanPublishSite(uint32_t Slot, StringRef Function,
-                             StringRef Period, uint8_t Tier, uint8_t ArgNo,
-                             uint8_t Width, uint8_t FieldAlign,
+                             StringRef Period, uint8_t Kind, uint8_t Tier,
+                             uint8_t ArgNo, uint8_t Width, uint8_t FieldAlign,
                              uint64_t ByteOffset, uint64_t Expected) {
   EJitAsanState &St = gEJitAsanState;
   const uint32_t Id = St.siteCounter.loadRelaxed();
@@ -106,6 +106,7 @@ uint32_t ejitAsanPublishSite(uint32_t Slot, StringRef Function,
   EJitAsanSite &S = St.sites[Id];
   ejitAsanCopyName(S.function, sizeof(S.function), Function);
   ejitAsanCopyName(S.period, sizeof(S.period), Period);
+  S.kind = Kind;
   S.gen = 0;
   S.slot = Slot;
   S.tier = Tier;
@@ -114,6 +115,9 @@ uint32_t ejitAsanPublishSite(uint32_t Slot, StringRef Function,
   S.fieldAlign = FieldAlign;
   S.byteOffset = ByteOffset;
   S.expected = Expected;
+  // Seed the drift baseline so the first observation cannot report a
+  // pseudo-change from a zero-filled lastSeen.
+  St.sticky[Id].lastSeen.storeRelaxed(Expected);
   S.published.storeRelease(1u);
   if (Slot != kEJitAsanNoSlot)
     St.slots[Slot].activeSites.fetchAddRelaxed(1);
@@ -177,10 +181,10 @@ extern "C" int32_t __ejit_asan_gate(uint32_t Slot) {
   return Sub;
 }
 
-/// Mismatch hook, called from the stub's cold block with the site id, the
-/// actual bound-pointer argument of this call, and the value the stub saw
-/// there. The first mismatch freezes {value, argument} (the family member
-/// that diverged); every mismatch grows the saturating count.
+/// Stub cold-block hook (the name predates the drift extension). The
+/// site's kind dispatches the protocol: a folded site records a mismatch
+/// against the baked constant; a drift site records an observation against
+/// the last-seen baseline — a change is annotation evidence, never a fault.
 extern "C" void __ejit_asan_mismatch(uint32_t SiteId, const void *Arg,
                                      uint64_t ValueSeen) {
   if (SiteId >= EJIT_ASAN_MAX_SITES)
@@ -189,6 +193,32 @@ extern "C" void __ejit_asan_mismatch(uint32_t SiteId, const void *Arg,
   if (S.published.loadAcquire() == 0)
     return;
   EJitAsanSticky &R = gEJitAsanState.sticky[SiteId];
+  if (S.kind == kEJitAsanKindDrift) {
+    if (R.samples.loadRelaxed() != 0xFFFFFFFFu)
+      R.samples.fetchAddRelaxed(1);
+    uint64_t Cur = R.lastSeen.loadRelaxed();
+    if (Cur == ValueSeen)
+      return;
+    // Count one value transfer with a bounded CAS: under extreme
+    // multi-core flutter the retry gives up and under-counts instead of
+    // spinning (documented approximation).
+    for (unsigned T = 0; T < 4; ++T) {
+      if (R.lastSeen.compareExchange(Cur, ValueSeen)) {
+        if (R.driftChanges.loadRelaxed() != 0xFFFFFFFFu)
+          R.driftChanges.fetchAddRelaxed(1);
+        break;
+      }
+      if (Cur == ValueSeen)
+        break; // A concurrent observer already installed this value.
+    }
+    uint32_t Freeze = 0;
+    if (R.recorded.compareExchange(Freeze, 1u)) {
+      R.firstValue = ValueSeen;
+      R.firstArg = reinterpret_cast<uint64_t>(Arg);
+      R.recorded.storeRelease(2u);
+    }
+    return;
+  }
   if (R.count.loadRelaxed() < 0xFFFFu)
     R.count.fetchAddRelaxed(1);
   // Freeze protocol: CAS 0->1 elects the single freezing writer; only the
